@@ -160,17 +160,18 @@ as possible false positives (see `07-PRIOR-ART.md`).
 
 Confidence tiers:
 
-- **High** — the field is covered by extracted schema and typed as a reference.
-  Not a heuristic at all. **This tier is narrower than an earlier revision of this
-  document claimed.** The generated schema does *not* mark reference targets
-  machine-readably: known reference fields emerge as bare
-  `{"type": ["string","null"]}`, and `hytale.type` is a JSON-type marker, not a
-  pointer to an asset type (`OPEN-QUESTIONS.md` Q17, `05-CODEC-EXTRACTION.md`
-  §What it does NOT give us). What *is* available: `hytale.uiEditorComponent`
-  (259 fields, naming the editor picker and sometimes a path template), `$ref`
-  structure for nested objects, and descriptions that occasionally name the target
-  in prose. **Plan for this tier covering a minority of string fields, not most of
-  them** — the tiers below carry the weight.
+- **High** — the field carries `hytaleAssetRef`, naming the asset type it points
+  at, **and** the candidate resolves to an asset of that type. Not a heuristic at
+  all. 849 fields across 70 types are marked this way (`05-CODEC-EXTRACTION.md`
+  §What it does NOT give us, which records how this marker was twice missed: it
+  is a *sibling* of the `hytale` block, not a member of it).
+  A declared target that resolves to an asset of the **wrong** type is not
+  promoted and not silently downgraded either — it is recorded as broken, which
+  is what `validate_pack` reports. Further signal for unmarked fields:
+  `hytale.uiEditorComponent` (259 fields, naming the editor picker and sometimes a
+  path template), `$ref` structure for nested objects, and descriptions that
+  occasionally name the target in prose. **This tier still covers a minority of
+  string fields** — 849 of 17 400 — so the tiers below carry the weight.
 - **Medium** — a fully qualified, namespaced ID string matching a known asset
 - **Low** — a bare short string that happens to collide with a known ID
   (`Stone`, `Default`, `None` will generate noise)

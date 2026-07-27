@@ -714,20 +714,30 @@ than "this field is unusual in the corpus."
 **Reframed after the official batch mode was found. Three findings, one of them a
 correction.**
 
-**1. CORRECTION — reference-typed fields do *not* mark themselves in the schema.**
+**1. RESOLVED — reference-typed fields *do* mark themselves, via `hytaleAssetRef`.**
 
-An earlier revision of this answer claimed they did, reasoning from
-`AssetKeyValidator.updateSchema(SchemaContext, Schema)` in the bytecode. **The
-generated output does not bear that out.** Known reference fields emerge bare:
+This answer was wrong twice before landing. Revision one claimed the marker
+existed, reasoning from `AssetKeyValidator.updateSchema(SchemaContext, Schema)` in
+the bytecode without checking the output. Revision two searched the output, found
+nothing, and concluded no marker existed — but searched **inside** the `hytale`
+block. `hytaleAssetRef` is a *sibling* of it:
 
 ```json
-"Set":  { "type": ["string", "null"] },
-"Icon": { "type": ["string", "null"], "hytale": { "type": "string", … } }
+"Icon": {
+  "type": ["string", "null"],
+  "hytaleAssetRef": "Texture",
+  "hytale": { "type": "string", … }
+}
 ```
 
-`hytale.type` is a JSON-type marker (`string`, `object`, `Enum`, `Color`), not a
-pointer to a target asset type. Whatever `updateSchema` contributes, it is not a
-machine-readable reference target.
+849 fields across 70 types carry it. `hytale.type` remains a JSON-type marker
+(`string`, `object`, `Enum`, `Color`) and is not a reference target — that half of
+revision two stood, and is what made the wrong conclusion look confirmed.
+
+**Method note, since the same mistake was available twice:** the check that
+settles this is enumerating the distinct *key names* present at each node and
+diffing them against what the reader consumes, not searching for a key whose name
+was guessed in advance.
 
 Partial signal remains and should be mined: `hytale.uiEditorComponent` (259 fields)
 names the editor picker and sometimes a path template. But this covers a minority.
@@ -896,9 +906,122 @@ via the resolver-precision regression test in `09-EVALUATION.md`, not assumed.
 
 ---
 
+## Q20 — What selects a union branch when no sibling `Type` exists? 🟡 OPEN
+
+**Discovered while raising the declared/observed join.**
+
+Polymorphic `anyOf` unions are normally resolved from the data: the sibling `Type`
+names the branch (`Type: "Fixed"` → `FixedTradeSlot`), which now settles **40 388
+of 44 187 crossings (91.4 %)**. The remaining 3 799 fall into two shapes that the
+`Type` rule cannot reach, and both are visible in the top unjoined pointers:
+
+- **`ScriptedBrushAsset./Operations/*`** — 56 branches, and instances carry `Id`,
+  `ClickType`, `BlockPattern` but **no `Type`**. If `Id` is the discriminator its
+  vocabulary does not match the branch names, so the mapping is not mechanical.
+  Worldgen brushes are editor tooling, so this is low-value; recorded so the
+  count is explained rather than mysterious.
+- **`RootInteraction./Interactions/*`** — `ref_scope` is null here, meaning the
+  branches were **not `$ref`s at all** but inline objects. The union is invisible
+  to the current reader, which is why 1 689 `/Interactions/*/Parent` observations
+  sit unjoined. This one is worth fixing: interactions are how right-click
+  behaviour is described, which the pickaxe scenario needs.
+
+A third family is not a union problem at all: `common:DensityTerrainAsset` recurses
+(`/Density/Inputs/*/Inputs/*/…`) and 543 rows sit below `MAX_POINTER_DEPTH`. Those
+will never join at a fixed depth and should be reported as recursion, not as
+missing schema.
+
+**Do not** guess a branch when the discriminator is absent or names none — an
+earlier revision followed the first branch and attributed 2 732 real observations
+to `common:ChoiceItemDropContainer./Item/ItemId`, a field that definition does not
+declare. `describe_schema` presented them as fact. Staying in the parent namespace
+is also wrong, but countably so.
+
+---
+
+## Q21 — Should domain concepts live in the index or the prompt? ✅ RESOLVED
+
+**Asked directly by the maintainer:** should the project factor out concepts like
+bench, tool, effect, block, plant — or should the atlas stay universal (what is
+described how, what points where, what properties exist) with the *understanding*
+of what a bench is living in the MCP tool descriptions?
+
+**Answer: universal index, concepts in the prompt** — with one boundary that is
+easy to get wrong.
+
+Measured, not assumed:
+
+- **The game ships no usable concept vocabulary.** 40 of 48 `assetTypes.*.title`
+  values are the identifier de-camel-cased; 56 of 102 types have none at all,
+  including `BlockType`, `CraftingRecipe`, `Fluid`, `RootInteraction`. Zero type
+  descriptions in the lang data; 17 of 102 schema root descriptions, ~6 informative.
+  101 of 102 schema root `title`s are byte-identical to the type name. **Deriving a
+  semantic layer from the game's own words does not work** — this refutes an
+  earlier suggestion in this project that indexing `assetTypes.*.title` would
+  supply one.
+- **A generic value-containment detector is a discovery tool, not a mechanism.**
+  49 pairs survived coverage ≥ 0.8; roughly 6 were real. It misses benches
+  entirely (0.714, because declarations split across four union branches and
+  vanilla ships 78 broken requirements).
+
+**The dividing rule — a fact about the data, or a fact about the world?**
+
+| | Belongs to | Why |
+|---|---|---|
+| Where a string value is declared | index | needs a scan of 35 074 assets |
+| Reference edges, inheritance, localization | index | structural, already generic |
+| Implicit foreign keys (bench ids, and others yet to be found) | index, **declared as data** | no schema vocabulary expresses them |
+| Field shapes, nesting, enums, discriminators | index, **read from the schema** | already declared; guessing them produced four defects |
+| "A bench is where you craft", "a pickaxe mines" | prompt / MCP tool description | the agent already knows; an index restating it goes stale |
+| Which asset types count as "tools" or "plants" | prompt | not declared anywhere, and pack authors will disagree |
+
+**Consequence for implementation:** `src/indexer/benches.ts` was rewritten to hold
+exactly one domain statement, expressed as data — that
+`common:BenchRequirement./Id` draws its values from the `BlockType./Bench` union's
+`/Id`. Branch namespaces, category shapes, nesting and discriminator values are all
+read from the schema at index time. Keying on `schema_scope`/`schema_pointer`
+rather than raw host paths is what made that possible.
+
+**Both follow-up links are now declared** in `src/indexer/value-links.ts`:
+
+- `item-subcategory` — `common:SubCategoryDefinition./Id` → `Item./SubCategory`,
+  **775 of 775** resolved, replacing 2 042 low-confidence name-collision edges.
+- `gather-type` — `ItemToolSpec./GatherType` → `common:BlockBreakingDropType./GatherType`,
+  2 144 of 2 156. Directional rather than a foreign key: tools *provide* 14 values,
+  blocks *require* 16, so the unresolved side is the finding — `Unbreakable`
+  (deliberate), `SoftWoods` and `Pickaxe_Tier0` (not obviously so).
+
+**Still open:** more links of this shape almost certainly exist. The detector's
+output is a candidate list, not a conclusion — re-run it after any patchline and
+promote what survives inspection to a declared line.
+
+---
+
 ## Newly discovered blockers
 
 *(append below during implementation)*
+
+- **Bench ids are not asset ids.** `Recipe.BenchRequirement[].Id` carries values
+  like `Builders` and `Farmingbench`, declared inside `Bench_*` items at
+  `/BlockType/Bench/Id` — so "what can I craft at this bench" had nothing to join
+  on until the `benches` tables were added. 1 879 of 1 957 requirements resolve;
+  the remaining 78 are a finding, not a parse failure: **58 name the literal bench
+  id `TODO`** (all `Type: Crafting`, 56 of them armour) and vanilla ships them.
+  `validate_pack` should report these rather than treat them as errors.
+- **Bench categories must be keyed `(bench_id, category_id)`, never
+  `category_id` alone.** `Decorative` is declared by both `Builders` and
+  `Farmingbench`, `All` by both `Farmingbench` and `Loombench`. Those two
+  collisions cover 100 of the 1 364 category matches — a global lookup would be
+  ambiguous exactly where it is used most.
+- **38 of 53 bench category name keys carry a `server.` root** that must be
+  stripped before they join `lang_keys`; none resolve otherwise.
+- **Write and read sites of a composite key drifted apart silently.** The
+  discriminator map was built with a raw control character as its separator and
+  read with a space, so **all 21 439 lookups missed while both maps were correctly
+  populated** — and the only symptom was a counter reading zero. The fix was a
+  named `discriminatorKey()` builder used by both sides. Any future map keyed by a
+  concatenation should get the same treatment; invisible characters in source do
+  not survive review by eye.
 
 - **Q17**, **Q18** and **Q19** above were discovered during Phase 0 verification and
   are filed as full questions rather than notes.

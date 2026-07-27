@@ -2,10 +2,14 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 
 import { openDatabase } from "../db/open.ts";
 import { buildSearchIndex } from "../indexer/corpus.ts";
+import { craftableAt, indexBenches } from "../indexer/benches.ts";
+import { VALUE_LINKS, indexValueLinks } from "../indexer/value-links.ts";
 import { resolveCandidates } from "../indexer/references.ts";
-import { TypeResolver, applyTypes, ingestSchemas } from "../indexer/schema.ts";
+import { computeFieldStats } from "../indexer/stats.ts";
+import { TypeResolver, applyTypes, assetSuffixes, ingestSchemas } from "../indexer/schema.ts";
 import { type AssetLoader, resolveAsset } from "../query/asset.ts";
 import { searchAssets } from "../query/search.ts";
+import { describeSchema, findUndocumented, searchSchema } from "../query/schema.ts";
 import { AssetArchive, archiveStamp } from "../sources/archive.ts";
 import { detectInstallation } from "../sources/detect.ts";
 import { TELEMETRY_DISCLOSURE, withGeneratedSchemas } from "../sources/schema-gen.ts";
@@ -201,11 +205,13 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
     // Schema first: it supplies the path -> type map, and an asset indexed without
     // a type cannot later be told apart from a worldgen prefab or an animation.
     let resolver: TypeResolver | undefined;
+    let suffixes: string[] | undefined;
     const schemaDir = args.schema ?? DEFAULT_SCHEMA_DIR;
     if (existsSync(schemaDir)) {
       const set = readGeneratedSchemas(schemaDir);
       const ingested = ingestSchemas(db, set);
       resolver = new TypeResolver(set.types);
+      suffixes = assetSuffixes(set.types);
       process.stdout.write(
         `  schema: ${ingested.types} types, ${formatCount(ingested.fields)} fields, ` +
           `${formatCount(ingested.definitions)} shared definitions\n`,
@@ -219,6 +225,7 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
 
     const result = await buildSearchIndex(archive, db, {
       ...(resolver ? { types: resolver } : {}),
+      ...(suffixes ? { assetSuffixes: suffixes } : {}),
       onProgress: (done, total) => {
         process.stdout.write(`\r  parsed ${formatCount(done)} / ${formatCount(total)}`);
       },
@@ -228,6 +235,17 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
     // Pass 2 resolution: one indexed join per edge kind, now that the symbol
     // table is complete.
     const edges = resolveCandidates(db);
+
+    // Pass 3: aggregate candidates into per-field statistics, which is what
+    // gives describe_schema its observed layer and infers enums for the
+    // 13,677 fields the schema declares none for.
+    const stats = computeFieldStats(db);
+
+    // Pass 4: value links -- strings whose legal values are declared elsewhere in
+    // the corpus. The schema has no vocabulary for these joins, so without them
+    // "what can I craft here" and "which tool gathers this" have no answer.
+    const links = indexValueLinks(db);
+    const benches = indexBenches(db);
 
     process.stdout.write(
       [
@@ -239,8 +257,32 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
           `${formatCount(edges.fileReferences)} to files, ` +
           `${formatCount(edges.inherits)} inherits, ` +
           `${formatCount(edges.localizedBy)} localized-by`,
+        `Fields: ${formatCount(stats.rows)} observed across ${stats.typesCovered} types, ` +
+          `${formatCount(stats.enumCandidates)} inferred enums, ` +
+          `${formatCount(stats.schemaOnlyFields)} declared-but-unused`,
+        `Unions: ${formatCount(stats.resolvedUnions)} resolved by discriminator, ` +
+          `${formatCount(stats.unresolvedUnions)} left in place`,
         `Candidates: ${formatCount(edges.candidates)} recorded, ` +
           `${formatCount(edges.dangling)} unresolved`,
+        ...links.map(
+          (l) =>
+            `Link ${l.name}: ${l.distinctValues} values from ${formatCount(l.declared)} ` +
+            `declarations, ${formatCount(l.resolved)} / ${formatCount(l.references)} references resolved` +
+            (l.unresolvedValues.length > 0
+              ? `\n  note: ${VALUE_LINKS.find((v) => v.name === l.name)?.unresolvedMeans} -- ` +
+                l.unresolvedValues.join(", ")
+              : ""),
+        ),
+        `Benches: ${benches.benches} ids from ${benches.declarations} declarations, ` +
+          `${benches.categories} categories (+${benches.nestedCategories} nested), ` +
+          `${formatCount(benches.resolved)} / ${formatCount(benches.requirements)} requirements resolved` +
+          (benches.duplicateIds.length > 0
+            ? `\n  note: bench id declared more than once: ${benches.duplicateIds.join(", ")}`
+            : "") +
+          (benches.unresolvedIds.length > 0
+            ? `\n  note: requirements name ${benches.unresolvedIds.length} undeclared bench id(s): ` +
+              benches.unresolvedIds.join(", ")
+            : ""),
         `Localization: ${result.locales.length} locales, ` +
           `${formatCount(result.langKeys)} keys, ` +
           `${formatCount(result.ftsRows)} search rows`,
@@ -360,6 +402,196 @@ export async function cmdGet(
     return 0;
   } finally {
     archive.close();
+    db.close();
+  }
+}
+
+/** Renders both schema layers for one asset type, or one field of it. */
+/**
+ * Benches, or what a named bench crafts.
+ *
+ * The reverse lookup `Recipe.BenchRequirement[].Id` could not answer before,
+ * because those ids name benches rather than assets and nothing joined the two.
+ */
+export async function cmdBench(
+  benchId: string | undefined,
+  args: { assets?: string; patchline?: string; limit?: number },
+): Promise<number> {
+  const db = await frozenDb(args.assets, args.patchline);
+  try {
+    if (benchId === undefined) {
+      const rows = db
+        .prepare(
+          `SELECT b.id, b.bench_type,
+                  (SELECT group_concat(a.logical_id, ', ') FROM bench_declarations d
+                     JOIN assets a ON a.id = d.asset_id WHERE d.bench_id = b.id) declared_by,
+                  (SELECT count(*) FROM bench_categories c WHERE c.bench_id = b.id) cats,
+                  (SELECT count(*) FROM bench_requirements r WHERE r.bench_id = b.id) reqs
+             FROM benches b
+            ORDER BY reqs DESC`,
+        )
+        .all() as unknown as {
+        id: string;
+        bench_type: string | null;
+        declared_by: string | null;
+        cats: number;
+        reqs: number;
+      }[];
+      for (const r of rows) {
+        process.stdout.write(
+          `${r.id.padEnd(18)} ${String(r.bench_type ?? "?").padEnd(18)} ` +
+            `${String(r.reqs).padStart(5)} recipes  ${String(r.cats).padStart(2)} cat  ` +
+            `${r.declared_by ?? ""}\n`,
+        );
+      }
+      return 0;
+    }
+
+    const categories = db
+      .prepare(
+        `SELECT c.category_id, c.parent_id, c.name_key, l.value
+           FROM bench_categories c
+           LEFT JOIN lang_keys l ON l.key = c.name_key AND l.locale = 'en-US'
+          WHERE c.bench_id = ?
+          ORDER BY coalesce(c.parent_id, c.category_id), c.parent_id IS NOT NULL, c.category_id`,
+      )
+      .all(benchId) as unknown as {
+      category_id: string;
+      parent_id: string | null;
+      name_key: string | null;
+      value: string | null;
+    }[];
+
+    const items = craftableAt(db, benchId, args.limit ?? 200);
+    if (categories.length === 0 && items.length === 0) {
+      process.stderr.write(`No bench '${benchId}'. Run without an argument to list them.\n`);
+      return 1;
+    }
+
+    for (const c of categories) {
+      const indent = c.parent_id === null ? "  " : "      ";
+      process.stdout.write(
+        `${indent}${c.category_id.padEnd(26 - indent.length)} ${c.value ?? c.name_key ?? ""}\n`,
+      );
+    }
+    process.stdout.write(`\n${formatCount(items.length)} craftable here:\n`);
+    let current: string | null | undefined;
+    for (const it of items) {
+      if (it.category !== current) {
+        current = it.category;
+        process.stdout.write(`\n  [${current ?? "no category"}]\n`);
+      }
+      process.stdout.write(`    ${it.logicalId}\n`);
+    }
+    process.stdout.write("\n");
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+export async function cmdDescribe(
+  assetType: string,
+  args: { assets?: string; patchline?: string; field?: string; limit?: number },
+): Promise<number> {
+  const db = await frozenDb(args.assets, args.patchline);
+  try {
+    const fields = describeSchema(db, assetType, args.field);
+    if (fields.length === 0) {
+      process.stderr.write(`No schema for type '${assetType}'.\n`);
+      return 1;
+    }
+    const limit = args.limit ?? 60;
+    for (const f of fields.slice(0, limit)) {
+      const d = f.declared;
+      const o = f.observed;
+      const flags = [
+        d?.optional === false ? "required" : null,
+        d?.inheritsProperty ? "inherits" : null,
+        d?.mergesProperties ? "merges" : null,
+        d?.referenceTarget ? `-> ${d.referenceTarget}` : null,
+        d === null ? "UNDECLARED" : null,
+        o === null ? "unused" : null,
+      ].filter(Boolean);
+
+      process.stdout.write(
+        `${f.pointer.padEnd(46)} ${String(d?.type ?? "?").padEnd(16)} ${flags.join(" ")}\n`,
+      );
+      if (d?.title) process.stdout.write(`    ${d.title}\n`);
+      if (d?.description) {
+        process.stdout.write(`    ${d.description.replace(/\s+/g, " ").slice(0, 140)}\n`);
+      }
+      // Declared enums are the complete legal set; observed values are only what
+      // vanilla happens to use. Labelled differently on purpose.
+      if (d?.enumValues) process.stdout.write(`    legal: ${d.enumValues.join(", ")}\n`);
+      else if (o?.values) process.stdout.write(`    seen:  ${o.values.slice(0, 14).join(", ")}\n`);
+      if (o) {
+        process.stdout.write(
+          `    used in ${formatCount(o.assets)} assets` +
+            (o.targetTypes ? `, points at ${o.targetTypes.join("/")}` : "") + "\n",
+        );
+      }
+    }
+    if (fields.length > limit) {
+      process.stdout.write(`... ${formatCount(fields.length)} fields total\n`);
+    }
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+/** Searches the schema itself: where does a capability live, and does it exist. */
+export async function cmdSearchSchema(
+  query: string,
+  args: { assets?: string; patchline?: string; limit?: number },
+): Promise<number> {
+  const db = await frozenDb(args.assets, args.patchline);
+  try {
+    const hits = searchSchema(db, query, args.limit ?? 15);
+    if (hits.length === 0) {
+      process.stdout.write("No schema field matches. That is itself an answer: nothing in\n");
+      process.stdout.write("any asset type declares this capability.\n");
+      return 1;
+    }
+    for (const h of hits) {
+      process.stdout.write(`${(h.assetType + h.pointer).padEnd(56)} ${h.title ?? ""}\n`);
+      if (h.description) {
+        process.stdout.write(`    ${h.description.replace(/\s+/g, " ").slice(0, 130)}\n`);
+      }
+    }
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+/** Fields the schema permits that no vanilla asset uses. */
+export async function cmdUndocumented(args: {
+  assets?: string;
+  patchline?: string;
+  type?: string;
+  limit?: number;
+}): Promise<number> {
+  const db = await frozenDb(args.assets, args.patchline);
+  try {
+    const fields = findUndocumented(db, args.type, args.limit ?? 40);
+    process.stdout.write(
+      "Fields the schema permits that appear in zero vanilla assets.\n" +
+        "These are leads, not features: a field may be deprecated, engine-internal,\n" +
+        "set programmatically rather than from JSON, or a debug hook.\n\n",
+    );
+    for (const f of fields) {
+      process.stdout.write(
+        `${(f.assetType + f.pointer).padEnd(56)} ${f.declaredType ?? ""}` +
+          `${f.referenceTarget ? ` -> ${f.referenceTarget}` : ""}\n`,
+      );
+      if (f.description) {
+        process.stdout.write(`    ${f.description.replace(/\s+/g, " ").slice(0, 130)}\n`);
+      }
+    }
+    return 0;
+  } finally {
     db.close();
   }
 }

@@ -52,6 +52,21 @@ export interface SchemaField {
    * widget configuration). See `docs/init/OPEN-QUESTIONS.md` Q17.
    */
   readonly referenceTarget: string | null;
+  /**
+   * Namespace the pointer continues in, when this field is a `$ref`.
+   *
+   * `Item./BlockType` has refScope `BlockType`, so a corpus pointer
+   * `/BlockType/Gathering/Breaking/GatherType` rebases to
+   * `BlockType./Gathering/Breaking/GatherType`. Following the ref during
+   * flattening instead of recording it is what produced 138,961 duplicated fields
+   * across 8 truncated types.
+   *
+   * **Space-separated when a union offers several branches**, which is a
+   * different thing entirely: the branch in force is chosen by a discriminator in
+   * the data, so the pointer alone cannot say where it continues and callers must
+   * not rebase through it. Read it with `scopes()`.
+   */
+  readonly refScope: string | null;
 }
 
 export interface SchemaDefinition {
@@ -71,14 +86,49 @@ export interface GeneratedSchemaSet {
 const DEFINITION_FILES = new Set(["common.json", "other.json"]);
 
 /**
- * How deep to follow nested objects and `$ref`s.
+ * Recursion guard on schema **nodes**, not on pointer depth.
  *
- * Not a performance guard so much as a shape guard: `common.json` holds 895
- * definitions and `InteractionSettings` alone is referenced 303 times, so an
- * unbounded expansion produces a field list nobody can read. Eight levels covers
- * every field observed in real assets.
+ * `$ref` and `anyOf` traversal consumes node depth without adding a pointer
+ * segment, so a shared limit silently truncates real fields: with a combined cap
+ * of 8, `Item` reached only `/BlockType/Gathering/Breaking` while the corpus uses
+ * `/BlockType/Gathering/Breaking/GatherType` -- and 95 % of observed fields failed
+ * to join to any declared one.
+ *
+ * Cycles are caught separately by `refStack`, so this only bounds pathological
+ * nesting.
  */
-const MAX_DEPTH = 8;
+const MAX_NODE_DEPTH = 64;
+
+/**
+ * How deep a JSON pointer may go.
+ *
+ * The deepest pointer the corpus actually uses is 15 segments, but depth alone
+ * cannot bound the work: `common.json`'s 895 definitions reference each other, so
+ * each extra level multiplies rather than adds. At 20 the flatten did not finish
+ * in ten minutes.
+ */
+const MAX_POINTER_DEPTH = 8;
+
+/**
+ * Hard ceiling on fields emitted for one asset type.
+ *
+ * The real guarantee of termination. Depth and cycle detection bound the *shape*
+ * of the walk; this bounds its *size*, so a schema that references itself broadly
+ * degrades to a truncated field list instead of hanging. Truncation is reported
+ * rather than silent -- a partial answer a caller knows is partial is usable, one
+ * they do not is worse than none.
+ */
+const MAX_FIELDS_PER_TYPE = 12_000;
+
+/**
+ * Hard ceiling on schema **nodes visited** for one type.
+ *
+ * The field cap alone does not terminate: `seenPointers` suppresses duplicate
+ * emissions, so a walk can visit millions of nodes without the emitted count
+ * moving, and a cap on output never fires. Bounding visits is what actually
+ * guarantees the walk ends.
+ */
+const MAX_VISITS_PER_TYPE = 400_000;
 
 /**
  * Node-editor scratch fields, skipped.
@@ -166,11 +216,15 @@ export class SchemaResolver {
 interface FlattenContext {
   readonly assetType: string;
   readonly resolver: SchemaResolver;
-  readonly out: SchemaField[];
+  out: SchemaField[];
   readonly seenPointers: Set<string>;
   readonly refStack: string[];
   /** Non-finite defaults, keyed by the file and pointer they were found at. */
   readonly repaired: ReadonlyMap<string, ReadonlySet<string>>;
+  /** Emitted-field ceiling for this type; see MAX_FIELDS_PER_TYPE. */
+  readonly limit: number;
+  /** Mutable visit budget; see MAX_VISITS_PER_TYPE. */
+  visits: number;
 }
 
 /**
@@ -196,14 +250,48 @@ function hadNonFiniteDefault(
   return false;
 }
 
+/** The namespaces a refScope names -- more than one means a polymorphic union. */
+export function scopes(refScope: string | null): string[] {
+  return refScope === null || refScope === "" ? [] : refScope.split(" ");
+}
+
 function emit(
   ctx: FlattenContext,
   pointer: string,
   node: Node,
   optional: boolean,
   defaultUnset: boolean,
+  refScope: string | null = null,
 ): void {
-  if (ctx.seenPointers.has(pointer)) return;
+  if (ctx.seenPointers.has(pointer)) {
+    // A pointer is often emitted twice: once for the `anyOf` wrapper and once for
+    // the `$ref` branch inside it. The wrapper arrives first and carries no
+    // refScope, so plain dedup would discard exactly the information that lets an
+    // observed pointer rebase into the target namespace -- which is why
+    // Item./BlockType kept its whole subtree instead of handing it to BlockType.
+    if (refScope !== null) {
+      const existing = ctx.out.find(
+        (fld) => fld.assetType === ctx.assetType && fld.pointer === pointer,
+      );
+      if (existing !== undefined && existing.refScope === null) {
+        const index = ctx.out.indexOf(existing);
+        ctx.out[index] = { ...existing, refScope };
+      } else if (existing !== undefined && !scopes(existing.refScope).includes(refScope)) {
+        // A SECOND, different target for the same pointer: the union is genuinely
+        // polymorphic and which branch applies is decided by a discriminator in
+        // the data. Accumulate every branch rather than keeping the first.
+        //
+        // This is the only reliable way to tell the two `anyOf` shapes apart.
+        // `anyOf: [{$ref: X}, {type: null}]` is just an optional reference -- one
+        // ref branch, unambiguous -- and treating every `anyOf` as polymorphic
+        // stopped those rebasing too, taking the declared/observed join from
+        // 20.5% down to 8.5%.
+        const index = ctx.out.indexOf(existing);
+        ctx.out[index] = { ...existing, refScope: `${existing.refScope!} ${refScope}` };
+      }
+    }
+    return;
+  }
   ctx.seenPointers.add(pointer);
 
   const meta = hytale(node);
@@ -228,6 +316,7 @@ function emit(
     // `hytale` silently yields null for all 932 fields, which is exactly how this
     // was first written.
     referenceTarget: asString(node["hytaleAssetRef"]),
+    refScope,
   });
 }
 
@@ -255,20 +344,23 @@ function flatten(
   depth: number,
   optional: boolean,
 ): void {
-  if (depth > MAX_DEPTH) return;
+  if (depth > MAX_NODE_DEPTH) return;
+  if (ctx.out.length >= ctx.limit) return;
+  if (++ctx.visits > MAX_VISITS_PER_TYPE) return;
+  // Pointer depth is counted from the pointer itself, so following a $ref or an
+  // anyOf branch costs nothing -- those move sideways, not downwards.
+  if (pointer.length > 0 && pointer.split("/").length - 1 > MAX_POINTER_DEPTH) return;
 
   const ref = asString(node["$ref"]);
   if (ref !== null) {
-    const key = `${currentFile}|${ref}`;
-    if (ctx.refStack.includes(key)) return; // cyclic definition
-    const target = ctx.resolver.resolve(ref, currentFile);
-    if (target !== null) {
-      const hash = ref.indexOf("#");
-      const targetPointer = hash < 0 ? "" : ref.slice(hash + 1);
-      ctx.refStack.push(key);
-      flatten(ctx, target.node, pointer, targetPointer, target.file, depth + 1, optional);
-      ctx.refStack.pop();
-    }
+    // Record the crossing; do not walk through it.
+    //
+    // Every namespace is flattened exactly once, and a $ref becomes an edge
+    // between namespaces rather than an inlined copy. Expanding instead meant
+    // common.json's 895 mutually-referencing definitions multiplied at every
+    // referring site: 138,961 fields, 8 types truncated, and a declared/observed
+    // join of 7.8% because the deep tail was cut off anyway.
+    if (pointer !== "") emit(ctx, pointer, node, optional, false, scopeOfRef(ref, currentFile));
     return;
   }
 
@@ -331,6 +423,24 @@ function flatten(
 }
 
 /** Reads `.vscode/settings.json` into type-id → globs, when present. */
+/**
+ * Namespace a `$ref` points into.
+ *
+ * `BlockType.json#` -> `BlockType` (an asset type).
+ * `common.json#/definitions/ItemTool` -> `common:ItemTool` (a shared definition,
+ * which gets its own pointer space so it is described once rather than per
+ * referring type).
+ */
+function scopeOfRef(ref: string, currentFile: string): string | null {
+  const hash = ref.indexOf("#");
+  const file = hash <= 0 ? currentFile : ref.slice(0, hash);
+  const pointer = hash < 0 ? "" : ref.slice(hash + 1);
+  const base = file.replace(/\.json$/, "");
+  const defName = /^\/definitions\/([^/]+)$/.exec(pointer)?.[1];
+  if (defName !== undefined) return `${base}:${defName}`;
+  return pointer === "" || pointer === "/" ? base : null;
+}
+
 function readVsCodeBindings(dir: string): Map<string, string[]> {
   const out = new Map<string, string[]>();
   const path = join(dir, ".vscode", "settings.json");
@@ -390,8 +500,30 @@ export function readGeneratedSchemas(dir: string): GeneratedSchemaSet {
     if (DEFINITION_FILES.has(file)) {
       const defs = asNode(root["definitions"]);
       if (defs !== null) {
+        const base = file.replace(/\.json$/, "");
         for (const [name, body] of Object.entries(defs)) {
           definitions.push({ sourceFile: file, name, body: JSON.stringify(body) });
+          const node = asNode(body);
+          if (node === null) continue;
+          // Its own namespace, flattened once, referenced by pointer from anywhere.
+          flatten(
+            {
+              assetType: `${base}:${name}`,
+              resolver,
+              out: fields,
+              seenPointers: new Set(),
+              refStack: [],
+              repaired,
+              limit: fields.length + MAX_FIELDS_PER_TYPE,
+              visits: 0,
+            },
+            node,
+            "",
+            `/definitions/${name}`,
+            file,
+            0,
+            true,
+          );
         }
       }
       continue;
@@ -410,8 +542,18 @@ export function readGeneratedSchemas(dir: string): GeneratedSchemaSet {
       fileMatch: bindings.get(id) ?? [],
     });
 
+    const before = fields.length;
     flatten(
-      { assetType: id, resolver, out: fields, seenPointers: new Set(), refStack: [], repaired },
+      {
+        assetType: id,
+        resolver,
+        out: fields,
+        seenPointers: new Set(),
+        refStack: [],
+        repaired,
+        limit: before + MAX_FIELDS_PER_TYPE,
+        visits: 0,
+      },
       root,
       "",
       "",
@@ -419,6 +561,12 @@ export function readGeneratedSchemas(dir: string): GeneratedSchemaSet {
       0,
       true,
     );
+    if (fields.length - before >= MAX_FIELDS_PER_TYPE) {
+      warnings.push(
+        `${id}: field list truncated at ${MAX_FIELDS_PER_TYPE} -- the schema references ` +
+          `itself too broadly to enumerate fully`,
+      );
+    }
   }
 
   return { types, fields, definitions, warnings };

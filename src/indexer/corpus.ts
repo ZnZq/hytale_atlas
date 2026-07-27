@@ -52,6 +52,14 @@ export interface BuildOptions {
    * These roots stay searchable and typed; they simply contribute no edges.
    */
   readonly skipCandidatesIn?: readonly string[];
+  /**
+   * Filename suffixes that hold an asset document.
+   *
+   * Defaults to `.json` alone, which is wrong for any real corpus -- see
+   * `assetSuffixes()` in `./schema.ts`. Callers with a schema should pass its
+   * declared extensions.
+   */
+  readonly assetSuffixes?: readonly string[];
   /** Reports progress; called every `progressEvery` assets. */
   readonly onProgress?: (done: number, total: number) => void;
   readonly progressEvery?: number;
@@ -172,6 +180,7 @@ export async function buildSearchIndex(
     roots = ["Server/"],
     types,
     skipCandidatesIn = DEFAULT_CANDIDATE_EXCLUSIONS,
+    assetSuffixes = [".json"],
     onProgress,
     progressEvery = 2000,
   } = options;
@@ -206,7 +215,8 @@ export async function buildSearchIndex(
     );
     let files = 0;
     for (const entry of archive.entries) {
-      if (entry.path.endsWith(".json") || entry.path.endsWith(".lang")) continue;
+      if (entry.path.endsWith(".lang")) continue;
+      if (assetSuffixes.some((s) => entry.path.endsWith(s))) continue;
       insFile.run(entry.path, fileKind(entry.path));
       files++;
     }
@@ -224,7 +234,9 @@ export async function buildSearchIndex(
     );
 
     const assetEntries = archive.entries.filter(
-      (e) => e.path.endsWith(".json") && roots.some((r) => e.path.startsWith(r)),
+      (e) =>
+        assetSuffixes.some((s) => e.path.endsWith(s)) &&
+        roots.some((r) => e.path.startsWith(r)),
     );
 
     let assets = 0;

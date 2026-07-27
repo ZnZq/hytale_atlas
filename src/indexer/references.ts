@@ -73,6 +73,10 @@ export function collectCandidates(node: unknown, pointer = "", out: Candidate[] 
   }
   if (node !== null && typeof node === "object") {
     for (const [k, v] of Object.entries(node)) {
+      // Node-editor scratch keys are stripped from the schema side already; not
+      // stripping them here left thousands of observed-but-undeclared rows
+      // (`/$NodeId`, `/$NodeEditorMetadata/$Groups/*/$name`) that can never join.
+      if (k.startsWith("$")) continue;
       collectCandidates(v, `${pointer}/${escapeSegment(k)}`, out);
     }
   }
@@ -119,6 +123,13 @@ export interface ResolveResult {
   readonly inherits: number;
   readonly localizedBy: number;
   readonly dangling: number;
+  /**
+   * Declared references whose target type has no asset of that name.
+   *
+   * Stronger than an ordinary dangling string: the schema states what the field
+   * points at, so this is a broken reference rather than a guess that missed.
+   */
+  readonly brokenDeclared: number;
   /** Distinct raw values that matched an asset id but look like noise. */
   readonly ambiguous: number;
 }
@@ -138,8 +149,8 @@ export function resolveCandidates(db: Database): ResolveResult {
 
     // Inheritance: an explicit, engine-resolved relationship, not a guess.
     db.exec(`
-      INSERT INTO edges (src, dst, kind, json_pointer, confidence)
-      SELECT c.asset_id, a.id, 'INHERITS_FROM', c.json_pointer, 'high'
+      INSERT INTO edges (src, dst, dst_kind, kind, json_pointer, confidence)
+      SELECT c.asset_id, a.id, 'asset', 'INHERITS_FROM', c.json_pointer, 'high'
         FROM candidates c
         JOIN assets a ON a.logical_id = c.raw_value
        WHERE c.json_pointer = '/Parent' AND a.id <> c.asset_id
@@ -151,8 +162,8 @@ export function resolveCandidates(db: Database): ResolveResult {
     // SQLite means string surgery with no substring-search function; the query
     // layer splits the pointer instead, which is one line there and none here.
     db.exec(`
-      INSERT INTO edges (src, dst, kind, json_pointer, confidence)
-      SELECT c.asset_id, l.id, 'LOCALIZED_BY', c.json_pointer, 'high'
+      INSERT INTO edges (src, dst, dst_kind, kind, json_pointer, confidence)
+      SELECT c.asset_id, l.id, 'lang_key', 'LOCALIZED_BY', c.json_pointer, 'high'
         FROM candidates c
         JOIN lang_keys l
           ON l.key = CASE
@@ -164,33 +175,48 @@ export function resolveCandidates(db: Database): ResolveResult {
 
     // Files: Common/-relative paths carrying an extension.
     db.exec(`
-      INSERT INTO edges (src, dst, kind, json_pointer, confidence)
-      SELECT c.asset_id, f.id, 'REFERENCES_FILE', c.json_pointer, 'high'
+      INSERT INTO edges (src, dst, dst_kind, kind, json_pointer, confidence)
+      SELECT c.asset_id, f.id, 'file', 'REFERENCES_FILE', c.json_pointer, 'high'
         FROM candidates c
         JOIN files f ON f.path = 'Common/' || c.raw_value
        WHERE c.raw_value LIKE '%.%' AND c.raw_value NOT LIKE '% %'
     `);
 
-    // Asset references.
+    // Asset references, in two steps.
     //
-    // Confidence comes from the schema where it can. `hytale.hytaleAssetRef` names
-    // the asset type a field points at -- 932 fields across 70 targets -- so a
-    // value landing in such a field is a declared reference, not a string that
-    // happened to collide with an identifier.
+    // `hytale.hytaleAssetRef` names the asset type a field points at -- 849 fields
+    // across 70 targets. Where it is present the reference is a declared fact, and
+    // crucially it also **disambiguates the target**: `Wood` exists simultaneously
+    // as a PhysicalMaterial, a BlockSoundSet and a BlockParticleSet, and matching
+    // on name alone produced an edge to each. Requiring the declared type picks the
+    // one the field actually means.
     //
-    //   high    the field declares a target type AND the matched asset is of it
-    //   medium  the field declares a target type but the match is a different
-    //           type, or the field name follows a naming convention
+    //   high    declared target type, and an asset of that type carries the name
+    //   medium  no declared target, but the field name follows a naming convention
     //   low     neither: the value merely collides with some identifier
-    //
-    // The medium/type-mismatch case is worth keeping rather than dropping: it is
-    // how a reference pointing at the wrong kind of asset becomes visible.
     db.exec(`
-      INSERT INTO edges (src, dst, kind, json_pointer, confidence)
-      SELECT c.asset_id, a.id, 'REFERENCES', c.json_pointer,
+      INSERT INTO edges (src, dst, dst_kind, kind, json_pointer, confidence)
+      SELECT c.asset_id, a.id, 'asset', 'REFERENCES', c.json_pointer, 'high'
+        FROM candidates c
+        JOIN assets src ON src.id = c.asset_id
+        JOIN schema_fields sf
+               ON sf.asset_type = src.type
+              AND sf.json_pointer = c.schema_pointer
+              AND sf.reference_target IS NOT NULL
+        JOIN assets a
+               ON a.logical_id = c.raw_value
+              AND a.type = sf.reference_target
+       WHERE c.json_pointer <> '/Parent' AND a.id <> c.asset_id
+    `);
+
+    // Everything else: no declared target, or a declared target that nothing of
+    // that type answers to. The second case is a genuine finding -- a reference
+    // pointing at the wrong kind of asset, or at nothing -- and is left to the
+    // dangling pass below rather than fabricated into an edge of the wrong type.
+    db.exec(`
+      INSERT INTO edges (src, dst, dst_kind, kind, json_pointer, confidence)
+      SELECT c.asset_id, a.id, 'asset', 'REFERENCES', c.json_pointer,
              CASE
-               WHEN sf.reference_target IS NOT NULL AND sf.reference_target = a.type THEN 'high'
-               WHEN sf.reference_target IS NOT NULL THEN 'medium'
                WHEN c.json_pointer LIKE '%Id'
                  OR c.json_pointer LIKE '%/Set'
                  OR c.json_pointer LIKE '%/Model'
@@ -200,13 +226,33 @@ export function resolveCandidates(db: Database): ResolveResult {
                ELSE 'low'
              END
         FROM candidates c
-        JOIN assets a ON a.logical_id = c.raw_value
         JOIN assets src ON src.id = c.asset_id
-        LEFT JOIN schema_fields sf
-               ON sf.asset_type = src.type
-              AND sf.json_pointer = c.schema_pointer
-              AND sf.reference_target IS NOT NULL
-       WHERE c.json_pointer <> '/Parent' AND a.id <> c.asset_id
+        JOIN assets a ON a.logical_id = c.raw_value
+       WHERE c.json_pointer <> '/Parent'
+         AND a.id <> c.asset_id
+         AND NOT EXISTS (
+               SELECT 1 FROM schema_fields sf
+                WHERE sf.asset_type = src.type
+                  AND sf.json_pointer = c.schema_pointer
+                  AND sf.reference_target IS NOT NULL)
+    `);
+
+    // A declared reference whose target type has no such asset: the field says it
+    // points at an X named N, and no X is named N. Recorded distinctly from an
+    // ordinary dangling string, because the schema makes this one unambiguous.
+    db.exec(`
+      UPDATE candidates SET dangling = 2
+       WHERE EXISTS (
+             SELECT 1 FROM assets src
+               JOIN schema_fields sf
+                 ON sf.asset_type = src.type
+                AND sf.json_pointer = candidates.schema_pointer
+                AND sf.reference_target IS NOT NULL
+              WHERE src.id = candidates.asset_id
+                AND NOT EXISTS (
+                      SELECT 1 FROM assets a
+                       WHERE a.logical_id = candidates.raw_value
+                         AND a.type = sf.reference_target))
     `);
 
     // Mark candidates that named something identifier-shaped but matched nothing.
@@ -228,6 +274,7 @@ export function resolveCandidates(db: Database): ResolveResult {
       inherits: count("SELECT count(*) AS n FROM edges WHERE kind = 'INHERITS_FROM'"),
       localizedBy: count("SELECT count(*) AS n FROM edges WHERE kind = 'LOCALIZED_BY'"),
       dangling: count("SELECT count(*) AS n FROM candidates WHERE dangling = 1"),
+      brokenDeclared: count("SELECT count(*) AS n FROM candidates WHERE dangling = 2"),
       ambiguous: count(
         "SELECT count(*) AS n FROM edges WHERE kind = 'REFERENCES' AND confidence = 'low'",
       ),

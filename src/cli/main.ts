@@ -1,6 +1,16 @@
 #!/usr/bin/env node
 import { detectInstallation, detectProject } from "../sources/detect.ts";
-import { cmdEval, cmdGenerateSchema, cmdGet, cmdIndex, cmdSearch } from "./commands.ts";
+import {
+  cmdBench,
+  cmdDescribe,
+  cmdEval,
+  cmdGenerateSchema,
+  cmdGet,
+  cmdIndex,
+  cmdSearch,
+  cmdSearchSchema,
+  cmdUndocumented,
+} from "./commands.ts";
 
 /**
  * CLI entry point.
@@ -19,6 +29,10 @@ const USAGE = `hytale-atlas — unofficial local index of Hytale assets
   hytale-atlas search <query>  Search assets in any indexed locale
   hytale-atlas get <id>        Effective definition, with the parent chain resolved
                                (the only high-token command)
+  hytale-atlas describe <Type> Schema for a type: declared and observed layers
+  hytale-atlas search-schema <q>  Where does a capability live, and does it exist
+  hytale-atlas bench [id]      Crafting benches; with an id, what it crafts
+  hytale-atlas undocumented    Fields the schema permits that vanilla never uses
   hytale-atlas eval            Run the search evaluation set, recall@5 per tier
   hytale-atlas generate-schema Run the game's own schema generator, then ingest
                                (starts the server binary; it sends telemetry)
@@ -161,6 +175,26 @@ function main(): number | Promise<number> {
       }
       return cmdGet(id, opts(args));
     }
+    case "describe": {
+      const type = args.rest[0];
+      if (type === undefined) {
+        process.stderr.write("usage: hytale-atlas describe <AssetType> [--field <pointer>]\n");
+        return 2;
+      }
+      return cmdDescribe(type, opts(args));
+    }
+    case "search-schema": {
+      const query = args.rest.join(" ");
+      if (query.length === 0) {
+        process.stderr.write("usage: hytale-atlas search-schema <query>\n");
+        return 2;
+      }
+      return cmdSearchSchema(query, opts(args));
+    }
+    case "bench":
+      return cmdBench(args.rest[0], opts(args));
+    case "undocumented":
+      return cmdUndocumented(opts(args));
     case "eval":
       return cmdEval(opts(args));
     case "generate-schema":
@@ -194,6 +228,8 @@ function opts(args: Args) {
     ...(num("limit") !== undefined ? { limit: num("limit")! } : {}),
     ...(str("jar") !== undefined ? { jar: str("jar")! } : {}),
     ...(str("keep") !== undefined ? { keep: str("keep")! } : {}),
+    ...(str("field") !== undefined ? { field: str("field")! } : {}),
+    ...(str("type") !== undefined ? { type: str("type")! } : {}),
     ...(args.flags.has("force") ? { force: true } : {}),
     ...(args.flags.has("yes") ? { yes: true } : {}),
     ...(args.flags.has("dry-run") ? { dryRun: true } : {}),
