@@ -120,36 +120,54 @@ the first try, grounded in how the game actually does it.
   cover the plugin-authoring surface. This tool reads the JAR only to recover
   *asset schema*, not to document classes.
 
-## Operating constraint — static sources only
+## Operating constraint — files at rest, plus documented batch modes
 
-**The tool must never require the game to run.** Everything it knows comes from
-files at rest:
+**The tool never depends on a live game.** Its inputs are files:
 
 | Source | Supplies |
 |---|---|
-| `HytaleServer.jar` | Schema, enums, validators, asset-type registry, engine behaviour |
+| `HytaleServer.jar` | Schema, enums, asset-type table, engine behaviour |
 | `Assets.zip` | The vanilla corpus and its localization |
 | Pack directories and archives | Third-party and user content |
 | `patchline.json` | Which installation to read |
 
-No game process. No server instance. No connection to a running server. No
-in-game command output.
+No live server. No network session. No world. No in-game command output.
 
-This is a hard constraint, not a preference, and it has teeth in three places:
+### The one permitted exception, and its price
 
-1. **Codec extraction loads classes; it does not boot a server.** Reading metadata
-   out of a JVM that has loaded the JAR is within scope. If some type's static
-   initializer demands a live server environment, that type degrades to
-   corpus-inferred and is reported in `coverage` — we do not start a server to
-   rescue it (`05-CODEC-EXTRACTION.md`).
-2. **Questions answerable only by observing a running game are out of scope as
-   *mechanisms*.** They may remain useful as one-off research, but nothing the tool
-   does at runtime may depend on them. `OPEN-QUESTIONS.md` Q9 (`/assets` command
-   output) falls here and has been demoted accordingly.
-3. **Where a question looked like it needed the game, read the JAR instead.** This
-   is not a workaround; it is usually the better answer, because the JAR is the
-   thing the game itself obeys. Phase 0 resolved Q5 and Q7 exactly this way after
-   both were initially filed as "needs a running game" — see `OPEN-QUESTIONS.md`.
+**Documented batch modes of the server binary that generate a file and exit** are
+in scope. The server ships `--generate-asset-schema <dir>`, which produces the
+entire schema corpus in ~40 seconds and terminates
+(`05-CODEC-EXTRACTION.md`). Shelling out to a vendor tool that exits is a different
+act from requiring a running game — nearer to invoking `javac` than to booting a
+world.
+
+This was a deliberate amendment, not a drift. The original constraint said "no game
+process" outright, and adopting the batch mode changes it. Three conditions come
+with it:
+
+1. **Disclose before running.** The batch mode **emits telemetry and we cannot
+   suppress it** — `TelemetryService` has no CLI switch. It also writes plugin and
+   server configs. The user must be told plainly that this step starts the vendor's
+   server binary and that the binary phones home. Not in a log line; in the prompt
+   that precedes it.
+2. **Isolate and clean up.** Fresh temp working directory, deleted afterwards. The
+   generator *wipes its output directory* before writing, so pointing it at user
+   content would destroy it.
+3. **Cache by JAR hash.** Once per game version, never per invocation.
+
+### What remains out of scope
+
+- **A live server as a data source.** `OPEN-QUESTIONS.md` Q9 (`/assets` command
+  output) stays demoted: even a favourable answer could not be depended on.
+- **Long-running or interactive game processes.** Batch-and-exit only.
+
+### Where a question looks like it needs the game, check twice
+
+Phase 0 filed Q5 and Q7 as "needs a running game"; both turned out to be readable
+from the JAR, and the JAR answers were *better*, because they state the rule rather
+than one instance of it. Q1 went through three plans before someone read `--help`.
+**Suspect the framing before accepting the deferral.**
 
 The one place this constraint bites honestly is **evaluation**: "does the generated
 pack load in-game" is the only true ground truth, and it is out of scope for the

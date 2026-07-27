@@ -282,11 +282,16 @@ a **populated** store, so this needs the corpus loaded through the engine — he
 than schema extraction, though still short of booting a server, which
 `01-VISION.md` §Operating constraint forbids.
 
-**Deliberately not scheduled.** `05-CODEC-EXTRACTION.md` §Scope boundary draws the
-line at *reading declarations* rather than *invoking behaviour*, and this falls on
-the far side. `validate_pack` therefore ships as schema conformance plus
-broken-reference detection — the design's original specification. See
-`OPEN-QUESTIONS.md` **Q17** for the revisit trigger.
+**Deliberately not scheduled — on cost, not feasibility.** The engine's validators
+*are* reachable, as a documented batch mode (`--validate-assets
+--shutdown-after-validate`). What rules them out as the default is the price:
+a full server boot of roughly 40 seconds, an unsuppressable telemetry beacon, and a
+scratch directory — **per run**. `validate_pack` is meant to be callable after
+every edit; this cannot be.
+
+So `validate_pack` ships as schema conformance plus broken-reference detection —
+the design's original specification — and deep validation is at most an explicit,
+user-invoked `validate --deep`. See `OPEN-QUESTIONS.md` **Q17**.
 
 Distinguish **error** (will not load) from **warning** (unusual but legal). Do not
 report low-confidence heuristic findings as errors.

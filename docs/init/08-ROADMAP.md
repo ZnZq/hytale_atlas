@@ -44,33 +44,27 @@ size percentiles before elision thresholds are tuned.
 **Deliverable:** `npx hytale-index` indexes `Assets.zip` and serves
 `search_assets`, `list_asset_types`, `get_asset` over MCP.
 
-### Prerequisite — build the extractor first
+### Prerequisite — run schema generation first
 
-**Phase 1 consumes two of the extractor's three artifacts**, so the extractor
-program is built before the corpus index rather than after it:
+**Phase 1 needs two things that only the JAR supplies**, and both come out of a
+single 40-second command (`05-CODEC-EXTRACTION.md`):
 
-| Needed by | Artifact |
+| Needed by | Comes from |
 |---|---|
-| Pass 1, `logical_id`, `list_asset_types` | The asset type table — `id`, `path`, `fileExtension` (Q4) |
-| `get_asset` | Inheritance merge semantics, from `Schema.hytaleParent` (Q18) |
+| Pass 1, `logical_id`, `list_asset_types` | the type table — `hytale.path` / `hytale.extension` per schema (Q4) |
+| `get_asset` | per-field `inheritsProperty` / `mergesProperties` (Q18) |
 
-There is **no separate "probe"**. Once Phase 2's scope was fixed at three artifacts
-(`05-CODEC-EXTRACTION.md` §Scope boundary), the extractor became small enough that
-splitting it would cost more than moving it. Build it whole, run it, and Phase 1
-starts with real type and inheritance data.
+This was previously scoped as "build the extractor first". **That work no longer
+exists** — the server generates the schemas itself, so the prerequisite is running
+a command and reading its output, not writing a program.
 
-What stays in Phase 2 is everything that *consumes* the output —
-`find_undocumented`, authoritative `describe_schema`, `search_schema`,
-schema-aware `validate_pack`. Only the extraction program moves.
+Without it, Phase 1 either guesses at asset types or ships a `get_asset` that
+returns partial definitions. **Both failures are silent**: nothing crashes, the
+answers are simply wrong.
 
-Without this ordering, Phase 1 either guesses at asset types or ships a `get_asset`
-that returns partial definitions. **Both failures are silent**, which is the worst
-kind here: nothing crashes, the answers are simply wrong.
-
-If the registry proves impossible to populate without booting a server (forbidden —
-`01-VISION.md` §Operating constraint), fall back to reading the literal
-`id`/`path`/`fileExtension` constants from the handler construction sites, and
-report the degradation in `status()`.
+The one-time cost is real and must be surfaced to the user rather than hidden:
+~40 s, a telemetry beacon that cannot be suppressed, and a scratch directory. Cache
+the result by JAR hash so it happens once per game version.
 
 Scope:
 - Streaming ZIP reader with per-entry extraction (do not unpack wholesale) —
@@ -135,30 +129,40 @@ precisely the low-confidence collision case. Running extraction *before* schema
 inference means Phase 3 resolves those against declared types instead of guessing,
 so its statistics are built on correct edges rather than needing rework.
 
-**Scope is fixed by `05-CODEC-EXTRACTION.md` §Scope boundary — three artifacts,
-nothing else:**
+**There is no extractor to write.** The server generates the schemas itself
+(`05-CODEC-EXTRACTION.md`):
 
-1. The asset type table — `id`, `path`, `fileExtension` per registered type, from
-   `AssetTypeRegistry` / `AssetEditorAssetType`
-2. Codec schema per type — `toSchema(SchemaContext)`, serialised via `Schema.CODEC`
-3. Reference-typed field markers — **free**, they arrive inside (2) because
-   `AssetKeyValidator.updateSchema` writes them there
+```
+java -jar HytaleServer.jar --bare --assets <Assets.zip> --generate-asset-schema <tmp>
+```
 
-`Schema.hytaleParent` (`InheritSettings`) also arrives free inside (2), which is
-where the Q18 inheritance semantics come from.
+~40 seconds, 104 schemas, 12.7 MB, exits on its own. **No Java code ships in this
+project.**
 
-Engineering around those three:
-- Pre-compiled JVM extractor run as a sandboxed subprocess, preferring the game's
-  bundled JRE (`06-CLI-UX.md`)
-- Keep the verbatim schema document *and* a flattened field list
-- **Capture `title` / `description` / `enumDescriptions`** — the game documents its
-  own schema; that prose is user-facing output *and* the input to `search_schema`
-- Coverage reporting, including types that fail to initialise
-- Hash-keyed schema cache
+Scope is therefore ingestion, not extraction:
 
-**Do not extend this scope during Phase 2.** Q17 (executing engine validators) and
-Q19 (the engine's own reference graph) are filed and explicitly **not scheduled** —
-revisit only if Phases 1–3 demonstrate a gap they would close.
+- **Subprocess driver** — fresh temp working directory, run, read, delete. Prefer
+  the game's bundled JRE (`06-CLI-UX.md`); no user-installed Java required
+- **Disclosure prompt before the first run.** The batch mode emits telemetry that
+  cannot be suppressed, and writes configs. The user must be told before it runs,
+  not after (`01-VISION.md` §Operating constraint)
+- **Tolerant reader** — `common.json` contains bare `NaN` and is not valid JSON;
+  103 of 104 files parse strictly
+- **Ingest the type table** from each schema's `hytale.path` / `hytale.extension`,
+  cross-checked against `.vscode/settings.json`'s 102 `fileMatch` bindings.
+  Disagreement is a bug worth surfacing
+- **Ingest the prose** — 17 641 field descriptions and `markdownDescription`. This
+  is user-facing output *and* the FTS input for `search_schema`
+- **Ingest `inheritsProperty` / `mergesProperties`** — per-field inheritance
+  semantics, which `get_asset` needs (Q18)
+- **Mine what reference signal exists** — `hytale.uiEditorComponent`, `$ref`
+  structure. Reference targets are *not* machine-marked, so this supplements the
+  heuristic resolver rather than replacing it
+- Hash-keyed cache; re-run only when the JAR hash changes
+
+**Do not extend scope during Phase 2.** Q17 (deep validation via
+`--validate-assets`) and Q19 (the engine's reference graph) are filed and
+**not scheduled** — revisit only if Phases 1–3 show a gap they would close.
 
 **Test, and treat it as a go/no-go on the feature's framing.** Take a sample of
 fields `find_undocumented` reports and grade them **statically first**, in this

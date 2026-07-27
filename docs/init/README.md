@@ -108,29 +108,45 @@ scope. **When a question looks like it needs the game, suspect the framing.**
   51 archive directories, with no clean correspondence.
 
 **Roadmap change:** Phase 3 (codec extraction) was promoted ahead of Phase 2
-(schema statistics), on the trigger the roadmap itself specified. The extraction
-*program* moves earlier still — Phase 1 consumes two of its three artifacts.
+(schema statistics), on the trigger the roadmap itself specified. Schema generation
+moves earlier still — it is a 40-second command, and Phase 1 needs its type table
+and inheritance markers before pass 1 can run.
 
 ---
 
-## Scope boundary — added after Phase 0
+## Schema extraction — solved by the game, not by us
 
-Phase 0 kept finding useful things in the JAR, and the natural drift was to reach
-for all of them. **`05-CODEC-EXTRACTION.md` §Scope boundary now fixes the line:**
+**The server ships `--generate-asset-schema <dir>`**, a documented batch mode that
+writes the entire schema corpus and exits. Measured: ~40 s, **104 schemas,
+12.7 MB**, with 17 641 field descriptions, an embedded asset-type table
+(`hytale.path` / `hytale.extension`), per-field inheritance markers, and a
+`.vscode/settings.json` binding file globs to schemas.
 
-> **Read data, do not invoke behaviour.**
+**No Java code ships in this project.** The extraction step is a subprocess call.
 
-Extraction produces exactly three artifacts — the asset type table, the codec
-schema per type, and reference-typed field markers (the third arrives free inside
-the second). Executing the engine's validators (**Q17**) and reading its internal
-reference graph (**Q19**) are *filed, not scheduled*: both require populated asset
-stores, which couples us to how the game initialises rather than to what it
-declares.
+This required amending the operating constraint, deliberately: the original said
+"no game process" outright. Batch modes that generate a file and exit are now in
+scope; a live server is still not (`01-VISION.md`). Three conditions ride along —
+see `05-CODEC-EXTRACTION.md` §Hazards:
 
-The corollary is easy to miss: **learning a rule from the JAR does not create a
-dependency on it.** Pack priority (Q5) and Asset Editor write semantics (Q7) were
-read statically and written down. We implement them ourselves. That is knowledge,
-not coupling.
+- **It emits telemetry we cannot suppress.** No CLI switch exists. The user must be
+  told before the run, not after.
+- **It wipes its output directory** before writing. Fresh temp dir only.
+- **`common.json` is not valid JSON** — bare `NaN`. 103 of 104 parse strictly.
+
+Two corollaries worth keeping:
+
+- **Learning a rule from the JAR does not create a dependency on it.** Pack
+  priority (Q5) and Asset Editor write semantics (Q7) were read statically and
+  written down; we implement them ourselves.
+- **Reference targets are *not* machine-marked in the schema.** An earlier revision
+  claimed they were, reasoning from `AssetKeyValidator.updateSchema` in the
+  bytecode; the generated output disproved it. Reference resolution stays
+  substantially heuristic (**Q17**, `03-ARCHITECTURE.md` §Confidence).
+
+**Q17** (deep validation via `--validate-assets`) and **Q19** (the engine's
+reference graph) remain *filed, not scheduled* — now on cost grounds rather than
+feasibility.
 
 ## A worked example that shaped the design
 

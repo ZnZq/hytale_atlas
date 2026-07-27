@@ -711,29 +711,48 @@ candidate asset, validation becomes *authoritative* rather than approximate — 
 tool would report exactly what the game will reject, which is a far stronger claim
 than "this field is unusual in the corpus."
 
-**Substantially advanced during the Q5/Q7 investigation. Two findings:**
+**Reframed after the official batch mode was found. Three findings, one of them a
+correction.**
 
-**1. Reference-typed fields mark themselves in the emitted schema.**
+**1. CORRECTION — reference-typed fields do *not* mark themselves in the schema.**
 
-```java
-public class AssetKeyValidator<K> implements Validator<K> {
-    private final Supplier<AssetStore<K, ?, ?>> store;
-    public void accept(K, ValidationResults);
-    public void updateSchema(SchemaContext, Schema);      // <-- this
-}
+An earlier revision of this answer claimed they did, reasoning from
+`AssetKeyValidator.updateSchema(SchemaContext, Schema)` in the bytecode. **The
+generated output does not bear that out.** Known reference fields emerge bare:
+
+```json
+"Set":  { "type": ["string", "null"] },
+"Icon": { "type": ["string", "null"], "hytale": { "type": "string", … } }
 ```
 
-`updateSchema` means a validator **writes itself into the schema `toSchema()`
-produces**. So a field validated by `AssetKeyValidator` is identifiable *in the
-extracted schema* as a reference, along with which `AssetStore` it targets.
+`hytale.type` is a JSON-type marker (`string`, `object`, `Enum`, `Color`), not a
+pointer to a target asset type. Whatever `updateSchema` contributes, it is not a
+machine-readable reference target.
 
-This is exactly the "High — the field is covered by extracted codec schema and
-typed as a reference. Not a heuristic at all" tier that `03-ARCHITECTURE.md`
-§Confidence hoped for, and it removes the guesswork for every field it covers.
-Given that real references are bare unnamespaced strings (`"Set": "Rock_Magma_Cooled"`),
-this is the difference between a usable reference graph and a noisy one.
+Partial signal remains and should be mined: `hytale.uiEditorComponent` (259 fields)
+names the editor picker and sometimes a path template. But this covers a minority.
+**Reference resolution stays substantially heuristic** — see
+`05-CODEC-EXTRACTION.md` §What it does NOT give us, and adjust
+`03-ARCHITECTURE.md` §Confidence expectations accordingly.
 
-**2. Missing-reference diagnosis is a first-class engine concept.**
+**2. Validation is reachable as a batch mode, not by reflection.**
+
+```
+--validate-assets           exit non-zero if any assets are invalid
+--validate-prefabs          same for prefabs
+--shutdown-after-validate   exit once validation completes
+```
+
+This is the same class of action as `--generate-asset-schema`, now permitted under
+the amended operating constraint (`01-VISION.md`) — with the same hazards:
+telemetry we cannot suppress, and a working directory that must be isolated.
+
+So the question is no longer "can we invoke the validators" but "is shelling out to
+a validation run worth its cost per invocation". Given it boots the server each
+time, it is plainly unsuitable for the per-keystroke path and plausibly useful as
+an explicit `validate --deep` command.
+
+**3. Missing-reference diagnosis is a first-class engine concept.**
 
 ```java
 public class AssetValidationResults extends ValidationResults {
@@ -757,16 +776,19 @@ it is reachable. Also determine whether `LateValidator` implies a two-phase mode
 and whether error messages resolve through `assetEditor.messages.*` keys and can
 therefore be rendered as real prose.
 
-**⛔ Filed, not scheduled.** `05-CODEC-EXTRACTION.md` §Scope boundary excludes this
-from Phase 2. Reading the schema marker is *reading a declaration*; running the
-validators is *invoking behaviour*, which needs populated `AssetStore`s and couples
-us to the engine's initialisation sequence rather than to what it declares.
+**⛔ Filed, not scheduled** — but for a cost reason now, not a feasibility one.
 
-The affordable consequence: `validate_pack` degrades to schema conformance plus
-broken-reference detection — which is what the design specified in the first place.
+`--validate-assets --shutdown-after-validate` is available and permitted. What
+makes it unsuitable as the default is its price: a full server boot (~40 s), a
+telemetry beacon, and a scratch working directory, **per run**. `validate_pack` is
+meant to be callable after every edit; this cannot be.
 
-**Revisit when** Phases 1–3 have shipped and validation demonstrably misses real
-errors that these validators would have caught. Not before.
+`validate_pack` therefore ships as schema conformance plus broken-reference
+detection — what the design specified in the first place — and deep validation is at
+most an explicit, user-invoked `validate --deep`.
+
+**Revisit when** Phases 1–3 have shipped and cheap validation demonstrably misses
+real errors. Not before.
 
 ---
 
@@ -797,13 +819,38 @@ not self-contained.**
 - It interacts with Q5: if pack override uses the same merge machinery, both
   problems share a solution.
 
-**Determine:** merge semantics (deep merge? list concatenation or replacement?
-null-as-delete?); whether chains can be multi-level or cyclic; whether `Parent` is
-the only inheritance field or one of several; how `InheritSettings` in the schema
-describes it.
+**Answer: deep merge, child replaces parent per field, recursively into nested
+structures. Documented by the game itself.**
 
-**This is the most consequential newly discovered item.** It affects Phase 1
-(`get_asset`) and Phase 2 (schema inference), not just later phases.
+The generated schema (`05-CODEC-EXTRACTION.md`) carries this as the description of
+`/properties/Parent`, verbatim:
+
+> *"When set this asset will inherit properties from the named asset. When
+> inheriting from another **Item** most properties will simply be copied from the
+> parent asset to this asset. In the case where both child and parent provide a
+> field the child field will simply replace the value provided by the parent, in
+> the case of nested structures this will apply to the fields within the
+> structure."*
+
+**And it is answered per field, not just in general.** The `hytale` metadata block
+marks individual properties:
+
+| Marker | Count across 104 schemas | Meaning |
+|---|---|---|
+| `inheritsProperty` | 3 024 | this field is inherited from `Parent` |
+| `mergesProperties` | 1 237 | this field merges rather than being replaced wholesale |
+
+So `get_asset` can resolve the parent chain exactly, and report per field whether a
+value was declared locally, inherited, or merged — which is precisely what a pack
+author needs in order to know what to put in their own file.
+
+**Still unverified:** whether chains can be multi-level (almost certainly yes —
+`Tool_Pickaxe_Iron` → `Tool_Pickaxe_Crude`) and whether cycles are possible or
+rejected. Cheap to determine from the corpus once indexing exists; guard against
+cycles defensively in the resolver regardless.
+
+Note "most properties will simply be copied" — the hedge is the game's own. The
+per-field markers are the authority where the prose is vague.
 
 ---
 
@@ -835,9 +882,9 @@ all reference kinds or only some; whether it is reachable without a live server
 whether it survives as queryable state or is transient during load; how it relates
 to `AssetKeyValidator`, which appears to be the per-field mechanism.
 
-**⛔ Filed, not scheduled.** Same boundary as Q17: reaching this graph means
-populating asset stores through the engine, i.e. invoking behaviour rather than
-reading a declaration (`05-CODEC-EXTRACTION.md` §Scope boundary).
+**⛔ Filed, not scheduled.** Same reasoning as Q17: reaching this graph means
+populating asset stores through the engine — a full boot per run, with the
+telemetry and isolation costs that carries (`05-CODEC-EXTRACTION.md` §Hazards).
 
 The heuristic resolver is needed regardless — for anything schema does not type,
 and for the hot layer, where the user's in-progress pack may not load at all. And
