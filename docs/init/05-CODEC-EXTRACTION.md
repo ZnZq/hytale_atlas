@@ -1,251 +1,254 @@
-# 05 — Codec Extraction
+# 05 — Schema Extraction
 
-**Highest risk, highest value component. Read `OPEN-QUESTIONS.md` Q1 before
-starting: the entire approach depends on an unverified assumption.**
+**Status: solved, and not by us.** The server ships a documented batch mode that
+generates the schemas itself.
 
----
+This document has been rewritten twice. The first version planned to recover schema
+by reflection, ASM bytecode analysis, or decompilation, and rated the work "highest
+risk, highest value". The second discovered `Codec<T> extends SchemaConvertable<T>`
+and planned a small reflective extractor. Both are obsolete: **the game has a CLI
+flag for exactly this.** See §Historical note.
 
-## Why this matters
-
-Corpus inference tells you what vanilla *uses*. It cannot tell you what the game
-*accepts*. The difference is the whole point:
-
-| Source | Answers |
-|---|---|
-| Corpus (`Assets.zip`) | What is idiomatic. Which fields co-occur. Real examples. |
-| Codecs (server JAR) | What is legal. Complete field set, types, defaults, optionality. |
-| Enum types in bytecode | The **complete** valid value set for a field |
-
-An enum recovered from the corpus contains only values that happened to be used.
-An enum recovered from bytecode is exhaustive. For a creator asking "what else can
-I put here", only the second is an answer.
-
-And the diff between the two is the intended product: **fields that exist in the
-schema and appear in zero vanilla assets**. Nothing else in the Hytale ecosystem
-surfaces these.
-
-**Caveat, and it is a real one.** Such a field is not automatically a usable
-feature. It may be deprecated, engine-internal, set programmatically rather than
-read from JSON, or a debug hook. The value of this feature rests on an untested
-assumption about what fraction are genuinely usable.
-
-Test it as soon as tier 2 works at all: pick three schema-only fields, put them in a
-real pack, run the game, see what happens. That experiment costs an hour and
-determines whether this is the headline feature or a footnote. See `01-VISION.md`
-criterion 6.
+Verified 2026-07-27 against the release patchline.
 
 ---
 
-## The complication
-
-`[REPORTED]` Hytale uses a "Codec system" for JSON serialization.
-
-`[ASSUMED]` It resembles Mojang's DataFixerUpper `Codec`.
-
-If that assumption holds, the good news is that codecs carry more than annotations
-would: field name, type, optionality, default, and nested composition are all
-explicit. The bad news is *how* they carry it. Codecs are **imperative builder
-chains in static initializers**, not declarative metadata. You cannot recover them
-by reflecting over class fields the way you could with `@JsonProperty`.
-
-Roughly, a codec looks like:
-
-```java
-public static final Codec<Item> CODEC = RecordCodecBuilder.create(i -> i.group(
-    Codec.STRING.fieldOf("Name").forGetter(Item::name),
-    Model.CODEC.optionalFieldOf("Model").forGetter(Item::model),
-    Codec.INT.optionalFieldOf("MaxStack", 64).forGetter(Item::maxStack)
-).apply(i, Item::new));
-```
-
-The field names live as string constants inside `<clinit>`, threaded through
-builder calls. Recovering them statically means tracing bytecode.
-
----
-
-## Three approaches, in order of preference
-
-### A. Runtime reflection over codec objects (preferred)
-
-Load the JAR in a child JVM, enumerate asset config classes, read their static
-codec fields, and walk the resulting codec *object graph* via reflection.
-Serialise the description to JSON and hand it back to the indexer.
-
-**Why preferred:** you inspect the constructed codec, not the code that constructs
-it. Builder complexity, helper methods, and indirection all disappear — you get
-the real structure the game actually uses.
-
-**Costs:**
-- Requires a JVM (Java 25). Plugin developers have it; pack authors may not. This
-  is the tier boundary in `06-CLI-UX.md`.
-- Executes Hytale's code. Static initializers may have side effects or expect an
-  initialised server environment. Sandbox: no network, temp working directory,
-  timeout, separate process so a crash cannot take down the MCP server.
-- Whether codec internals are reflectively walkable depends on their concrete
-  implementation. **This is the core of Q1.**
-
-### B. Bytecode analysis (fallback)
-
-Read class files directly with ASM. No JVM execution, no side effects.
-
-Recoverable without executing anything:
-- Class and field structure, with generic signatures (retained in bytecode)
-- Annotations, if any exist
-- **Enum constants** — complete and definitive, which alone justifies this path
-- Constant strings in `<clinit>`, in call order
-
-The hard part is reconstructing which string binds to which field with which type
-from the builder call sequence. Feasible for straightforward codec construction,
-brittle where the code uses helpers or loops.
-
-**Pragmatic hybrid:** use B for enums and class structure (easy, reliable, no
-JVM), and A for full codec shape when a JVM is available. This maximises what tier
-1 users get.
-
-### C. Decompile to source and parse
-
-Decompile with Vineflower, then parse the Java with tree-sitter or JavaParser.
-
-Least preferred: decompiler output varies in quality, and you inherit both the
-decompiler's errors and the difficulty of A without its accuracy. Mentioned
-because a working precedent exists (below) and because decompiled source is
-independently useful for humans reading the result.
-
----
-
-## Precedent to study
-
-A community project documents Hytale's QUIC/UDP network protocol by
-**automatically extracting, decompiling, and documenting all packets, enums, and
-data structures from server JAR files**, using Vineflower, with version tracking
-and generated wiki documentation.
-
-Found via https://github.com/topics/hytale-api
-
-This is a working JAR-to-structured-data pipeline for exactly this game. Study
-specifically: how it handles version tracking, and how it diffs between versions.
-That is the problem you will hit second.
-
-Separately, Hytale Depot generates an API index from the current `HytaleServer.jar`
-using an automated class-file parser, regenerating signatures and class counts from
-the JAR rather than hand-maintaining them:
-https://hytaledepot.net/en/dev-docs/assets-config
-
-Both confirm automated JAR analysis is practical. Neither extracts *asset schema* —
-that is the gap.
-
----
-
-## Entry points
-
-`[REPORTED]` Asset config classes follow the convention:
+## The command
 
 ```
-com.hypixel.hytale.server.core.asset.type.<typename>.config.<TypeName>
+java -jar HytaleServer.jar \
+     --bare \
+     --assets <Assets.zip> \
+     --generate-asset-schema <output-dir>
 ```
 
-Known: `...asset.type.item.config.Item`, `...asset.type.blocktype.config.BlockType`.
+From the server's own `--help`:
 
-**Enumerating asset types = listing subpackages of
-`com.hypixel.hytale.server.core.asset.type`.** Discover them; do not hardcode a
-list. Cross-check against the directory names actually present in `Assets.zip` —
-if they disagree, that disagreement is itself information worth surfacing.
+> `generate-asset-schema` — Generate asset JSON schemas to the specified directory and exit
+> `generate-config-schema` — Generate config JSON schemas to the specified directory and exit
+> `bare` — Runs the server bare. For example without loading worlds, binding to ports or creating directories.
 
----
+Measured: **~40 seconds**, exits with shutdown reason `schemaGenerated`.
 
-## Known hard problems
-
-### Polymorphic components
-
-The ECS resolves component types through a registry mapping strings to classes.
-Registration is typically imperative and may be scattered, including registration
-performed by plugins at runtime. This is the hardest part of the extraction and
-the most likely place where approach A (runtime, where the registry is populated
-and inspectable) decisively beats B.
-
-Expect partial coverage here. Degrade gracefully: an unrecognised component type
-should fall back to corpus-inferred structure, not produce a validation error.
-
-### Non-codec paths
-
-Not everything necessarily goes through codecs. Hand-written loaders exist in
-community code (`GSON.fromJson(reader, JsonObject.class)` style), and the vanilla
-game may do the same for some asset types. Where no codec is found for a type,
-fall back to inference and mark the schema `source: "inferred"` so the agent knows
-the difference.
-
-### Version drift
-
-Multiple patchlines can coexist on one machine (`02-DOMAIN.md`). Key the extracted
-schema by JAR content hash, never by a version string. Store the patchline as
-metadata for display.
+`Assets.zip` can be passed directly — archive packs are mounted as a
+`java.nio.file.FileSystem` rather than unpacked (`AssetPack.fileSystem`). Asset
+loading is a precondition: without `--assets` the server exits with
+`missingAssets.failedToLoad`.
 
 ---
 
-## Output contract
+## What it produces
 
-Extraction produces a JSON document consumed by the indexer:
+**104 schema files, 12.7 MB**, in a fixed layout under the given directory:
+
+```
+<output-dir>/
+  Schema/<TypeName>.json      104 files, incl. shared common.json and other.json
+  .vscode/settings.json       102 fileMatch -> schema bindings
+```
+
+### The schemas
+
+Real JSON Schema, with cross-file `$ref` (`common.json#/definitions/ItemTool`,
+`CraftingRecipe.json#`), `$id`, `title`, `properties`, `additionalProperties`,
+`default`, and enums.
+
+**17 641 field descriptions**, many with `markdownDescription`. The game documents
+its own schema, because this output drives a VS Code authoring workflow.
+
+Each schema root carries a `hytale` block with **`path` and `extension`** — the
+asset type table, embedded:
+
+```
+BlockGroup           -> Item/Groups        *.json
+BlockBoundingBoxes   -> Item/Block/Hitboxes
+AttitudeGroup        -> NPC/Attitude/Roles
+```
+
+Paths are relative to `Server/` and are frequently three levels deep, confirming
+that a second-level directory is not an asset type (`OPEN-QUESTIONS.md` Q4).
+
+### The `hytale` metadata block
+
+Counts across all 104 schemas:
+
+| Key | Count | Meaning |
+|---|---|---|
+| `type` | 24 153 | **JSON** type marker (`string`, `object`, `Enum`, `EnumMap`, `Color`, …) — *not* an asset reference |
+| `uiPropertyTitle` / `uiDisplayMode` | ~10 200 each | Asset Editor presentation |
+| **`inheritsProperty`** | 3 024 | this field is inherited from `Parent` |
+| **`mergesProperties`** | 1 237 | this field merges rather than replaces |
+| `uiEditorComponent` | 259 | which editor picker the field uses |
+| `path` / `extension` | 102 each | the type table |
+| `internalKeys`, `idProvider`, `allowEmptyObject` | few | |
+
+`inheritsProperty` and `mergesProperties` answer `OPEN-QUESTIONS.md` **Q18 at field
+granularity** — not just "inheritance exists" but which fields do what.
+
+### The `.vscode` bindings
 
 ```json
-{
-  "source_jar_hash": "…",
-  "patchline": "release",
-  "extracted_at": "…",
-  "method": "reflection|bytecode|hybrid",
-  "asset_types": {
-    "item": {
-      "class": "com.hypixel.hytale.server.core.asset.type.item.config.Item",
-      "fields": [
-        {
-          "pointer": "/Name",
-          "type": "String",
-          "optional": false,
-          "default": null,
-          "enum_values": null,
-          "reference_target": null
-        },
-        {
-          "pointer": "/Rarity",
-          "type": "Rarity",
-          "optional": true,
-          "default": "Common",
-          "enum_values": ["Common", "Uncommon", "Rare", "Epic", "Legendary"],
-          "reference_target": null
-        }
-      ]
-    }
-  },
-  "coverage": {
-    "types_found": 47,
-    "types_with_codec": 41,
-    "types_inferred_only": 6
-  }
-}
+{ "fileMatch": ["/Server/Audio/AmbienceFX/*.json",
+                "/Server/Audio/AmbienceFX/**/*.json"],
+  "url": "./Schema/AmbienceFX.json" }
 ```
 
-`coverage` is not decoration. Report it in `status()` so the agent knows how much
-of what it is told is authoritative.
+An independent, machine-readable statement of the same path → type mapping. Use it
+to cross-check the embedded `hytale.path`; a disagreement is a bug worth surfacing.
 
 ---
 
-## Payoff for the resolver
+## Hazards — all three are real
 
-Once schema is available, reference detection stops being heuristic for every
-field it covers. If `/Components/Renderable/Model` is *declared* as a reference to
-a model asset, the edge is high-confidence by construction, and confidence tiers
-are only needed for the uncovered remainder.
+### 1. It wipes the output directory
 
-This is a significant accuracy improvement and an argument for pulling codec
-extraction earlier in the roadmap than a "nice to have" reading would suggest.
-See `08-ROADMAP.md`.
+`SchemaGenerator.cleanAndCreateSchemaDir(Path)` **deletes the target directory
+before writing.** Point it only at a freshly created temp directory. Pointing it at
+a user's pack folder would destroy their work.
+
+This is not hypothetical carelessness to guard against later — it is the first
+thing the generator does.
+
+### 2. It emits telemetry, and that cannot be disabled
+
+The run logs `Sending server stop telemetry`, creates a `telemetry/` directory in
+the working directory, and writes a session `.jsonl`. `TelemetryService` exposes
+`isEnabled()` / `setEnabled(boolean)`, but neither is public API and **no CLI option
+is wired to them**. Of ~50 options there are `--disable-sentry`,
+`--disable-file-watcher` and `--disable-asset-compare`, but nothing for telemetry.
+
+**The tool must disclose this before running schema generation.** A user is
+entitled to know that this step starts the vendor's server binary and that the
+binary phones home. Do not bury it in a log line.
+
+The run also writes plugin configs and a server config into the working directory,
+so give it a scratch working directory of its own, not the user's project.
+
+### 3. `common.json` is not valid JSON
+
+It contains bare `NaN`, which `JSON.parse` rejects. Measured on the release
+patchline: **103 of 104 files parse strictly; `common.json` has exactly three
+occurrences**, all in one place —
+
+```
+/definitions/RailPoint/properties/Normal/default/{X,Y,Z}
+```
+
+— a rail point's normal vector with no meaningful default. `Infinity` does not
+currently appear but is the same class of defect.
+
+**Do not repair this with a regex.** The obvious
+`/(?<=[:\[,\s])(NaN|Infinity)/ → null` happens to work on today's input, but the
+same corpus contains **640 occurrences of these words inside string literals** —
+field descriptions are prose, and one reading *"the value NaN, which means…"* would
+be silently corrupted. The reader must track string state.
+
+Implemented in `src/util/json.ts` (`parseJsonLenient`), which is string-aware and
+**reports** repairs as JSON Pointers rather than applying them silently: a `default`
+that was `NaN` means *unset*, which is a more useful thing to tell a pack author
+than `default: null`. `src/util/json.integration.test.ts` re-checks the whole
+schema set and fails if the shape of the defect changes after a patchline update.
 
 ---
 
-## Legal boundary — non-negotiable
+## What it does NOT give us
 
-- Extraction runs locally, on the user's own installation
-- The repository and published package contain **no** extracted Hytale data
-- No decompiled Hytale source is vendored into the repository
-- Extracted schema lives in the user's cache and is never transmitted
-- Check Hytale's official server/EULA policy pages before publishing
-  (`OPEN-QUESTIONS.md` Q10)
+**Asset reference targets are not machine-marked.** This corrects an earlier claim
+in this document.
+
+`AssetKeyValidator` exposes `updateSchema(SchemaContext, Schema)`, which made it
+look as though reference-typed fields would annotate themselves with their target
+`AssetStore`. **The generated output does not bear that out.** Known reference
+fields come out bare:
+
+```json
+"Set":  { "type": ["string", "null"] },
+"Icon": { "type": ["string", "null"], "hytale": { "type": "string", … } }
+```
+
+`hytale.type` is a JSON-type marker, not a pointer to an asset type.
+
+Partial signal does exist and is worth mining:
+
+- **`hytale.uiEditorComponent`** (259 fields) names the editor picker and sometimes
+  a path template — `Icon` carries
+  `{"component":"Icon","defaultPathTemplate":"Icons/ItemsGenerated/{assetId}.png"}`.
+  That identifies both the reference kind and its file convention.
+- **`$ref` structure** types nested objects precisely, even where leaf strings are
+  untyped.
+- Field descriptions sometimes name the target type in prose.
+
+**Consequence for `03-ARCHITECTURE.md` §Confidence: the "High — typed by schema, not
+a heuristic at all" tier applies to a minority of fields, not the majority.**
+Reference resolution stays substantially heuristic, and the confidence tiers stay
+load-bearing. Plan pass 2 accordingly.
+
+---
+
+## Extraction contract
+
+The tool's extraction step is a **subprocess invocation**, not a program we write.
+There is no Java code in this project.
+
+1. Create a fresh temp directory; never reuse and never point at user content
+2. Run the command above with the working directory set to that temp directory
+3. Read `Schema/*.json` (tolerating `NaN` in `common.json`) and `.vscode/settings.json`
+4. Normalise into the index's own store, keyed by **JAR content hash**
+5. Delete the temp directory, including `telemetry/` and the written configs
+6. Record in `status()`: schema count, type count, generator exit reason, and the
+   fact that telemetry was emitted
+
+Cache aggressively — this is minutes of a user's time and a network beacon per run.
+Re-run only when the JAR hash changes.
+
+---
+
+## Adjacent capability, now reachable
+
+The same batch surface offers:
+
+```
+--validate-assets           exit non-zero if any assets are invalid
+--validate-prefabs          same for prefabs
+--shutdown-after-validate   exit once validation completes
+```
+
+This reopens `OPEN-QUESTIONS.md` **Q17** in a much better form. The question is no
+longer "can we invoke the engine's validators by reflection" — it is "should we
+shell out to a documented validation mode". That is the same class of action as
+schema generation, with the same hazards and the same disclosure requirement.
+
+Still filed, not scheduled: evaluate after Phases 1–3 show what validation misses.
+
+---
+
+## Legal boundary
+
+Verified against Hytale EULA v2.2 (`OPEN-QUESTIONS.md` Q10). The official batch
+mode strengthens the position further:
+
+- **We now run the vendor's own documented tool** rather than reflecting into
+  internals. §4.1(a) on reverse engineering is not engaged at all.
+- Extraction runs locally, on the user's own installation.
+- The repository and published package contain **no** extracted Hytale data.
+- Generated schema lives in the user's cache and is never transmitted.
+- Package naming and README must be descriptive only (§3.6).
+
+---
+
+## Historical note
+
+Three generations of plan, recorded because the progression is instructive:
+
+1. **Reverse-engineer the codecs** — reflection, ASM, or Vineflower. Rated highest
+   risk in the project. Obsolete once Q1 was checked.
+2. **Reflect over `toSchema()`** — a small Java extractor calling
+   `AssetRegistry.getStoreMap()` then `codec.toSchema(new SchemaContext())`. Built
+   and run; it failed at `AssetRegistryLoader.init()` because
+   `Options.getOptionSet()` was null — the registry is populated by server
+   bootstrap, not by class loading. Deleted.
+3. **Run `--generate-asset-schema`** — the current plan.
+
+Each step was a page of careful reasoning replaced by five minutes of checking. The
+recurring lesson, now three for three: **look at the artifact before designing
+around it.** Reading `--help` would have found this on day one.

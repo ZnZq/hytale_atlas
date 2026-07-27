@@ -47,11 +47,29 @@ It answers four families of question:
 |---|---|
 | **What exists?** | "What asset types are there? What items exist?" |
 | **How is X built?** | "Show me how vanilla implements a burning weapon" |
-| **What is possible?** | "What fields can an item definition have, including ones vanilla never uses?" |
+| **What is possible?** | "What fields can an item definition have, including ones vanilla never uses?" · "Can a pickaxe mine 3x3 at all?" |
 | **What connects to X?** | "What breaks if I override this block? What does this entity need to load?" |
 
 The fourth is the one nothing else can answer today, and the third is the one that
 requires the server JAR.
+
+**The third splits into two answers with very different risk profiles**, and the
+distinction is worth making early because it de-risks this document's central bet:
+
+- **The negative answer — "this is not expressible."** Safe, verifiable, and
+  immediately valuable. Traced on real data: a gathering tool has no area field, so
+  a 3x3 pickaxe cannot be made by editing an item. An agent without schema searches
+  the corpus, finds no 3x3 tool, and invents `"BreakRadius": 3`; the game silently
+  ignores it. **Absence is invisible to corpus search**, so this answer is
+  structurally unavailable to any grep-based approach — and it costs nothing to be
+  confident about, because we are reporting what the schema does not contain.
+- **The positive answer — "this field exists but vanilla never uses it."** That is
+  criterion 6 below, and it remains a bet: such a field may be deprecated,
+  engine-internal, or set programmatically.
+
+Half the value of "what is possible" therefore does **not** depend on the bet
+landing. Even if `find_undocumented` turns out to be mostly noise, the negative
+answer stands on its own.
 
 ## Who it is for
 
@@ -102,6 +120,59 @@ the first try, grounded in how the game actually does it.
   cover the plugin-authoring surface. This tool reads the JAR only to recover
   *asset schema*, not to document classes.
 
+## Operating constraint — files at rest, plus documented batch modes
+
+**The tool never depends on a live game.** Its inputs are files:
+
+| Source | Supplies |
+|---|---|
+| `HytaleServer.jar` | Schema, enums, asset-type table, engine behaviour |
+| `Assets.zip` | The vanilla corpus and its localization |
+| Pack directories and archives | Third-party and user content |
+| `patchline.json` | Which installation to read |
+
+No live server. No network session. No world. No in-game command output.
+
+### The one permitted exception, and its price
+
+**Documented batch modes of the server binary that generate a file and exit** are
+in scope. The server ships `--generate-asset-schema <dir>`, which produces the
+entire schema corpus in ~40 seconds and terminates
+(`05-CODEC-EXTRACTION.md`). Shelling out to a vendor tool that exits is a different
+act from requiring a running game — nearer to invoking `javac` than to booting a
+world.
+
+This was a deliberate amendment, not a drift. The original constraint said "no game
+process" outright, and adopting the batch mode changes it. Three conditions come
+with it:
+
+1. **Disclose before running.** The batch mode **emits telemetry and we cannot
+   suppress it** — `TelemetryService` has no CLI switch. It also writes plugin and
+   server configs. The user must be told plainly that this step starts the vendor's
+   server binary and that the binary phones home. Not in a log line; in the prompt
+   that precedes it.
+2. **Isolate and clean up.** Fresh temp working directory, deleted afterwards. The
+   generator *wipes its output directory* before writing, so pointing it at user
+   content would destroy it.
+3. **Cache by JAR hash.** Once per game version, never per invocation.
+
+### What remains out of scope
+
+- **A live server as a data source.** `OPEN-QUESTIONS.md` Q9 (`/assets` command
+  output) stays demoted: even a favourable answer could not be depended on.
+- **Long-running or interactive game processes.** Batch-and-exit only.
+
+### Where a question looks like it needs the game, check twice
+
+Phase 0 filed Q5 and Q7 as "needs a running game"; both turned out to be readable
+from the JAR, and the JAR answers were *better*, because they state the rule rather
+than one instance of it. Q1 went through three plans before someone read `--help`.
+**Suspect the framing before accepting the deferral.**
+
+The one place this constraint bites honestly is **evaluation**: "does the generated
+pack load in-game" is the only true ground truth, and it is out of scope for the
+tool. `09-EVALUATION.md` addresses the substitute.
+
 ## Success criteria
 
 The tool is working if:
@@ -133,12 +204,19 @@ Criteria 1–5 are achievable with confidence. Criterion 6 is the bet.
 
 ## Risk register
 
-| Risk | Severity | Note |
+Revised after Phase 0 verification (2026-07-27). Three of the four High risks
+retired; the residual risk in this project is now **product-side and
+engineering-side, not feasibility-side**.
+
+| Risk | Severity | Status after Phase 0 |
 |---|---|---|
-| Pack format changes between EA versions | High | Schema must be inferred/extracted, never hardcoded |
-| **Search fails on natural-language intent** | **High** | Identifiers are machine names. Mitigated by indexing localization strings — but if lang data is sparse or structured unexpectedly (Q14), reconsider embeddings |
-| Codec extraction proves infeasible | High | Degrades to corpus-only inference; tool still useful, criterion 6 lost |
-| Schema-only fields are mostly noise | Medium | `find_undocumented` becomes a curiosity rather than a feature. Test early; fall back to impact analysis as the headline |
-| Community finds docs-MCP sufficient | Medium | Product risk, not technical. Mitigate by leading with impact analysis, which docs cannot provide |
-| Legal exposure from JAR processing | Medium | Local-only extraction, no redistribution, no bundled game data |
-| Node dependency excludes no-code pack authors | Medium | See `06-CLI-UX.md` for the single-binary alternative |
+| Pack format changes between EA versions | High | **Unchanged.** Still the governing constraint: never hardcode schema. Two patchlines already coexist on one machine, so cache by content hash |
+| **Corpus scale** | **High** → Medium | `Assets.zip` measured at **3.43 GB / 60 148 entries** — an order of magnitude above the original budget. Streaming extraction is mandatory. Downgraded after implementation: enumerating all entries costs ~4 s and decompressing one asset JSON ~0.13 ms, so the archive is navigable; the cost is in how many entries we choose to parse |
+| ~~Path → asset type mapping~~ | ~~High~~ → **Low** | **Retired.** The engine ships the table and the resolver: `AssetEditorAssetType{id, path, fileExtension}` plus `AssetTypeRegistry.getAssetTypeHandlerForPath(Path)`. Execution, not a design unknown — but it must be extracted **before** Phase 1's pass 1 (`08-ROADMAP.md` §Prerequisite) |
+| Asset inheritance (`Parent`) | Medium 🆕 | Definitions are not self-contained. Affects `get_asset` and field statistics. Merge semantics still open — `OPEN-QUESTIONS.md` Q18 |
+| ~~Search fails on natural-language intent~~ | ~~High~~ → **Low** | **Retired.** Explicit `TranslationProperties.Name` references, 99.9 % item coverage, 5 locales. Embeddings not needed. Residual risk is parser correctness (ICU MessageFormat, root-prefix rewrite), not data availability |
+| ~~Codec extraction proves infeasible~~ | ~~High~~ → **Low** | **Retired, and inverted.** `Codec<T> extends SchemaConvertable<T>` — schema is a supported API call, delivered with the game's own prose descriptions |
+| ~~Legal exposure from JAR processing~~ | ~~Medium~~ → **Low** | **Retired.** EULA v2.2 §3.1 encourages modding, §4.2 preserves interoperability rights, and `toSchema()` does not engage the §4.1(a) decompilation clause at all. Constraints unchanged: local-only, no redistribution, descriptive naming |
+| ~~Node dependency excludes no-code authors~~ | ~~Medium~~ → **Low** | Unchanged for Node itself, but the *Java* half is gone: the game bundles a Temurin 25 JRE, so tier 2 needs no user-installed JVM |
+| Schema-only fields are mostly noise | Medium | **Still open (Q15)** — but cheaper to test, and extracted `description` text may separate live fields from vestigial ones without an in-game experiment |
+| Community finds docs-MCP sufficient | Medium | **Unchanged, and now the largest remaining risk.** Product, not technical. Lead with impact analysis and validation, which documentation cannot provide |

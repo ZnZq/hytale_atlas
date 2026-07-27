@@ -4,8 +4,15 @@ This directory contains the design specification for a proposed tool that indexe
 Hytale asset packs and the vanilla asset corpus into a queryable graph, exposed to
 AI agents over MCP.
 
-**Status: pre-implementation.** No code exists yet. These documents are the input
-to the design and build process, not a description of a finished system.
+**Status: pre-implementation, Phase 0 verification complete (2026-07-27).** No code
+exists yet. These documents are the input to the design and build process, not a
+description of a finished system.
+
+The design has been reconciled against a real Hytale installation — see
+`OPEN-QUESTIONS.md` for what was confirmed, what was contradicted, and what remains
+open. Start there if you are picking this up cold; it is now the most
+information-dense document in the set. `../PHASE-0-PLAN.md` records what was
+checked and how.
 
 ## Reading order
 
@@ -15,30 +22,149 @@ to the design and build process, not a description of a finished system.
 | `02-DOMAIN.md` | Hytale-specific facts, with confidence levels. **Read before any design work.** |
 | `03-ARCHITECTURE.md` | Layers, graph model, indexing algorithm, storage, incremental updates |
 | `04-MCP-SURFACE.md` | Tool surface exposed to agents, response discipline |
-| `05-CODEC-EXTRACTION.md` | Deriving authoritative schema from the server JAR — highest risk, highest value |
+| `05-CODEC-EXTRACTION.md` | Deriving authoritative schema from the server JAR. Rewritten after Q1 — the codecs expose JSON Schema directly, so this went from the riskiest component to one of the cheapest |
 | `06-CLI-UX.md` | `npx` entry point, autodetection, cache layout, degradation tiers |
 | `07-PRIOR-ART.md` | Comparable systems worth studying before writing code |
 | `08-ROADMAP.md` | Phasing, with explicit "stop and demo" points |
 | `09-EVALUATION.md` | How to tell whether the tool actually helps |
-| `OPEN-QUESTIONS.md` | **Everything that must be empirically verified.** Blockers go here. |
+| `OPEN-QUESTIONS.md` | **Answers from Phase 0, plus what remains open.** Blockers go here. Now the densest document in the set — read it second, after `01-VISION.md`. |
 
 ## Confidence markers
 
 Every factual claim about Hytale in these documents carries one of:
 
+- `[MEASURED]` — established by direct inspection of a real installation on
+  2026-07-27; **outranks everything below it**
 - `[VERIFIED]` — sourced from official docs or confirmed community documentation; URL given
 - `[REPORTED]` — stated by a secondary source (blog, wiki, tool README); plausible but unconfirmed
 - `[ASSUMED]` — inferred by analogy or reasoning; **not** established fact
 - `[UNKNOWN]` — explicitly open; see `OPEN-QUESTIONS.md`
 
-**Do not treat `[ASSUMED]` or `[REPORTED]` items as settled.** Several core design
-decisions hinge on facts that have not been checked against an actual Hytale
-installation. Verifying them is cheap and should happen before the code that
-depends on them is written.
+**Do not treat `[ASSUMED]` or `[REPORTED]` items as settled.** Phase 0 verification
+contradicted several of them outright — including one `[VERIFIED]` claim (the user
+pack path) and one `[REPORTED]` figure that was off by a factor of ten (archive
+size). Where a `[MEASURED]` claim sits beside an older one, the older text is kept
+only for provenance.
 
 These documents were compiled from web research in July 2026. Hytale is in Early
 Access and its pack format, API, and file layout are explicitly subject to change
 between versions. Re-verify anything load-bearing.
+
+## Phase 0 outcome — 2026-07-27
+
+Verified against a real Windows installation (release patchline). Full detail in
+`OPEN-QUESTIONS.md`; the headlines:
+
+**Resolved favourably, all three stop-and-reassess conditions cleared:**
+
+- **Q1 — codec extraction is nearly free.** `Codec<T> extends SchemaConvertable<T>`;
+  every codec emits JSON Schema on request, complete with the game's own `title`,
+  `description` and `enumDescriptions` prose. The three-approach risk analysis in
+  `05-CODEC-EXTRACTION.md` was obsolete and that document was rewritten.
+- **Q2 — the client ships `HytaleServer.jar` *and* a Temurin 25 JRE.** Tier 2 is
+  available to pack authors, the primary audience, with no Java install required.
+- **Q14 — localization works and is explicit.** `TranslationProperties.Name`
+  references real keys; 99.9 % item coverage across 5 locales. No embeddings needed.
+- **Q10 — EULA v2.2 permits this.** Modding is encouraged; calling `toSchema()` does
+  not engage the decompilation clause at all.
+- **Q16 — `logical_id` is path-derived**, the basename without extension.
+- **Q5 — pack priority is an enum**, `PackSource.overrides()`:
+  `CLI` > `CLASSPATH` > `MODS` > `RUNTIME`. Not filename order. (Same-category
+  tiebreak still open.)
+- **Q7 — the Asset Editor writes in place**, `Files.write(…, CREATE, WRITE,
+  TRUNCATE_EXISTING)`, and hot-reloads externally modified files.
+
+**A design principle the original documents never stated, added after Q5/Q7:**
+
+**The tool never runs the game.** Everything comes from files at rest —
+`HytaleServer.jar`, `Assets.zip`, packs, `patchline.json`. Q5 and Q7 were both
+initially deferred as "needs a running game"; both turned out to be statically
+readable, and the JAR answers were *better*, because they state the rule rather
+than one instance of it. The Asset Editor in particular is a **builtin server
+plugin**, not a client feature. `01-VISION.md` §Operating constraint and
+`03-ARCHITECTURE.md` §Governing principle now carry this; Q9 was demoted out of
+scope. **When a question looks like it needs the game, suspect the framing.**
+
+**Contradicted by reality:**
+
+- `Assets.zip` is **3.43 GB / 60 148 entries**, not "several hundred megabytes"
+- User packs are **not** reliably at `UserData/Packs/` — that path did not exist
+- The documented `manifest.json` field list is both incomplete and over-specified
+- Codecs are **not** DataFixerUpper-style
+
+**Newly discovered, and consequential:**
+
+- **Q18 — assets inherit via `Parent`.** Definitions are not self-contained. This
+  changes `get_asset` and field statistics, and was absent from every original
+  document.
+- **Q17 — the engine ships its own validators**, potentially reusable, which would
+  make `validate_pack` authoritative rather than approximate. Better still,
+  `AssetKeyValidator.updateSchema()` means **reference-typed fields mark themselves
+  in the extracted schema** — the high-confidence resolver tier, by construction.
+- **Q19 — the engine may already maintain a reference graph** (`AssetReferences`,
+  typed by asset class and key). If reachable, large parts of pass 2 become
+  verification rather than inference.
+- **Path → asset type mapping is now the weakest link**: 39 JAR type subpackages vs
+  51 archive directories, with no clean correspondence.
+
+**Roadmap change:** Phase 3 (codec extraction) was promoted ahead of Phase 2
+(schema statistics), on the trigger the roadmap itself specified. Schema generation
+moves earlier still — it is a 40-second command, and Phase 1 needs its type table
+and inheritance markers before pass 1 can run.
+
+---
+
+## Schema extraction — solved by the game, not by us
+
+**The server ships `--generate-asset-schema <dir>`**, a documented batch mode that
+writes the entire schema corpus and exits. Measured: ~40 s, **104 schemas,
+12.7 MB**, with 17 641 field descriptions, an embedded asset-type table
+(`hytale.path` / `hytale.extension`), per-field inheritance markers, and a
+`.vscode/settings.json` binding file globs to schemas.
+
+**No Java code ships in this project.** The extraction step is a subprocess call.
+
+This required amending the operating constraint, deliberately: the original said
+"no game process" outright. Batch modes that generate a file and exit are now in
+scope; a live server is still not (`01-VISION.md`). Three conditions ride along —
+see `05-CODEC-EXTRACTION.md` §Hazards:
+
+- **It emits telemetry we cannot suppress.** No CLI switch exists. The user must be
+  told before the run, not after.
+- **It wipes its output directory** before writing. Fresh temp dir only.
+- **`common.json` is not valid JSON** — bare `NaN`. 103 of 104 parse strictly.
+
+Two corollaries worth keeping:
+
+- **Learning a rule from the JAR does not create a dependency on it.** Pack
+  priority (Q5) and Asset Editor write semantics (Q7) were read statically and
+  written down; we implement them ourselves.
+- **Reference targets are *not* machine-marked in the schema.** An earlier revision
+  claimed they were, reasoning from `AssetKeyValidator.updateSchema` in the
+  bytecode; the generated output disproved it. Reference resolution stays
+  substantially heuristic (**Q17**, `03-ARCHITECTURE.md` §Confidence).
+
+**Q17** (deep validation via `--validate-assets`) and **Q19** (the engine's
+reference graph) remain *filed, not scheduled* — now on cost grounds rather than
+feasibility.
+
+## A worked example that shaped the design
+
+Tracing one real request — *"make a pickaxe that mines 3x3 and add its recipe to my
+new workbench, in the tools category"* — against real data produced three changes:
+
+- **A new tool, `search_schema`** (`04-MCP-SURFACE.md`). Four of the five
+  sub-questions are answerable from the corpus. The fifth — *can a tool have an
+  area of effect at all?* — is not, because **absence is invisible to a search over
+  what exists**. `ItemTool` has no area field; area lives in `buildertool`. Without
+  schema search an agent invents `"BreakRadius": 3` and the game silently ignores it.
+- **A canonical evaluation scenario** (`09-EVALUATION.md`) with ground truth
+  verified from the JAR and corpus, gradeable without launching the game.
+- **A sharper framing of the project's bet** (`01-VISION.md`): the *negative*
+  answer — "this is not expressible" — is safe and verifiable, and stands even if
+  `find_undocumented` proves to be mostly noise.
+
+---
 
 ## Revision note
 

@@ -39,9 +39,17 @@ repositories reporting answer quality, token counts, and tool-call counts
 
 ## Metrics
 
+**A note on the operating constraint.** `01-VISION.md` forbids the *tool* from
+requiring a running game. That constraint does not extend to *evaluation* — running
+the game to grade output is legitimate research, done by a person, once. But it
+does mean the primary correctness metric cannot be automated or run in CI, so a
+static proxy is needed for day-to-day work. Both are listed below; do not let the
+proxy quietly replace the ground truth.
+
 | Metric | How | Why |
 |---|---|---|
-| **Correctness** | Generated pack loads in-game without error | The only metric that fully matters |
+| **Correctness** (ground truth) | Generated pack loads in-game without error | The only metric that fully matters. Manual, occasional, not automatable |
+| **Correctness** (static proxy) | Generated pack passes the engine's own validators, run from the JAR | Automatable and CI-able. Only as good as `OPEN-QUESTIONS.md` Q17 turns out to be — if engine validators can be invoked without a server, this proxy is very close to ground truth; if not, it degrades to schema conformance |
 | **Field accuracy** | Proportion of emitted fields present in the real schema | Catches invented fields, the characteristic failure |
 | **Grounding** | Did it cite a real vanilla example? | Distinguishes retrieval from confabulation |
 | **Tokens** | Total context consumed to answer | The efficiency claim |
@@ -75,14 +83,74 @@ whether it loads)
 
 ---
 
+## The canonical scenario — "3x3 pickaxe"
+
+One task worth singling out, because it exercises every question family at once,
+has a **known-correct answer verified against real data**, and contains a trap that
+distinguishes a grounded agent from a confident one.
+
+> *"Create a new pickaxe that mines 3x3 and add its recipe to my new workbench,
+> in the tools category."*
+
+### Ground truth
+
+Established from `Tool_Pickaxe_Iron.json` and `ItemTool` / `BuilderTool` in the
+release JAR. All of it is checkable without launching the game.
+
+| Sub-question | Correct answer |
+|---|---|
+| How are tools described? | `Tool.Specs[{Power, GatherType, Quality}]` — one entry per material class; plus `DurabilityLossBlockTypes`, `MaxDurability` |
+| **How to specify a 3x3 area?** | **You cannot.** `ItemTool` = `{specs[], speed, durabilityLossBlockTypes, hitSoundLayerId, incorrectMaterialSoundLayerId}`. No width, radius, area or shape. Area belongs to `buildertool` (`Width`, `Height`, `Thickness`, `Shape` with 11 `BrushShape` values) — a different asset type with different semantics |
+| How are recipes described? | A `Recipe` block **inside the item**, not a separate file: `{TimeSeconds, Input[{ItemId, Quantity}], BenchRequirement[]}` |
+| How to attach to a bench and category? | `BenchRequirement: [{Id, Type, Categories[]}]` — e.g. `{"Id": "Workbench", "Type": "Crafting", "Categories": ["Workbench_Tools"]}` |
+| What does the definition inherit? | `"Parent": "Tool_Pickaxe_Crude"` — the effective definition is **not** the file contents. `Tool_Pickaxe_Iron` even borrows the parent's description key |
+
+### Grading
+
+**The decisive criterion is the second row.** A correct answer *declines* to express
+3x3 on the tool and explains where area actually lives. The characteristic failure
+is inventing a plausible field — `"BreakRadius": 3`, `"AreaOfEffect": {...}` — which
+the game **silently ignores**: no error, no warning, a normal pickaxe, and an hour
+of user confusion. Corpus search cannot catch this, because absence is invisible to
+a search over what exists. Only extracted schema can.
+
+Secondary criteria, all binary:
+
+- Uses `ItemId` in recipe inputs, not an invented `Item` / `Id` / `Ingredient`
+- Resolves `Parent` rather than treating the file as the whole definition
+- Points `BenchRequirement.Id` at the **user's** bench and confirms it resolves
+- Uses a category the user's bench actually declares, not a vanilla one
+- Adds `TranslationProperties.Name` **and** the matching `.lang` entry — omitting
+  the second ships a raw identifier to players, the most common beginner mistake
+
+### Why it belongs here rather than in the task list
+
+It is the clearest single demonstration of the project's thesis. Four of the five
+sub-questions are answerable from the corpus, where a grep-equipped baseline
+competes respectably. The fifth is answerable **only** from extracted schema, and it
+is the one where the baseline fails silently rather than visibly.
+
+Run it in both arms at Phase 2, and report the 3x3 outcome separately from the
+aggregate — an aggregate score hides exactly the failure this task exists to expose.
+
+---
+
 ## Search evaluation (separate, and do it first)
 
 Search quality is the single largest identified risk (`01-VISION.md` §Risk
 register), and it can be tested before any MCP work exists.
 
+**Built: `../evaluation/search-phrases.json`** — 36 phrases with ground truth
+verified against the release corpus, in six tiers. See `../evaluation/README.md`.
+
 Build a set of ~30 pairs of *natural-language phrase* → *expected asset ID*, drawn
 from how a real creator would speak: "cave spider", "iron pickaxe", "flaming sword",
 "the blue flowers", "torch".
+
+*(Retained for provenance. Note that measurement moved "cave spider" out of the
+localization tier: `Spider_Cave` contains both query tokens, so it tests
+tokenisation rather than localization. Suggestive examples are not evidence until
+checked against the corpus.)*
 
 Then measure recall@5 under three configurations:
 
@@ -93,6 +161,23 @@ Then measure recall@5 under three configurations:
 **This experiment is cheap and decisive.** If configuration 2 does not clear a
 useful bar, the design needs semantic search and the roadmap changes. Run it in
 Phase 1, not later.
+
+**Phase 0 established that the data configuration 2 needs exists**
+(`OPEN-QUESTIONS.md` Q14): explicit `TranslationProperties.Name` references, 99.9 %
+item coverage, 5 locales. It did **not** establish that configuration 2 *performs*.
+Those are different claims and only the first is settled — still run the
+experiment.
+
+Draw the phrase set from display names that **diverge from their identifiers**, not
+just ones that match. `items.Armor_Adamantite_Chest.name` = *"Adamantite Cuirass"*
+is the case that separates configurations 1 and 2; a phrase set full of items whose
+name is a spaced-out version of their ID will show the two configurations as
+falsely equivalent.
+
+Add a fourth configuration once Phase 2 lands: **identifiers + localized strings +
+extracted schema `description` prose**. The codec ships human-readable field
+documentation, which is more natural-language content to match against, and it is
+free once extraction exists.
 
 ---
 
@@ -116,11 +201,14 @@ Independent of agent evaluation, and cheaper to run:
 
 ## When to run what
 
+Phase numbering follows `08-ROADMAP.md` as revised after Phase 0 — codec extraction
+is now Phase 2 and schema statistics Phase 3.
+
 | Phase | Evaluation |
 |---|---|
 | 1 | Search evaluation (§Search). Golden index. |
-| 2 | Lookup + idiom tasks, both arms |
-| 3 | Schema tasks. Plus the schema-only-fields experiment from `05-CODEC-EXTRACTION.md`. |
+| 2 | Schema tasks. Plus the schema-only-fields experiment from `05-CODEC-EXTRACTION.md`. |
+| 3 | Lookup + idiom tasks, both arms |
 | 4 | Impact + diagnosis tasks |
 | 5 | Incremental equivalence under live editing |
 

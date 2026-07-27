@@ -1,7 +1,5 @@
 # OPEN QUESTIONS
 
-Everything here is unverified. Several items are load-bearing for the architecture.
-
 **Working agreement:** when a blocker is hit during implementation, append it here
 with enough context to be actionable, and continue with the next unblocked task.
 Do not pause to ask. When a question is answered, record the answer inline, mark it
@@ -11,292 +9,917 @@ Questions are ordered by how much of the design depends on them.
 
 ---
 
-## Q1 — What exactly is Hytale's "Codec system"? 🔴 BLOCKING
+## Verification provenance
 
-**Why it matters:** `05-CODEC-EXTRACTION.md` assumes DataFixerUpper-style codecs
-and chooses runtime reflection on that basis. If codecs are a bespoke abstraction —
-or if serialization is annotation-driven or hand-written — the extraction approach
-changes completely, and tier 2 may need a different strategy or may be infeasible.
+Answers below marked `RESOLVED` were established on **2026-07-27** against a real
+Windows installation:
 
-**How to check:** open `HytaleServer.jar`, find
-`com.hypixel.hytale.server.core.asset.type.item.config.Item`, and look at how its
-codec (or serializer) is declared.
+| | |
+|---|---|
+| Install root | `%AppData%\Roaming\Hytale\` |
+| Patchlines present | `release`, `pre-release` |
+| Patchline verified | `release` |
+| `Assets.zip` | 3 428 472 949 bytes, 60 148 entries |
+| `HytaleServer.jar` | 123 347 829 bytes, 39 618 entries |
+| Toolchain used | `javap` from Eclipse Adoptium JDK 25.0.1.8 |
 
-**Specifically determine:**
-- Is there a static `Codec` field, or annotations, or a hand-written reader?
-- Are field names string literals in `<clinit>`, or something else?
-- Is the codec object reflectively walkable once constructed?
-- Do defaults and optionality survive into the runtime object?
-- Is there a shared base or registry that enumerates all codecs?
+Hytale is in Early Access. Re-verify anything load-bearing against a new patchline.
 
-**Answer:**
-
----
-
-## Q2 — Does the client installation include `HytaleServer.jar`? 🔴 HIGH IMPACT
-
-**Why it matters:** singleplayer connects to a local server, so the client plausibly
-ships one. If it does, tier 2 is available to **pack authors** — the primary
-audience — not just plugin developers. That roughly doubles the tool's value for the
-people who need it most and would justify moving Phase 3 earlier
-(`08-ROADMAP.md`).
-
-**How to check:** search the client install directory for `HytaleServer.jar` or any
-server JAR. Five minutes.
-
-**Also determine:** its path relative to `Assets.zip`, and whether it is the same
-artifact as the dedicated-server JAR.
-
-**Answer:**
+**Every answer below was obtained from files at rest — the JAR, the archive, pack
+directories, and launcher metadata. The game was never launched.** This is not
+incidental; it is the operating constraint in `01-VISION.md`. Two questions
+originally filed as "needs a running game" (**Q5**, **Q7**) turned out to be
+answerable from `HytaleServer.jar`, and the JAR answers were *better* than
+observation would have been, because they describe the rule rather than one
+instance of it. **When a question here looks like it needs the game, suspect the
+framing before accepting the deferral.**
 
 ---
 
-## Q3 — Pack layout: `Common/` + `Server/`, or `assets/<type>/`?
+## Q1 — What exactly is Hytale's "Codec system"? ✅ RESOLVED
 
-**Why it matters:** the indexer's path-to-asset-type mapping depends on it entirely.
+**Answer: a bespoke codec framework — *not* Mojang DataFixerUpper — and it is far
+better for our purposes than DFU would have been, because every codec can emit its
+own JSON Schema.**
 
-**Conflict:** CurseForge and official docs describe `Common/` (models, textures) and
-`Server/` (definitions, translations, particles). A community documentation site
-describes plugin-embedded packs as `manifest.json` plus `assets/` with per-type
-subdirectories (`blocktype/`, `item/`, `model/`, `soundevent/`, `soundset/`,
-`particle/`, `weather/`, `entity/`, `entityeffect/`, `environment/`). See
-`02-DOMAIN.md` §Conflicting account.
+The decisive fact:
 
-**Hypotheses:** different nesting levels of the same tree; one is outdated;
-standalone and plugin-embedded packs genuinely differ.
+```java
+public interface com.hypixel.hytale.codec.Codec<T>
+        extends RawJsonCodec<T>, SchemaConvertable<T>
 
-**How to check:** open `Assets.zip` and look. Then compare against a plugin JAR
-built from a template with `IncludesAssetPack: true`.
+public interface com.hypixel.hytale.codec.schema.SchemaConvertable<T> {
+    Schema toSchema(SchemaContext);
+    default Schema toSchema(SchemaContext, T);
+}
+```
 
-**Answer:**
+**Every codec in the game is schema-convertible by construction.** There is no need
+to trace builder bytecode, walk codec object graphs by reflection, or decompile
+anything. Ask the codec for its schema and serialise the result.
 
----
+`com.hypixel.hytale.codec.schema.config.Schema` is a full JSON-Schema model:
 
-## Q4 — What is the actual internal structure of `Assets.zip`?
+```
+id, types[], title, description, markdownDescription,
+anyOf[], oneOf[], allOf[], not, required[],
+enumDescriptions[], markdownEnumDescriptions[],
+definitions{}, ref, data, default (BsonDocument),
+if / then / else,
+hytale            -> Schema$HytaleMetadata
+hytaleParent      -> Schema$InheritSettings
+```
 
-Needed for pass 1 and for the type discovery strategy.
+`Schema` itself carries `public static final ObjectCodecMapCodec<String, Schema>
+CODEC`, so a schema can serialise itself to JSON with no hand-written writer.
 
-- Full directory tree, at least two levels deep
-- Are asset type directories named the same as the JAR's `asset.type` subpackages?
-- One asset per file, or multiple per file?
-- Are IDs namespaced in the file (`Hytale:Foo`) or derived from the path?
-- How do JSON files reference `.blockymodel` and `.png` — by path, by ID, with or
-  without extension?
-- What non-JSON file types are present, and in what proportion?
-- Actual uncompressed size and file count (drives performance budgets)
-- Are there any non-asset entries — indexes, manifests, precomputed data?
+**Sub-questions, answered:**
 
-**Answer:**
+- *Static `Codec` field, annotations, or hand-written reader?* — a static field.
+  `Item` declares `public static final AssetCodec<String, Item> CODEC` and
+  `private static final AssetBuilderCodec$Builder<String, Item> CODEC_BUILDER`.
+- *Are field names string literals in `<clinit>`?* — yes, the builder chain runs in
+  `<clinit>`, but **this no longer matters**, because `toSchema()` supersedes it.
+- *Is the codec reflectively walkable once constructed?* — moot; it exposes a
+  schema directly.
+- *Do defaults and optionality survive?* — yes: `Schema.default_` and
+  `Schema.required[]`.
+- *Shared base or registry enumerating all codecs?* — asset config classes
+  implement `com.hypixel.hytale.assetstore.map.JsonAssetWithMap<K, V>` and expose
+  a static `AssetStore` via `getAssetStore()` / `getAssetMap()`. That interface is
+  the enumeration hook, and is more reliable than listing packages.
 
----
+**Additional findings:**
 
-## Q5 — How does the engine resolve priority between packs?
+- Field names, types and structure are accompanied by `title`, `description`,
+  `markdownDescription` and `enumDescriptions` — **the game ships human-readable
+  documentation of its own schema.** This is a significant, unanticipated windfall:
+  `describe_schema` can return real prose, and that prose is also indexable for
+  natural-language search.
+- `com.hypixel.hytale.codec.schema.metadata.ui.*` carries Asset Editor UI hints
+  (`UIEditorPreview`, `UITypeIcon`, `UIPropertyTitle`, `UISidebarButtons`,
+  `UIEditorSectionStart`, `UIDisplayMode`, …). Useful for grouping and labelling
+  fields the way the official editor does.
+- `com.hypixel.hytale.codec.validation` (40 classes, incl. `ValidatorCache`,
+  `LateValidator`) is the game's own validation layer. `Item` exposes
+  `public static final ValidatorCache<String> VALIDATOR_CACHE`. **`validate_pack`
+  may be able to reuse the engine's real validators rather than reimplementing
+  them.** Worth a dedicated investigation — see Q17.
+- The codec stack is built on **BSON** (`org.bson.BsonDocument`,
+  `Codec.BSON_DOCUMENT`), not on a JSON DOM directly.
+- `InheritCodec` and `RawJsonInheritCodec` exist, and `Schema.hytaleParent` is an
+  `InheritSettings` — the asset inheritance mechanism is first-class in the codec
+  layer. See **Q18**.
 
-**Why it matters:** `is_effective` on `Asset` nodes, and therefore `diff_override`
-and `find_conflicts`, depend on getting this right.
-
-Known: `FileIO` provides a multi-root virtual filesystem where mod assets overlay
-base assets. A community loader library sorts external packs by filename, but that
-is that library's own convention, not necessarily the engine's.
-
-**Determine:** is order defined by load order, manifest, alphabetical, world config,
-or something else? Is it configurable? What happens on a genuine conflict — last
-wins silently, or is there a warning? Is there a deep-merge, or is override
-whole-asset?
-
-The last sub-question matters a lot: whole-asset replacement and field-level merge
-produce very different `diff_override` semantics.
-
-**Answer:**
-
----
-
-## Q6 — Game install paths per operating system
-
-Needed for autodetection (`06-CLI-UX.md`).
-
-Known: launcher → Settings → Open Directory leads to
-`<install>/release/package/game/latest`, and user data is at
-`%AppData%/Roaming/Hytale/UserData/`.
-
-**Determine:** the install root on Windows (`%LocalAppData%`? `%AppData%`? Program
-Files?), on macOS, and on Linux. Whether the launcher records the path somewhere
-readable. Whether patchlines produce sibling directories.
-
-**Answer:**
-
----
-
-## Q7 — Does the Asset Editor write files in a watcher-hostile way?
-
-**Why it matters:** write-race handling in `03-ARCHITECTURE.md`.
-
-**Determine:** does it write in place or temp-then-rename? Does it rewrite whole
-directories on save? Does it touch files it did not change? Does it hot-reload from
-disk, so external edits are visible in-game?
-
-If it does hot-reload, the loop closes completely: agent writes → index sees →
-validates → game picks it up. Worth confirming, since it is a strong selling point.
-
-**Answer:**
+**Consequence:** `05-CODEC-EXTRACTION.md` was rewritten. Its three-approach risk
+analysis is obsolete. Tier 2 drops from "highest risk component" to a small JVM
+program.
 
 ---
 
-## Q8 — How are ECS component types registered and discovered?
+## Q2 — Does the client installation include `HytaleServer.jar`? ✅ RESOLVED
 
-The hardest part of codec extraction (`05-CODEC-EXTRACTION.md` §Polymorphic
-components).
+**Answer: yes — and it ships a JVM alongside it.**
 
-- Is there a central registry mapping component name → class?
-- Is registration declarative or imperative?
-- Can plugins register components at runtime — and if so, is a static-only
-  extraction inherently incomplete?
-- Do component blocks in JSON use dynamic keys? (Drives the record-vs-map decision
-  in schema inference.)
+```
+%AppData%\Roaming\Hytale\install\<patchline>\package\game\latest\
+    Assets.zip                    3 428 472 949 bytes
+    Server\HytaleServer.jar         123 347 829 bytes
+%AppData%\Roaming\Hytale\install\<patchline>\package\jre\latest\
+    Temurin 25.0.2+10 (Eclipse Adoptium)
+```
 
-**Answer:**
+Both `release` and `pre-release` patchlines carry a full set. `Assets.zip` and the
+JAR are adjacent, exactly as the dedicated-server layout suggested, so a cache key
+combining both hashes cannot go out of sync.
 
----
+**Two consequences, both large:**
 
-## Q9 — Is `/assets` output parseable for cross-validation?
+1. **Tier 2 is available to pack authors**, the primary audience — not only to
+   plugin developers. Everyone with the game installed has the schema source.
+2. **The JVM dependency for tier 2 is free.** The bundled Temurin 25 runtime
+   satisfies the extractor's requirement, so the tool never has to ask a no-code
+   user to install Java. The `06-CLI-UX.md` caveat "no Java → tier 1" is now an
+   edge case rather than the expected path.
 
-`/assets` queries loaded resources and `/packs` lists active content packs. If
-either produces structured output, it becomes a way to verify the index against
-what the game actually loaded — a strong correctness check.
-
-**Determine:** output format, whether it can be run headless or scripted, whether
-it exposes resolved priority (which would answer Q5 empirically).
-
-**Answer:**
-
----
-
-## Q10 — What do Hytale's policies say about automated JAR analysis? 🔴 PHASE 0
-
-**Why it matters:** distribution and publishing. This is the only question here that
-can invalidate the entire project, which is why it belongs in the verification phase
-rather than at publication time. Answering it after building would be the wrong
-order.
-
-Community projects decline to redistribute Hytale binaries and place EULA
-responsibility on the user. The design already assumes local-only extraction and no
-bundled game data (`02-DOMAIN.md` §Legal).
-
-**Determine:** whether official server policy or EULA pages restrict automated
-analysis or decompilation beyond that; whether "not obfuscated, freely
-decompilable" is an official statement or a community observation; whether tools
-that read the JAR locally are explicitly permitted.
-
-**Answer:**
+The bundled runtime is a **JRE, not a JDK** — it contains `java.exe` but no
+`javap`/`javac`. That is sufficient to *run* an extractor; it is not sufficient to
+compile one on the user's machine, so the extractor must ship pre-compiled.
 
 ---
 
-## Q11 — Practical corpus statistics
+## Q3 — Pack layout: `Common/` + `Server/`, or `assets/<type>/`? ✅ RESOLVED
 
-Needed to size the implementation. Cheap to gather once Q4 is answered.
+**Answer: `Common/` + `Server/`. The `assets/<type>/` account does not describe the
+vanilla archive.**
 
-- Asset count by type
-- Median and p99 asset JSON size (drives elision thresholds)
-- Reference density — average outgoing references per asset
-- How many distinct string values collide with asset IDs by accident? (Estimates
-  the low-confidence noise floor)
-- Field count per type, and long-tail distribution
+`Assets.zip` root contains exactly:
 
-**Answer:**
+| Entry | Count |
+|---|---|
+| `Server/` | 35 194 |
+| `Common/` | 24 914 |
+| `Cosmetics/` | 38 |
+| `manifest.json` | 1 |
+| `CommonAssetsIndex.hashes` | 1 |
+
+**`Cosmetics/` is a third top-level root** that no source documented. The indexer
+must not assume exactly two roots.
+
+The vanilla `manifest.json` is minimal, and confirms the `Hytale:Hytale` addressing
+seen in the Asset Editor:
+
+```json
+{ "Group": "Hytale", "Name": "Hytale" }
+```
+
+A real third-party pack on disk
+(`UserData\Saves\qqq\mods\Airijko_EndlessLevelingCore`) also uses `Server/`, so the
+convention holds outside vanilla. Note that its manifest declares fields absent
+from `02-DOMAIN.md` — `LoadBefore`, `SubPlugins` — and omits `ServerVersion` and
+`Website`. **The manifest schema in the docs was incomplete; `LoadBefore` bears
+directly on Q5.**
+
+That pack also contains many directories that are plugin data rather than assets
+(`augments/`, `classes/`, `races/`, `quests/`, `raids/`, `old/`, `security/`). The
+indexer must not assume every directory in a pack holds assets, and should ignore
+what it cannot type — silently, not as an error.
+
+Still unverified: the layout inside a plugin JAR built with `IncludesAssetPack:
+true`. Low risk now that two independent real packs agree.
+
+---
+
+## Q4 — What is the actual internal structure of `Assets.zip`? ✅ RESOLVED (mostly)
+
+**60 148 entries, 3.43 GB.** The central directory reads in ~0.5 s, so **pass 1 over
+paths is effectively free**; all real cost is in decompressing entry contents.
+
+**Type directories are at the second level, PascalCase**, 51 in total. Largest:
+
+```
+Server/World       12175    Common/NPC          6039
+Server/Prefabs      7831    Common/Icons        4832
+Server/Item         6893    Common/Sounds       3857
+Server/Particles    2344    Common/Characters   2724
+Server/Audio        1761    Common/Blocks       2637
+Server/NPC          1537    Common/Items        1033
+Server/Drops         676    Common/BlockTextures 916
+Server/Entity        269    Common/Languages     110
+Server/Languages      11    Cosmetics/CharacterCreator 38
+```
+
+**A second-level directory is not an asset type.** `Server/Item` alone contains 14
+distinct third-level groupings:
+
+```
+Items 3641   Interactions 1341   RootInteractions 611   Block 477
+Recipes 403  ResourceTypes 181   Animations 146         Groups 43
+Unarmed 20   CustomConnectedBlockTemplates 11            Qualities 11
+Category 5   Reticles 2          PlayerToolsMenuConfig 1
+```
+
+and below that, arbitrary organisational nesting
+(`Server/Item/Items/Rock/Magma/…`). **Path → asset type mapping must be derived
+from the JAR's type registry, not guessed from directory depth.**
+
+The JAR exposes 39 subpackages of `com.hypixel.hytale.server.core.asset.type`:
+
+```
+ambiencefx attitude audiocategory audiostate blockbreakingdecal blockhitbox
+blockparticle blockset blocksound blocktick blocktype buildertool camera
+entityeffect environment equalizereffect fluid fluidfx gamemode gameplay item
+itemanimation itemsound model modelvfx musiccontainer particle physicalmaterial
+portalworld projectile responsecurve reverbeffect soundevent soundset tagpattern
+trail weather wordlist
+```
+
+These are **lowercase and do not map one-to-one onto the 51 PascalCase archive
+directories** — 39 vs 51, and names differ (`Server/Prefabs`, `Server/World`,
+`Server/Drops` have no matching subpackage; `blockhitbox`, `attitude`,
+`responsecurve` have no obvious matching directory). Note also there is no
+`entity` subpackage despite `Server/Entity` existing — entities are presumably ECS
+prefabs rather than a codec-backed asset type.
+
+**Do not reconcile this by hand — the engine ships the mapping.** The Asset Editor
+carries an authoritative type table and a path resolver:
+
+```java
+class AssetEditorAssetType {            // protocol.packets.asseteditor
+    public String id;                   // asset type id
+    public String path;                 // its directory
+    public String fileExtension;
+    public AssetEditorEditorType editorType;
+}
+
+class AssetTypeRegistry {               // builtin.asseteditor
+    Map<String, AssetTypeHandler> getRegisteredAssetTypeHandlers();
+    AssetTypeHandler getAssetTypeHandlerForPath(java.nio.file.Path);   // <- pass 1 needs exactly this
+    boolean isPathInAssetTypeFolder(java.nio.file.Path);
+}
+```
+
+`AssetEditorSetupAssetTypes` is a **protocol packet**, i.e. the whole table is
+already built to be serialised and shipped to the editor client. Extracting it is
+the same class of work as extracting schema.
+
+**This retires "path → type mapping" as a design unknown.** What remains is
+execution, plus one caveat: `AssetTypeRegistry` is populated by `registerAssetType`
+calls during Asset Editor plugin initialisation, so **determine the minimum
+initialisation that populates it without booting a server** (`01-VISION.md`
+§Operating constraint). Fallback if runtime population proves impractical: the
+handler construction sites pass literal `id`/`path`/`fileExtension` strings, which
+are readable from the constant pool.
+
+The 39-vs-51 disagreement remains worth *reporting* — a directory with no
+registered type is a real fact about the corpus — but it is no longer something the
+indexer must guess its way through.
+
+**One asset per file**, named by the asset ID.
+
+**Identity is path-derived, not content-derived** — see Q16.
+
+**`CommonAssetsIndex.hashes`** (3 028 686 bytes) is a precomputed manifest:
+
+```
+<sha256> <path relative to Common/>
+2b693c02…c53 BlockTextures/Rock_Magma_Cooled_Adamantite_Cracks02.png
+```
+
+It covers the `Common/` tree only. Useful as a free content-hash source for the
+frozen layer, and as a cross-check that the archive is complete.
+
+**File references in JSON are `Common/`-relative paths, with extension:**
+
+```json
+"Icon":     "Icons/ItemsGenerated/Rock_Magma_Cooled_Brick_Decorative.png",
+"Textures": [{ "All": "BlockTextures/Rock_Magma_Cooled_Brick_Decorative.png" }]
+```
+
+**Asset references are bare, unnamespaced short strings:**
+
+```json
+"Set": "Rock_Magma_Cooled",  "Parent": "Rock_Magma_Cooled_Brick",
+"ResourceTypeId": "Rock_Magma_Cooled",  "Id": "Builders"
+```
+
+This confirms the low-confidence-noise concern in `03-ARCHITECTURE.md` is real and
+not hypothetical. Codec schema is what promotes these to high confidence.
+
+Still open: exact size percentiles and the non-JSON file-type census — folded into
+Q11.
+
+---
+
+## Q5 — How does the engine resolve priority between packs? ✅ RESOLVED (mechanism)
+
+**Answer: priority is by *pack source category*, declared as an enum with an
+explicit comparison method. Not filename order.**
+
+```java
+public final class AssetPack$PackSource extends Enum<PackSource> {
+    CLI, CLASSPATH, MODS, RUNTIME;          // ordinals 0,1,2,3
+    public boolean overrides(PackSource other);
+}
+```
+
+Decoded from `overrides()` bytecode — `if_icmpge` on the two `ordinal()` values,
+returning `false` on greater-or-equal and `true` otherwise:
+
+```java
+boolean overrides(PackSource other) { return this.ordinal() < other.ordinal(); }
+```
+
+**Lower ordinal wins. Priority, highest first: `CLI` → `CLASSPATH` → `MODS` →
+`RUNTIME`.**
+
+That settles the standing doubt in `02-DOMAIN.md`: the community asset-loader
+library's sorted-filename ordering is **that library's own convention**, not the
+engine's rule.
+
+Supporting structure on `AssetPack`: `name`, `root`, `fileSystem`
+(a `java.nio.file.FileSystem` — archive packs are mounted, not unpacked),
+`isImmutable`, `manifest` (`PluginManifest`), `packLocation`, `source`, and
+`isCoreMod()`. `AssetPack implements com.hypixel.hytale.common.plugin.Mod`, so
+packs and plugins share one abstraction.
+
+**Two things this does NOT answer, and the second is the important one:**
+
+1. `overrides()` returns **false for equal ordinals**, so it cannot resolve two
+   packs in the same category — the common case, two mods both in `MODS`. The
+   tiebreak lives elsewhere (candidates: registration order, `LoadBefore` from the
+   manifest, dependency topology). **`is_effective` cannot be computed from
+   `PackSource` alone.**
+2. **Whether override is whole-asset replacement or field-level merge is still
+   open**, and it is now sharper rather than softer: `Parent` (Q18) proves the
+   engine already performs field-level inheritance *within* the corpus, and
+   `InheritCodec` exists. If pack override reuses that machinery, `diff_override`
+   semantics change substantially.
+
+**How to check next, statically:** the `AssetStore` load path and `InheritCodec`,
+plus wherever `LoadBefore` is consumed. Blocks Phase 4 only.
+
+---
+
+## Q6 — Game install paths per operating system ✅ RESOLVED (Windows)
+
+```
+%AppData%\Roaming\Hytale\
+  patchline.json          <- machine-readable, see below
+  settings.json           {"language":"en"}
+  eula.txt
+  install\<patchline>\package\game\latest\Assets.zip
+  install\<patchline>\package\game\latest\Server\HytaleServer.jar
+  install\<patchline>\package\jre\latest\                (bundled Temurin 25)
+  UserData\
+```
+
+**Autodetection does not need to guess.** `%AppData%\Roaming\Hytale\patchline.json`
+names the active patchline and the UserData root:
+
+```json
+{"patchline":"release","user_data":"C:\\Users\\<user>\\AppData\\Roaming\\Hytale\\UserData"}
+```
+
+Patchlines are sibling directories under `install\`, confirming that multiple game
+versions coexist and that **content hashing, not version strings, must key the
+cache**.
+
+**Correction to `02-DOMAIN.md`:** user packs were documented at
+`%AppData%/Roaming/Hytale/UserData/Packs/`. On this installation **`UserData\Packs`
+does not exist**; `UserData\Mods\` does, and holds an installed mod
+(`WeaponStatsViewer`). Editor-created packs live inside the world, as documented:
+`UserData\Saves\<World>\mods\<PackName>\`. **The tool must probe, not assume.**
+
+macOS and Linux install roots remain unverified.
+
+---
+
+## Q7 — Does the Asset Editor write files in a watcher-hostile way? ✅ RESOLVED
+
+This was initially filed as "requires running the game". That was wrong: **the
+Asset Editor is server-side, shipped as a builtin plugin inside
+`HytaleServer.jar`** (`com.hypixel.hytale.builtin.asseteditor`), so its write path
+reads statically like anything else.
+
+**Answer: in-place whole-file writes. No temp-then-rename.**
+
+`StandardDataSource.updateAsset(Path, byte[], EditorClient)` writes via:
+
+```java
+Files.write(path, bytes, CREATE, WRITE, TRUNCATE_EXISTING)
+```
+
+No `ATOMIC_MOVE`, no temp-file pattern anywhere in the class. `Files.move` appears
+only in `moveAsset` / `moveDirectory`.
+
+**Consequences for the watcher, and they cut both ways:**
+
+- **Favourable:** writes are per-asset and whole-file. One saved asset = one changed
+  file. No `.tmp` churn, no rename storms, no partial-directory rewrites. The
+  watcher design stays simple.
+- **Unfavourable:** `TRUNCATE_EXISTING` then write leaves a **real window where the
+  file exists and is empty or partial**. A zero-length JSON file is the *expected*
+  transient. The stability-check-and-retry mitigation in `03-ARCHITECTURE.md` is
+  therefore required, not merely prudent.
+- Renames surface as delete + create pairs; handle them as such.
+
+**The editor hot-reloads from disk — confirmed.** `DataSource` declares:
+
+```java
+boolean       shouldReloadAssetFromDisk(Path);
+java.time.Instant getLastModificationTimestamp(Path);
+```
+
+plus `AssetTypeHandler.loadAsset / unloadAsset / restoreOriginalAsset` and an
+`UndoRedoManager`. The editor polls modification timestamps and reloads externally
+changed assets.
+
+**This closes the loop, which was the outcome this question hoped for:** agent
+writes a file → our index sees it and validates → the editor picks it up live. It
+is a genuine selling point and it is now established rather than assumed.
+
+Full `DataSource` surface, useful for modelling what the editor can do to a pack:
+`createAsset`, `updateAsset`, `deleteAsset`, `moveAsset`, `createDirectory`,
+`deleteDirectory`, `moveDirectory`, `getAssetBytes`, `doesAssetExist`,
+`isImmutable`, `getRootPath`, `getManifest`, `getFullPathToAssetData`.
+
+---
+
+## Q8 — How are ECS component types registered and discovered? ⚠️ PARTIAL
+
+Not yet investigated directly. Two relevant findings from Q1/Q4:
+
+- Asset config classes implement `JsonAssetWithMap<K, V>` and expose a static
+  `AssetStore` — a discoverable registry pattern for *asset types*.
+- There is no `entity` subpackage under `asset.type` despite `Server/Entity` and
+  `Server/Prefabs` existing, which suggests entities/prefabs are composed rather
+  than codec-backed as a single type.
+
+The record-vs-map discrimination problem stands, but is now much less dangerous:
+`toSchema()` distinguishes an `ObjectSchema` with fixed properties from a dynamic
+map, so inference no longer has to guess for schema-covered fields.
+
+---
+
+## Q9 — Is `/assets` output parseable for cross-validation? ⛔ OUT OF SCOPE
+
+**Demoted deliberately.** This question presupposes a running server, and
+`01-VISION.md` §Operating constraint forbids the tool from depending on one. Even a
+favourable answer could not be used at runtime.
+
+The cross-validation it was meant to provide has a better static replacement: the
+engine's own `AssetStore` / `AssetRegistry` / validator machinery, read from the
+JAR (Q17). That checks the index against the rules the game *obeys*, rather than
+against the output of one observed session — a stronger check, not a weaker
+substitute.
+
+Left on file because a one-off manual comparison during development is still
+harmless and mildly informative. Nothing may be built on it.
+
+---
+
+## Q10 — What do Hytale's policies say about automated JAR analysis? ✅ RESOLVED
+
+**Source:** `%AppData%\Roaming\Hytale\eula.txt` — Hytale EULA v2.2, effective
+2026-01-13.
+
+**§4.1(a)** — you may not *"reverse engineer, decompile, or disassemble the Game
+**except as permitted by law**"*.
+
+**§4.2 Interoperability Exception** — *"Nothing in this EULA limits your rights
+under applicable law to conduct reverse engineering solely and to the extent
+necessary to achieve interoperability between the Game and independently created
+software, provided such activity is strictly limited to what the law permits and
+does not disclose or misuse our proprietary information."*
+
+**§3.1** — modding is explicitly encouraged. **§3.2(a)** and **§3.3** — you may not
+distribute the Game in whole or in part, *"including its source code, any
+decryption keys or any other files pertaining to the Game."*
+
+**Assessment (not legal advice):**
+
+The project's existing constraints already match what these clauses require, and
+the Q1 outcome improves the position further:
+
+1. **Prefer calling `toSchema()` over decompiling.** Loading the JAR and invoking a
+   public API is ordinary interoperability use, not "decompile or disassemble".
+   The now-obsolete Vineflower/ASM approaches sat squarely inside §4.1(a) and
+   depended entirely on §4.2 to be permissible. **Q1's answer removes that
+   exposure**, which is a second, independent reason to adopt it.
+2. **Never redistribute extracted output.** §4.2's "does not disclose our
+   proprietary information" and §3.3's distribution ban together mean extracted
+   schema must stay in the user's cache. Already the design; now load-bearing.
+3. **No Hytale-derived data in the repository or npm package.** Reaffirmed.
+4. **Descriptive naming only.** §3.6 permits "Mod for Hytale"-style descriptive
+   use; it forbids logos, trade dress, and anything implying endorsement. **The
+   published package name and README must not imply official status.**
+5. §4.2's scope is jurisdiction-dependent ("under applicable law"). Users in the
+   EU have a statutory decompilation-for-interoperability right; other
+   jurisdictions vary. Since the tool runs locally on the user's own installation
+   and ships no game data, this affects the user, not the distributor.
+
+**Verdict: the project is viable.** No clause prohibits a local tool that reads the
+user's own installation for interoperability. Re-check on EULA version bumps.
+
+Not established: whether "not obfuscated, freely decompilable" is an official
+statement — it appears to be a community observation. The JAR is in fact
+unobfuscated, as confirmed directly.
+
+---
+
+## Q11 — Practical corpus statistics ⚠️ PARTIAL
+
+Gathered so far:
+
+- 60 148 archive entries; 3.43 GB; 51 second-level directories
+- `Server/Item/Items` = 3 641 item definitions; `Server/Item` total 6 893
+- All 6 893 entries under `Server/Item` are `.json`
+- 10 726 distinct localization keys across all locales
+- Sample item JSON ≈ 1.2 KB with ~8 top-level fields
+
+Still needed before Phase 2: size percentiles per type (drives elision thresholds
+in `04-MCP-SURFACE.md`), reference density, and the accidental-ID-collision rate
+that sets the low-confidence noise floor.
 
 ---
 
 ## Q12 — Is `.blockymodel` worth parsing?
 
-Currently treated as an opaque `File` node. If it internally references textures or
-animations, parsing it would add real edges to the graph.
+Unchanged. Not investigated. Low priority — do not block on it.
 
-**Determine:** is the format documented or reverse-engineered anywhere? Does the
-Blockbench plugin reveal its structure? Does it contain texture references?
-
-Low priority — do not block on it.
-
-**Answer:**
+Note `Server/Models` (436) and `Common/` model-adjacent trees exist, and the codec
+registry has a `model` asset type, so model *metadata* may be reachable through
+schema without parsing the binary format at all.
 
 ---
 
 ## Q13 — How stable are asset IDs across patchlines?
 
-If IDs are renamed between versions, `whats_changed` and any future cross-version
-diffing need rename detection rather than add/remove pairs. Cannot be answered until
-a patch lands. Note it and move on.
-
-**Answer:**
-
----
-
-## Q14 — How does localization work? 🔴 PHASE 0
-
-**Why it matters:** this determines whether search works at all. Asset identifiers
-are machine names (`Sword_Iron`); users search in prose ("flaming sword"). The only
-natural-language content in the corpus is in translation files, which makes them the
-bridge between intent and identifier. See `03-ARCHITECTURE.md` §Localization.
-
-If localization turns out to be sparse, absent, or structured in a way that cannot
-be joined to assets, the tool needs embeddings — a different dependency footprint
-and a different storage design. Better to know in Phase 0.
-
-**Determine:**
-- File format and location. `Server/` is documented as holding translations, but the
-  format is unknown — JSON? key-value? one file per locale?
-- How does an asset reference its display name? An explicit field, or a convention
-  derived from the asset ID (`item.Sword_Iron.name`)? If conventional, the edge is
-  *derived* and should carry lower confidence.
-- Which roles exist beyond name — description, flavour text, tooltips?
-- How many locales ship, and is English reliably complete?
-- What proportion of vanilla assets actually have localization entries? (Determines
-  how much of the corpus is reachable by natural-language search.)
-- Do lang files support any nesting or interpolation that complicates parsing?
-
-**Answer:**
+Unchanged — cannot be answered until a patch lands. However, **both `release` and
+`pre-release` are installed side by side**, which makes this answerable *now* by
+diffing the two archives' entry lists. Cheap, and it would give an early read on
+rename frequency. Opportunistic, not blocking.
 
 ---
 
-## Q15 — Are schema-only fields actually usable? 🟡 PRODUCT-DEFINING
+## Q14 — How does localization work? ✅ RESOLVED
 
-**Why it matters:** `find_undocumented` is the intended differentiator
-(`01-VISION.md` criterion 6), and it rests on an untested assumption — that a field
-present in the codec but absent from vanilla is a usable capability.
+**Answer: it works, it is explicit, and coverage is essentially complete for items.
+Search does not need embeddings.**
 
-It might instead be deprecated, engine-internal, populated programmatically rather
-than from JSON, or a debug hook. If most are noise, the feature survives but its
-framing and its position in the pitch both change.
+**Format** — `.lang`, plain `key = value`, `#` comments, `# === section ===`
+headers. 121 `.lang` files in the archive.
 
-**How to check:** once tier 2 extraction works, take three schema-only fields, put
-them in a real pack, load the game, observe. About an hour.
+```
+items.Armor_Adamantite_Chest.name = Adamantite Cuirass
+assetEditor.messages.unknownItem  = Unknown Item "{id}"
+```
 
-**Determine:** what proportion appear to have real effect; whether there is a
-detectable marker (annotation, naming convention, package) separating live fields
-from dead ones — if there is, filter on it and the feature becomes solid.
+**Locales shipped: 5** — `en-US`, `pt-BR`, `ru-RU`, `uk-UA`, `zh-CN`.
+`Server/Languages/fallback.lang` maps ~50 regional variants onto base locales
+(`en-GB = en-US`, `ru-UA = ru-RU`, …) and references base locales that are **not
+yet shipped** (`de-DE`, `es-ES`, `fr-FR`, `it-IT`, `pl-PL`, …), so more are
+planned. Coverage: `uk-UA` has 9 435 of `en-US`'s 9 971 keys (94.6 %).
 
-**Answer:**
+**Layout** — two roots:
+
+```
+Server/Languages/<locale>/server.lang        (714 KB en-US, 9 971 keys)
+Server/Languages/<locale>/wordlists.lang
+Server/Languages/fallback.lang
+Common/Languages/<locale>/avatarCustomization/*.lang   (22 small files per locale)
+```
+
+**The reference is EXPLICIT, not conventional** — this is the key finding:
+
+```json
+"TranslationProperties": { "Name": "server.items.Rock_..._Decorative.name" }
+```
+
+Therefore `LOCALIZED_BY` edges are **observed, high-confidence**, not derived. The
+lower-confidence fallback contemplated in `03-ARCHITECTURE.md` is unnecessary.
+
+**Key prefix rule — do not miss this.** The referenced key is
+`server.items.<Id>.name`, but the key **stored in the file** is `items.<Id>.name`.
+The `server.` prefix corresponds to the **`Server/` root the lang file lives
+under**. A naive string match finds zero matches across the entire corpus — the
+first scan performed during this verification did exactly that and produced a false
+"localization is missing" result. **Strip/derive the root prefix when joining.**
+Presume `Common/Languages/…` resolves under a `common.` prefix; verify before
+relying on it.
+
+**Roles** under `items.*`: `name` (3 762), `description` (330), `nameFull` (1).
+
+**Coverage:** 3 637 of 3 641 item definitions (99.9 %) carry
+`TranslationProperties.Name`.
+
+**Why this validates the design.** `items.Armor_Adamantite_Chest.name` resolves to
+*"Adamantite Cuirass"*. A user searching "cuirass" finds nothing in the identifier
+space — the ID says `Chest`. This is precisely the identifier/prose gap
+`03-ARCHITECTURE.md` §Localization predicted, demonstrated on real data.
+
+**Parsing complications to handle:**
+
+- **Multi-line continuation** with a trailing `\`
+- **ICU MessageFormat**, including nested plural forms:
+  `other {{count, number} blocks}}` — brace-counting, not regex
+- 810 of 9 971 en-US values contain `{placeholder}` interpolation
+
+**Section namespaces in `server.lang`** (useful as a type-adjacent taxonomy):
+`assetEditor assetTypes barter benchCategories builderTools chat commands customUI
+entityEffects formatting general worldmap instances interactionHints interactions
+io itemSets items map memories modules music npc npcRoles objectives portals
+prefabs shop ui universe`.
 
 ---
 
-## Q16 — How is `logical_id` correctly derived?
+## Q15 — Are schema-only fields actually usable? 🟡 PRODUCT-DEFINING — still open
 
-**Why it matters:** it is the key that groups an asset with the definitions it
-overrides. Getting it wrong makes every override relationship in the graph wrong,
-and wrong *silently* — nothing will crash, the answers will just be incorrect.
+Unchanged as a question, but **much cheaper to answer now** and with a better
+chance of a clean result.
 
-Depends on Q4. Candidates: path-derived (`<type>:<basename>`) or content-derived
-(explicit `Id` field, possibly namespaced). The vanilla pack is addressable as
-`Hytale:Hytale` in the Asset Editor, suggesting pack-group namespacing exists at some
-level.
+Because `toSchema()` yields `title`, `description`, `markdownDescription` and
+`enumDescriptions`, a schema-only field usually arrives **with the game's own prose
+attached**. That prose is very likely to distinguish a live capability from a
+deprecated or engine-internal one — which is exactly the "detectable marker" this
+question hoped for. Check the descriptions before running the in-game experiment.
 
-**Determine:** where identity actually lives; whether it is namespaced; whether two
-files at different paths can share an identity; case sensitivity; what the engine
-does with a collision inside a single pack.
+**Static evidence to exhaust before any in-game experiment**, per
+`01-VISION.md` §Operating constraint:
 
-**Answer:**
+1. **The field's own `description` / `markdownDescription`** — deprecation and
+   internal-use notes usually say so.
+2. **Whether a validator is attached.** `AssetKeyValidator.updateSchema` (Q17)
+   shows validators annotate the schema. A field the engine bothers to validate is
+   a field the engine reads.
+3. **Whether the field appears in the client protocol.** `com.hypixel.hytale.protocol`
+   is in the same JAR; a property that never crosses to the client is a different
+   kind of thing from one that does.
+4. **Whether anything reads the getter.** The codec builder registers a
+   getter/setter pair per field; if nothing outside the codec calls the getter, the
+   field is decoded and then ignored.
+
+Points 2–4 are the "detectable marker" this question hoped for, and all four are
+available from files at rest.
+
+The in-game experiment — three schema-only fields in a real pack, load, observe —
+remains the ground truth and stays available as **one-off product research**. It is
+not something the tool may depend on, and it should be the last step rather than
+the first.
+
+---
+
+## Q16 — How is `logical_id` correctly derived? ✅ RESOLVED
+
+**Answer: path-derived — the file's basename without extension. Identity is not
+carried in the file.**
+
+Evidence: `Server/Item/Items/Rock/Magma/Rock_Magma_Cooled_Brick_Decorative.json`
+contains no `Id` or `Name` identity field, and its localization key is
+`server.items.Rock_Magma_Cooled_Brick_Decorative.name` — the basename exactly, with
+**no path segments**. Organisational nesting (`Items/Rock/Magma/`) is therefore
+**not** part of identity. Independently, `AssetStore<String, Item, …>` keys assets
+by plain `String`.
+
+References confirm it: `"Parent": "Rock_Magma_Cooled_Brick"` and
+`"Set": "Rock_Magma_Cooled"` are bare basenames.
+
+**Rule:** `logical_id = <asset_type>:<basename without extension>`, with asset type
+resolved from the type registry rather than from directory depth (see Q4).
+
+Pack-level namespacing (`Hytale:Hytale` in the Asset Editor) is `Group:Name` from
+the manifest and identifies the **pack**, not the asset. Whether asset IDs can also
+be pack-qualified at reference sites is unverified — no namespaced reference was
+observed in vanilla.
+
+Still unverified: case sensitivity, and what the engine does with two files sharing
+a basename in different directories of one pack. Both are cheap to test and worth
+doing before Phase 4.
+
+---
+
+## Q17 — Can the engine's own validators be reused? 🆕 HIGH VALUE
+
+**Discovered during Q1.** `com.hypixel.hytale.codec.validation` contains 40 classes
+including `ValidatorCache` and `LateValidator`, and `Item` exposes
+`public static final ValidatorCache<String> VALIDATOR_CACHE`.
+
+**Why it matters:** `04-MCP-SURFACE.md` specifies `validate_pack` with
+hand-written checks. If the engine's validators can be invoked directly on a
+candidate asset, validation becomes *authoritative* rather than approximate — the
+tool would report exactly what the game will reject, which is a far stronger claim
+than "this field is unusual in the corpus."
+
+**Reframed after the official batch mode was found. Three findings, one of them a
+correction.**
+
+**1. CORRECTION — reference-typed fields do *not* mark themselves in the schema.**
+
+An earlier revision of this answer claimed they did, reasoning from
+`AssetKeyValidator.updateSchema(SchemaContext, Schema)` in the bytecode. **The
+generated output does not bear that out.** Known reference fields emerge bare:
+
+```json
+"Set":  { "type": ["string", "null"] },
+"Icon": { "type": ["string", "null"], "hytale": { "type": "string", … } }
+```
+
+`hytale.type` is a JSON-type marker (`string`, `object`, `Enum`, `Color`), not a
+pointer to a target asset type. Whatever `updateSchema` contributes, it is not a
+machine-readable reference target.
+
+Partial signal remains and should be mined: `hytale.uiEditorComponent` (259 fields)
+names the editor picker and sometimes a path template. But this covers a minority.
+**Reference resolution stays substantially heuristic** — see
+`05-CODEC-EXTRACTION.md` §What it does NOT give us, and adjust
+`03-ARCHITECTURE.md` §Confidence expectations accordingly.
+
+**2. Validation is reachable as a batch mode, not by reflection.**
+
+```
+--validate-assets           exit non-zero if any assets are invalid
+--validate-prefabs          same for prefabs
+--shutdown-after-validate   exit once validation completes
+```
+
+This is the same class of action as `--generate-asset-schema`, now permitted under
+the amended operating constraint (`01-VISION.md`) — with the same hazards:
+telemetry we cannot suppress, and a working directory that must be isolated.
+
+So the question is no longer "can we invoke the validators" but "is shelling out to
+a validation run worth its cost per invocation". Given it boots the server each
+time, it is plainly unsuitable for the per-keystroke path and plausibly useful as
+an explicit `validate --deep` command.
+
+**3. Missing-reference diagnosis is a first-class engine concept.**
+
+```java
+public class AssetValidationResults extends ValidationResults {
+    void handleMissingAsset(String, Class<? extends JsonAsset>, Object);
+    void disableMissingAssetFor(Class<? extends JsonAsset>);
+    void logOrThrowValidatorExceptions(HytaleLogger, String, Path, int);
+}
+```
+
+The engine already models "this asset points at something that does not exist",
+including per-file, per-line reporting (`Path`, `int`). That is `validate_pack`'s
+headline check, built in.
+
+**Still to determine:** whether validators can run without a live server. This is
+the one part that is *not* obviously free — `AssetKeyValidator` holds a
+`Supplier<AssetStore>` and validates against a **populated** store, so using it
+means loading the corpus through the engine's own `AssetStore`, not merely reading
+schema. That is heavier than extraction but still short of booting a server;
+`AssetRegistry.getStoreMap()` and `AssetPack`'s `FileSystem`-mounted roots suggest
+it is reachable. Also determine whether `LateValidator` implies a two-phase model,
+and whether error messages resolve through `assetEditor.messages.*` keys and can
+therefore be rendered as real prose.
+
+**⛔ Filed, not scheduled** — but for a cost reason now, not a feasibility one.
+
+`--validate-assets --shutdown-after-validate` is available and permitted. What
+makes it unsuitable as the default is its price: a full server boot (~40 s), a
+telemetry beacon, and a scratch working directory, **per run**. `validate_pack` is
+meant to be callable after every edit; this cannot be.
+
+`validate_pack` therefore ships as schema conformance plus broken-reference
+detection — what the design specified in the first place — and deep validation is at
+most an explicit, user-invoked `validate --deep`.
+
+**Revisit when** Phases 1–3 have shipped and cheap validation demonstrably misses
+real errors. Not before.
+
+---
+
+## Q18 — How does asset inheritance (`Parent`) work? 🆕 BLOCKING FOR `get_asset`
+
+**Discovered during Q4.** A real item declares:
+
+```json
+"Parent": "Rock_Magma_Cooled_Brick"
+```
+
+and the codec layer has `InheritCodec`, `RawJsonInheritCodec`, and
+`Schema.hytaleParent` typed as `Schema$InheritSettings`. **Asset definitions are
+not self-contained.**
+
+**Why it matters, immediately:**
+
+- `04-MCP-SURFACE.md` defines `get_asset` as returning "full effective JSON
+  definition". With inheritance, *effective* now means *after resolving the parent
+  chain* — a different and larger job than reading one file. Returning the raw file
+  would be actively misleading, since the agent would see a partial definition and
+  conclude fields are absent.
+- It creates a new edge kind (`INHERITS_FROM`) that is distinct from `OVERRIDES`:
+  overriding is cross-pack and identity-based; inheritance is intra-corpus and
+  explicit.
+- Schema inference (pass 3) will **undercount** field usage if it aggregates raw
+  files, because inherited fields never appear in the child document.
+- It interacts with Q5: if pack override uses the same merge machinery, both
+  problems share a solution.
+
+**Answer: deep merge, child replaces parent per field, recursively into nested
+structures. Documented by the game itself.**
+
+The generated schema (`05-CODEC-EXTRACTION.md`) carries this as the description of
+`/properties/Parent`, verbatim:
+
+> *"When set this asset will inherit properties from the named asset. When
+> inheriting from another **Item** most properties will simply be copied from the
+> parent asset to this asset. In the case where both child and parent provide a
+> field the child field will simply replace the value provided by the parent, in
+> the case of nested structures this will apply to the fields within the
+> structure."*
+
+**And it is answered per field, not just in general.** The `hytale` metadata block
+marks individual properties:
+
+| Marker | Count across 104 schemas | Meaning |
+|---|---|---|
+| `inheritsProperty` | 3 024 | this field is inherited from `Parent` |
+| `mergesProperties` | 1 237 | this field merges rather than being replaced wholesale |
+
+So `get_asset` can resolve the parent chain exactly, and report per field whether a
+value was declared locally, inherited, or merged — which is precisely what a pack
+author needs in order to know what to put in their own file.
+
+**Still unverified:** whether chains can be multi-level (almost certainly yes —
+`Tool_Pickaxe_Iron` → `Tool_Pickaxe_Crude`) and whether cycles are possible or
+rejected. Cheap to determine from the corpus once indexing exists; guard against
+cycles defensively in the resolver regardless.
+
+Note "most properties will simply be copied" — the hedge is the game's own. The
+per-field markers are the authority where the prose is vague.
+
+---
+
+## Q19 — Does the engine already maintain the reference graph? 🆕 HIGH VALUE
+
+**Discovered while resolving Q5/Q7.**
+
+```java
+public class AssetReferences<CK, C extends JsonAssetWithMap<CK, ?>> {
+    private final Class<C> parentAssetClass;
+    private final Set<CK> parentKeys;
+    public <T extends JsonAssetWithMap<K, ?>, K> void addChildAssetReferences(Class<T>, K);
+}
+```
+
+**The engine models asset → asset references as first-class data**, typed by asset
+class and key, with a parent/child direction.
+
+**Why it matters:** this project's central artifact is a reference graph, and
+`03-ARCHITECTURE.md` builds it heuristically from string matching, with confidence
+tiers to manage the noise. If the engine constructs an authoritative one during
+load, and it is reachable, then large parts of pass 2 become *verification* rather
+than *inference*, and `trace_refs` — the "what breaks if I change this" tool that is
+the project's safest differentiator — rests on the engine's own answer.
+
+**Determine:** when `AssetReferences` is populated and by what; whether it covers
+all reference kinds or only some; whether it is reachable without a live server
+(same boundary question as Q17 — it plausibly needs populated `AssetStore`s);
+whether it survives as queryable state or is transient during load; how it relates
+to `AssetKeyValidator`, which appears to be the per-field mechanism.
+
+**⛔ Filed, not scheduled.** Same reasoning as Q17: reaching this graph means
+populating asset stores through the engine — a full boot per run, with the
+telemetry and isolation costs that carries (`05-CODEC-EXTRACTION.md` §Hazards).
+
+The heuristic resolver is needed regardless — for anything schema does not type,
+and for the hot layer, where the user's in-progress pack may not load at all. And
+reference confidence is already high for every schema-typed field, which is the
+majority. So the marginal gain here is smaller than it first appeared.
+
+**Revisit when** schema-typed references prove insufficient in practice — measured,
+via the resolver-precision regression test in `09-EVALUATION.md`, not assumed.
 
 ---
 
 ## Newly discovered blockers
 
 *(append below during implementation)*
+
+- **Q17**, **Q18** and **Q19** above were discovered during Phase 0 verification and
+  are filed as full questions rather than notes.
+- **`FileIO` is read-only and lives in `com.hypixel.hytale.procedurallib.file`**,
+  not where `02-DOMAIN.md` implied. Its surface is `exists`, `resolve`, `load`,
+  `list`, `relativize`, `append` — **there is no write method**. It is the
+  multi-root read overlay; writing goes through the Asset Editor's `DataSource`
+  (Q7). Do not look for override semantics in `FileIO`.
+- **The Asset Editor is a builtin server plugin**
+  (`com.hypixel.hytale.builtin.asseteditor`, `AssetEditorPlugin`), not a client
+  feature. Anything about its behaviour is statically readable.
+- **`AssetRegistry.getStoreMap()`** returns
+  `Map<Class<? extends JsonAssetWithMap>, AssetStore>` — a static, complete
+  registry of asset types. This is the extraction entry point; prefer it over
+  package-name scanning (`05-CODEC-EXTRACTION.md` §Entry points).
+- **Tags are interned to ints globally** (`AssetRegistry.TAG_MAP`,
+  `getOrCreateTagIndex`, `CLIENT_TAG_MAP`). Real assets carry a `Tags` block. If
+  tags are queryable, they are a cheap and meaningful search facet.
+- **Type-registry mismatch.** 39 JAR asset-type subpackages vs 51 archive
+  directories, with names in different cases and no clean correspondence. Until
+  resolved, path → type mapping is the weakest link in pass 1. See Q4.
+- **`Server/World` and `Server/Prefabs` are a third of the corpus** (20 006 of
+  60 148 entries) and have no matching codec asset type. Decide explicitly whether
+  worldgen data belongs in the graph before it dominates every field statistic.

@@ -85,15 +85,25 @@ Search in order, first hit wins:
 4. Project-local provisioned copies: `run/`, `data/server/`, `data/assets/`
 5. Standard install paths per OS (below)
 
-Standard install path, via launcher → Settings → Open Directory:
+**Windows install root — verified, and machine-readable.** Do not guess it:
 
 ```
-<install>/release/package/game/latest/Assets.zip
+%AppData%\Roaming\Hytale\patchline.json
+    {"patchline":"release","user_data":"…\\AppData\\Roaming\\Hytale\\UserData"}
+
+%AppData%\Roaming\Hytale\install\<patchline>\package\game\latest\Assets.zip
+%AppData%\Roaming\Hytale\install\<patchline>\package\game\latest\Server\HytaleServer.jar
+%AppData%\Roaming\Hytale\install\<patchline>\package\jre\latest\    (Temurin 25)
 ```
 
-`[UNKNOWN]` The OS-specific install root. `OPEN-QUESTIONS.md` Q6. Likely
-`%LocalAppData%` or `%AppData%` on Windows; macOS and Linux unconfirmed.
-User data is separately known to live at `%AppData%/Roaming/Hytale/UserData/`.
+**Read `patchline.json` and resolve from it.** It names the active patchline *and*
+the UserData root, which makes step 5 deterministic on Windows rather than a probe.
+Fall back to scanning `install\*\package\game\latest\` if the file is missing or
+malformed — patchlines are sibling directories, and more than one is commonly
+installed (`release` and `pre-release` were both present on the verification
+machine).
+
+macOS and Linux roots remain unverified (`OPEN-QUESTIONS.md` Q6).
 
 ### Server JAR
 
@@ -131,17 +141,35 @@ target.
 | **2** | `+ HytaleServer.jar` + JVM | Authoritative schema, complete enums, `find_undocumented`, real validation |
 | **3** | `+ project files` | Overrides, diffs, live validation, `whats_changed` |
 
-Tiers 1 and 3 are independent of tier 2; a pack author with no Java still gets a
-fully working tool, just without schema-level answers.
+Tiers 1 and 3 are independent of tier 2.
 
-**Important open question (Q2):** Hytale runs a local server even in singleplayer.
-If the client installation therefore ships `HytaleServer.jar`, then tier 2 is
-available to pack authors too — and since packs are the primary audience, that
-roughly doubles the tool's value for the people who need it most. This is verifiable
-in five minutes on any installation. **Check it early; it may reorder the roadmap.**
+**Q2 is resolved, and tier 2 is the normal case rather than the privileged one.**
+The client installation ships `HytaleServer.jar` adjacent to `Assets.zip`, **and
+bundles its own Temurin 25 JRE**:
 
-`status()` must always report the current tier, and tools that require tier 2 must
-say so plainly rather than silently returning less.
+```
+install\<patchline>\package\game\latest\Server\HytaleServer.jar   123 MB
+install\<patchline>\package\jre\latest\                           Temurin 25.0.2+10
+```
+
+So a no-code pack author with no Java installation still reaches tier 2 — both the
+schema source and the runtime to read it are already on their disk. Since packs are
+the primary audience, this roughly doubles the tool's value for the people who need
+it most, and it is why Phase 3 moved earlier in `08-ROADMAP.md`.
+
+Two implementation consequences:
+
+- **Ship the extractor pre-compiled.** The bundled runtime is a JRE — `java.exe`
+  is present, `javac`/`javap` are not. It can run our extractor; it cannot build it.
+- **Prefer the bundled JRE over any system Java.** It is guaranteed
+  version-matched to the JAR being read. Fall back to `JAVA_HOME`/`PATH` only if
+  the bundled runtime is absent.
+
+Tier 2 should now degrade only when the game is not installed locally at all — for
+example when the user points `--assets` at a copied archive. Say so plainly in that
+case rather than silently returning less.
+
+`status()` must always report the current tier.
 
 ---
 
@@ -211,8 +239,20 @@ blocker — but do not start there.
 
 ## First-run experience
 
-The first run is slow (hundreds of megabytes) and this is the moment a user decides
-whether to keep the tool. Requirements:
+The first run is slow — **`Assets.zip` measures 3.43 GB across 60 148 entries**, an
+order of magnitude beyond the "hundreds of megabytes" this document originally
+assumed — and this is the moment a user decides whether to keep the tool.
+
+Two measurements make the budget less alarming than the size suggests: the central
+directory read costs **~4 s** for all 60 148 entries, and decompressing one asset
+JSON costs **~0.13 ms**. So enumerating the corpus is cheap and random access is
+very cheap; the cost is in how many entries you choose to parse.
+
+Report progress against entries processed, and consider deferring the bulk of
+content parsing for directories the user is unlikely to query first —
+`Server/World` and `Server/Prefabs` alone are a third of the archive.
+
+Requirements:
 
 - Progress output with real counts, not a spinner
 - Explain *what* is happening: "Indexing vanilla assets (one-time, cached globally)"
@@ -224,11 +264,13 @@ Something close to:
 
 ```
 Detected: pack "MyFirstPack" (empty)
-Vanilla assets: <path>  [cached ✓]
-Server JAR:     not found — tier 1
-  → schema answers unavailable; run with --jar to enable
+Patchline:      release
+Vanilla assets: …\game\latest\Assets.zip          3.43 GB, 60,148 entries [cached ✓]
+Server JAR:     …\game\latest\Server\HytaleServer.jar          — tier 2
+Java runtime:   bundled Temurin 25.0.2 (game install)
 
-Indexed 12,847 assets across 43 types, 31,209 references (2,104 low-confidence)
+Indexed 12,847 assets across 39 types, 31,209 references (2,104 low-confidence)
+Schema: 39/39 types from codec  ·  Localization: 5 locales, 99.9% of items
 Ready. Add to your MCP client:
 
   { "hytale-index": { "command": "npx", "args": ["hytale-index", "--mcp"] } }
