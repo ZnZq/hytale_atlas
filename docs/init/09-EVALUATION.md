@@ -83,6 +83,58 @@ whether it loads)
 
 ---
 
+## The canonical scenario — "3x3 pickaxe"
+
+One task worth singling out, because it exercises every question family at once,
+has a **known-correct answer verified against real data**, and contains a trap that
+distinguishes a grounded agent from a confident one.
+
+> *"Create a new pickaxe that mines 3x3 and add its recipe to my new workbench,
+> in the tools category."*
+
+### Ground truth
+
+Established from `Tool_Pickaxe_Iron.json` and `ItemTool` / `BuilderTool` in the
+release JAR. All of it is checkable without launching the game.
+
+| Sub-question | Correct answer |
+|---|---|
+| How are tools described? | `Tool.Specs[{Power, GatherType, Quality}]` — one entry per material class; plus `DurabilityLossBlockTypes`, `MaxDurability` |
+| **How to specify a 3x3 area?** | **You cannot.** `ItemTool` = `{specs[], speed, durabilityLossBlockTypes, hitSoundLayerId, incorrectMaterialSoundLayerId}`. No width, radius, area or shape. Area belongs to `buildertool` (`Width`, `Height`, `Thickness`, `Shape` with 11 `BrushShape` values) — a different asset type with different semantics |
+| How are recipes described? | A `Recipe` block **inside the item**, not a separate file: `{TimeSeconds, Input[{ItemId, Quantity}], BenchRequirement[]}` |
+| How to attach to a bench and category? | `BenchRequirement: [{Id, Type, Categories[]}]` — e.g. `{"Id": "Workbench", "Type": "Crafting", "Categories": ["Workbench_Tools"]}` |
+| What does the definition inherit? | `"Parent": "Tool_Pickaxe_Crude"` — the effective definition is **not** the file contents. `Tool_Pickaxe_Iron` even borrows the parent's description key |
+
+### Grading
+
+**The decisive criterion is the second row.** A correct answer *declines* to express
+3x3 on the tool and explains where area actually lives. The characteristic failure
+is inventing a plausible field — `"BreakRadius": 3`, `"AreaOfEffect": {...}` — which
+the game **silently ignores**: no error, no warning, a normal pickaxe, and an hour
+of user confusion. Corpus search cannot catch this, because absence is invisible to
+a search over what exists. Only extracted schema can.
+
+Secondary criteria, all binary:
+
+- Uses `ItemId` in recipe inputs, not an invented `Item` / `Id` / `Ingredient`
+- Resolves `Parent` rather than treating the file as the whole definition
+- Points `BenchRequirement.Id` at the **user's** bench and confirms it resolves
+- Uses a category the user's bench actually declares, not a vanilla one
+- Adds `TranslationProperties.Name` **and** the matching `.lang` entry — omitting
+  the second ships a raw identifier to players, the most common beginner mistake
+
+### Why it belongs here rather than in the task list
+
+It is the clearest single demonstration of the project's thesis. Four of the five
+sub-questions are answerable from the corpus, where a grep-equipped baseline
+competes respectably. The fifth is answerable **only** from extracted schema, and it
+is the one where the baseline fails silently rather than visibly.
+
+Run it in both arms at Phase 2, and report the 3x3 outcome separately from the
+aggregate — an aggregate score hides exactly the failure this task exists to expose.
+
+---
+
 ## Search evaluation (separate, and do it first)
 
 Search quality is the single largest identified risk (`01-VISION.md` §Risk

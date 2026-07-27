@@ -83,6 +83,45 @@ cheap to carry.
 
 ### Understanding structure
 
+**`search_schema(query, type?, limit?)`**
+
+Full-text over the **schema itself** — field pointers, `title`, `description`,
+`markdownDescription`, enum values and `enumDescriptions` — across every asset
+type. Returns `{type, pointer, title, description, declared_type}`.
+
+**This answers a question no other tool here can: *where does capability X live?***
+`describe_schema` requires you to already know the type. `search_assets` searches
+assets, not the schema. Neither helps an agent that knows what it wants to achieve
+but not which asset type expresses it.
+
+The case that produced this tool, traced on real data:
+
+> *"make a pickaxe that mines 3x3"*
+>
+> `ItemTool` is `{specs[], speed, durabilityLossBlockTypes, hitSoundLayerId,
+> incorrectMaterialSoundLayerId}` — **no width, radius, area or shape.** A
+> gathering tool breaks one block, and no amount of searching *assets* reveals
+> that, because absence is invisible to a corpus search.
+>
+> `search_schema("area size shape width")` returns `buildertool`:
+> `/Width`, `/Height`, `/Thickness`, `/Shape` (11 `BrushShape` values), `/Mask`,
+> `/Density` — a **different asset type with different semantics**.
+>
+> The agent can then say: *"a gathering tool has no area field; area belongs to
+> the builder-tool system, which is a different kind of asset. This probably needs
+> a plugin, not a pack."* Without it, the agent writes `"BreakRadius": 3`, the game
+> silently ignores it, and the user debugs for an hour.
+
+Two properties make this cheap. The schema ships with the game's own prose
+(`05-CODEC-EXTRACTION.md`), so there is real language to match against rather than
+just identifiers — the same argument that makes localization load-bearing for
+`search_assets`. And the schema is small relative to the corpus, so this FTS index
+costs almost nothing.
+
+**Requires tier 2.** Without extracted schema, degrade to searching observed field
+pointers from corpus inference, and say so — corpus-derived pointers cannot answer
+the "does this capability exist at all" question, which is the whole point.
+
 **`describe_schema(type, field?)`**
 
 The inventory of fields for an asset type. Each field carries **both layers**:
@@ -243,7 +282,11 @@ a **populated** store, so this needs the corpus loaded through the engine — he
 than schema extraction, though still short of booting a server, which
 `01-VISION.md` §Operating constraint forbids.
 
-See `OPEN-QUESTIONS.md` **Q17**; investigate alongside Phase 2, do not block on it.
+**Deliberately not scheduled.** `05-CODEC-EXTRACTION.md` §Scope boundary draws the
+line at *reading declarations* rather than *invoking behaviour*, and this falls on
+the far side. `validate_pack` therefore ships as schema conformance plus
+broken-reference detection — the design's original specification. See
+`OPEN-QUESTIONS.md` **Q17** for the revisit trigger.
 
 Distinguish **error** (will not load) from **warning** (unusual but legal). Do not
 report low-confidence heuristic findings as errors.
@@ -271,9 +314,15 @@ Tool descriptions are prompt engineering, not documentation. Each should state:
 - when **not** to use it (especially: "use `search_assets` first, not `get_asset`")
 - its cost profile
 
-Suggested orientation hint in the server instructions: *start with
-`list_asset_types` or `search_assets`; use `find_examples` to learn a pattern;
+Suggested orientation hint in the server instructions: *to find out **whether**
+something is expressible, start with `search_schema`; to find **what exists**, start
+with `list_asset_types` or `search_assets`; use `find_examples` to learn a pattern;
 use `get_asset` only when you need the complete definition.*
+
+The first clause matters more than its length suggests. An agent that reaches for
+`search_assets` when the real question is "can this be done at all" will find
+nothing and conclude it must invent something — the failure mode traced in
+`09-EVALUATION.md` §The canonical scenario.
 
 ---
 

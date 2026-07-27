@@ -237,10 +237,43 @@ trail weather wordlist
 These are **lowercase and do not map one-to-one onto the 51 PascalCase archive
 directories** — 39 vs 51, and names differ (`Server/Prefabs`, `Server/World`,
 `Server/Drops` have no matching subpackage; `blockhitbox`, `attitude`,
-`responsecurve` have no obvious matching directory). **The disagreement is itself
-information and must be surfaced, not smoothed over.** Note also there is no
+`responsecurve` have no obvious matching directory). Note also there is no
 `entity` subpackage despite `Server/Entity` existing — entities are presumably ECS
 prefabs rather than a codec-backed asset type.
+
+**Do not reconcile this by hand — the engine ships the mapping.** The Asset Editor
+carries an authoritative type table and a path resolver:
+
+```java
+class AssetEditorAssetType {            // protocol.packets.asseteditor
+    public String id;                   // asset type id
+    public String path;                 // its directory
+    public String fileExtension;
+    public AssetEditorEditorType editorType;
+}
+
+class AssetTypeRegistry {               // builtin.asseteditor
+    Map<String, AssetTypeHandler> getRegisteredAssetTypeHandlers();
+    AssetTypeHandler getAssetTypeHandlerForPath(java.nio.file.Path);   // <- pass 1 needs exactly this
+    boolean isPathInAssetTypeFolder(java.nio.file.Path);
+}
+```
+
+`AssetEditorSetupAssetTypes` is a **protocol packet**, i.e. the whole table is
+already built to be serialised and shipped to the editor client. Extracting it is
+the same class of work as extracting schema.
+
+**This retires "path → type mapping" as a design unknown.** What remains is
+execution, plus one caveat: `AssetTypeRegistry` is populated by `registerAssetType`
+calls during Asset Editor plugin initialisation, so **determine the minimum
+initialisation that populates it without booting a server** (`01-VISION.md`
+§Operating constraint). Fallback if runtime population proves impractical: the
+handler construction sites pass literal `id`/`path`/`fileExtension` strings, which
+are readable from the constant pool.
+
+The 39-vs-51 disagreement remains worth *reporting* — a directory with no
+registered type is a real fact about the corpus — but it is no longer something the
+indexer must guess its way through.
 
 **One asset per file**, named by the asset ID.
 
@@ -724,8 +757,16 @@ it is reachable. Also determine whether `LateValidator` implies a two-phase mode
 and whether error messages resolve through `assetEditor.messages.*` keys and can
 therefore be rendered as real prose.
 
-**Do not block Phase 1 on this.** Investigate alongside Phase 2 (codec extraction),
-where the JVM harness already exists.
+**⛔ Filed, not scheduled.** `05-CODEC-EXTRACTION.md` §Scope boundary excludes this
+from Phase 2. Reading the schema marker is *reading a declaration*; running the
+validators is *invoking behaviour*, which needs populated `AssetStore`s and couples
+us to the engine's initialisation sequence rather than to what it declares.
+
+The affordable consequence: `validate_pack` degrades to schema conformance plus
+broken-reference detection — which is what the design specified in the first place.
+
+**Revisit when** Phases 1–3 have shipped and validation demonstrably misses real
+errors that these validators would have caught. Not before.
 
 ---
 
@@ -794,12 +835,17 @@ all reference kinds or only some; whether it is reachable without a live server
 whether it survives as queryable state or is transient during load; how it relates
 to `AssetKeyValidator`, which appears to be the per-field mechanism.
 
-**Do not build pass 2 around this until it is confirmed** — the heuristic resolver
-is still needed for anything the engine does not track, and for the hot layer where
-the user's in-progress pack may not load at all. But investigate it before
-finalising the resolver, because it could change what the resolver is *for*.
+**⛔ Filed, not scheduled.** Same boundary as Q17: reaching this graph means
+populating asset stores through the engine, i.e. invoking behaviour rather than
+reading a declaration (`05-CODEC-EXTRACTION.md` §Scope boundary).
 
-Investigate alongside Q17, in Phase 2.
+The heuristic resolver is needed regardless — for anything schema does not type,
+and for the hot layer, where the user's in-progress pack may not load at all. And
+reference confidence is already high for every schema-typed field, which is the
+majority. So the marginal gain here is smaller than it first appeared.
+
+**Revisit when** schema-typed references prove insufficient in practice — measured,
+via the resolver-precision regression test in `09-EVALUATION.md`, not assumed.
 
 ---
 

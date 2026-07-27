@@ -47,11 +47,29 @@ It answers four families of question:
 |---|---|
 | **What exists?** | "What asset types are there? What items exist?" |
 | **How is X built?** | "Show me how vanilla implements a burning weapon" |
-| **What is possible?** | "What fields can an item definition have, including ones vanilla never uses?" |
+| **What is possible?** | "What fields can an item definition have, including ones vanilla never uses?" · "Can a pickaxe mine 3x3 at all?" |
 | **What connects to X?** | "What breaks if I override this block? What does this entity need to load?" |
 
 The fourth is the one nothing else can answer today, and the third is the one that
 requires the server JAR.
+
+**The third splits into two answers with very different risk profiles**, and the
+distinction is worth making early because it de-risks this document's central bet:
+
+- **The negative answer — "this is not expressible."** Safe, verifiable, and
+  immediately valuable. Traced on real data: a gathering tool has no area field, so
+  a 3x3 pickaxe cannot be made by editing an item. An agent without schema searches
+  the corpus, finds no 3x3 tool, and invents `"BreakRadius": 3`; the game silently
+  ignores it. **Absence is invisible to corpus search**, so this answer is
+  structurally unavailable to any grep-based approach — and it costs nothing to be
+  confident about, because we are reporting what the schema does not contain.
+- **The positive answer — "this field exists but vanilla never uses it."** That is
+  criterion 6 below, and it remains a bet: such a field may be deprecated,
+  engine-internal, or set programmatically.
+
+Half the value of "what is possible" therefore does **not** depend on the bet
+landing. Even if `find_undocumented` turns out to be mostly noise, the negative
+answer stands on its own.
 
 ## Who it is for
 
@@ -176,7 +194,7 @@ engineering-side, not feasibility-side**.
 |---|---|---|
 | Pack format changes between EA versions | High | **Unchanged.** Still the governing constraint: never hardcode schema. Two patchlines already coexist on one machine, so cache by content hash |
 | **Corpus scale** | **High** 🆕 | `Assets.zip` measured at **3.43 GB / 60 148 entries** — an order of magnitude above the original budget. Streaming extraction is mandatory. Mitigating measurement: the central directory reads in ~0.5 s, so pass 1 is free |
-| **Path → asset type mapping** | **High** 🆕 | 39 JAR type subpackages vs 51 archive directories, different case, no clean correspondence; a second-level directory is not a type. **Now the weakest link in Phase 1** |
+| ~~Path → asset type mapping~~ | ~~High~~ → **Low** | **Retired.** The engine ships the table and the resolver: `AssetEditorAssetType{id, path, fileExtension}` plus `AssetTypeRegistry.getAssetTypeHandlerForPath(Path)`. Execution, not a design unknown — but it must be extracted **before** Phase 1's pass 1 (`08-ROADMAP.md` §Prerequisite) |
 | Asset inheritance (`Parent`) | Medium 🆕 | Definitions are not self-contained. Affects `get_asset` and field statistics. Merge semantics still open — `OPEN-QUESTIONS.md` Q18 |
 | ~~Search fails on natural-language intent~~ | ~~High~~ → **Low** | **Retired.** Explicit `TranslationProperties.Name` references, 99.9 % item coverage, 5 locales. Embeddings not needed. Residual risk is parser correctness (ICU MessageFormat, root-prefix rewrite), not data availability |
 | ~~Codec extraction proves infeasible~~ | ~~High~~ → **Low** | **Retired, and inverted.** `Codec<T> extends SchemaConvertable<T>` — schema is a supported API call, delivered with the game's own prose descriptions |

@@ -44,6 +44,34 @@ size percentiles before elision thresholds are tuned.
 **Deliverable:** `npx hytale-index` indexes `Assets.zip` and serves
 `search_assets`, `list_asset_types`, `get_asset` over MCP.
 
+### Prerequisite — build the extractor first
+
+**Phase 1 consumes two of the extractor's three artifacts**, so the extractor
+program is built before the corpus index rather than after it:
+
+| Needed by | Artifact |
+|---|---|
+| Pass 1, `logical_id`, `list_asset_types` | The asset type table — `id`, `path`, `fileExtension` (Q4) |
+| `get_asset` | Inheritance merge semantics, from `Schema.hytaleParent` (Q18) |
+
+There is **no separate "probe"**. Once Phase 2's scope was fixed at three artifacts
+(`05-CODEC-EXTRACTION.md` §Scope boundary), the extractor became small enough that
+splitting it would cost more than moving it. Build it whole, run it, and Phase 1
+starts with real type and inheritance data.
+
+What stays in Phase 2 is everything that *consumes* the output —
+`find_undocumented`, authoritative `describe_schema`, `search_schema`,
+schema-aware `validate_pack`. Only the extraction program moves.
+
+Without this ordering, Phase 1 either guesses at asset types or ships a `get_asset`
+that returns partial definitions. **Both failures are silent**, which is the worst
+kind here: nothing crashes, the answers are simply wrong.
+
+If the registry proves impossible to populate without booting a server (forbidden —
+`01-VISION.md` §Operating constraint), fall back to reading the literal
+`id`/`path`/`fileExtension` constants from the handler construction sites, and
+report the degradation in `status()`.
+
 Scope:
 - Streaming ZIP reader with per-entry extraction (do not unpack wholesale) —
   the archive is **3.43 GB / 60 148 entries**, so this is not optional
@@ -84,8 +112,13 @@ to find how a specific vanilla item is defined; it should take two or three call
 
 ## Phase 2 — Codec extraction *(was Phase 3; promoted)*
 
-**Deliverable:** tier 2. Authoritative `describe_schema`, `find_undocumented`,
-schema-aware `validate_pack`.
+**Deliverable:** tier 2. Authoritative `describe_schema`, **`search_schema`**,
+`find_undocumented`, schema-aware `validate_pack`.
+
+`search_schema` is new, and came out of tracing a real request against real data
+(`09-EVALUATION.md` §The canonical scenario). It answers *"where does capability X
+live, and does it exist at all"* — the one question corpus search structurally
+cannot, because absence is invisible to a search over what exists.
 
 **Why it moved.** The original document said to pull this earlier if Q1 and Q2 both
 resolved favourably. They did, emphatically:
@@ -102,19 +135,30 @@ precisely the low-confidence collision case. Running extraction *before* schema
 inference means Phase 3 resolves those against declared types instead of guessing,
 so its statistics are built on correct edges rather than needing rework.
 
-Scope per `05-CODEC-EXTRACTION.md`:
+**Scope is fixed by `05-CODEC-EXTRACTION.md` §Scope boundary — three artifacts,
+nothing else:**
+
+1. The asset type table — `id`, `path`, `fileExtension` per registered type, from
+   `AssetTypeRegistry` / `AssetEditorAssetType`
+2. Codec schema per type — `toSchema(SchemaContext)`, serialised via `Schema.CODEC`
+3. Reference-typed field markers — **free**, they arrive inside (2) because
+   `AssetKeyValidator.updateSchema` writes them there
+
+`Schema.hytaleParent` (`InheritSettings`) also arrives free inside (2), which is
+where the Q18 inheritance semantics come from.
+
+Engineering around those three:
 - Pre-compiled JVM extractor run as a sandboxed subprocess, preferring the game's
-  bundled JRE
-- Enumerate types via `JsonAssetWithMap` implementors, cross-checked against the
-  `asset.type` package convention
-- `toSchema(SchemaContext)` → serialise via `Schema.CODEC`
+  bundled JRE (`06-CLI-UX.md`)
 - Keep the verbatim schema document *and* a flattened field list
+- **Capture `title` / `description` / `enumDescriptions`** — the game documents its
+  own schema; that prose is user-facing output *and* the input to `search_schema`
 - Coverage reporting, including types that fail to initialise
 - Hash-keyed schema cache
-- **Capture `title` / `description` / `enumDescriptions`** — the game documents its
-  own schema, and that prose is both user-facing output and FTS input
-- Investigate `Schema.hytaleParent` / `InheritSettings` while here; it is the
-  authoritative description of the Q18 inheritance semantics Phase 1 had to infer
+
+**Do not extend this scope during Phase 2.** Q17 (executing engine validators) and
+Q19 (the engine's own reference graph) are filed and explicitly **not scheduled** —
+revisit only if Phases 1–3 demonstrate a gap they would close.
 
 **Test, and treat it as a go/no-go on the feature's framing.** Take a sample of
 fields `find_undocumented` reports and grade them **statically first**, in this

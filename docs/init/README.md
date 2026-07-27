@@ -108,7 +108,45 @@ scope. **When a question looks like it needs the game, suspect the framing.**
   51 archive directories, with no clean correspondence.
 
 **Roadmap change:** Phase 3 (codec extraction) was promoted ahead of Phase 2
-(schema statistics), on the trigger the roadmap itself specified.
+(schema statistics), on the trigger the roadmap itself specified. The extraction
+*program* moves earlier still — Phase 1 consumes two of its three artifacts.
+
+---
+
+## Scope boundary — added after Phase 0
+
+Phase 0 kept finding useful things in the JAR, and the natural drift was to reach
+for all of them. **`05-CODEC-EXTRACTION.md` §Scope boundary now fixes the line:**
+
+> **Read data, do not invoke behaviour.**
+
+Extraction produces exactly three artifacts — the asset type table, the codec
+schema per type, and reference-typed field markers (the third arrives free inside
+the second). Executing the engine's validators (**Q17**) and reading its internal
+reference graph (**Q19**) are *filed, not scheduled*: both require populated asset
+stores, which couples us to how the game initialises rather than to what it
+declares.
+
+The corollary is easy to miss: **learning a rule from the JAR does not create a
+dependency on it.** Pack priority (Q5) and Asset Editor write semantics (Q7) were
+read statically and written down. We implement them ourselves. That is knowledge,
+not coupling.
+
+## A worked example that shaped the design
+
+Tracing one real request — *"make a pickaxe that mines 3x3 and add its recipe to my
+new workbench, in the tools category"* — against real data produced three changes:
+
+- **A new tool, `search_schema`** (`04-MCP-SURFACE.md`). Four of the five
+  sub-questions are answerable from the corpus. The fifth — *can a tool have an
+  area of effect at all?* — is not, because **absence is invisible to a search over
+  what exists**. `ItemTool` has no area field; area lives in `buildertool`. Without
+  schema search an agent invents `"BreakRadius": 3` and the game silently ignores it.
+- **A canonical evaluation scenario** (`09-EVALUATION.md`) with ground truth
+  verified from the JAR and corpus, gradeable without launching the game.
+- **A sharper framing of the project's bet** (`01-VISION.md`): the *negative*
+  answer — "this is not expressible" — is safe and verifiable, and stands even if
+  `find_undocumented` proves to be mostly noise.
 
 ---
 

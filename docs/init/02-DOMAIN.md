@@ -275,6 +275,71 @@ non-self-contained, and the codec layer has `InheritCodec` / `RawJsonInheritCode
 to match. This affects `get_asset` and schema inference directly — see
 `OPEN-QUESTIONS.md` **Q18**.
 
+### Item anatomy
+
+`[MEASURED]` Items are the largest codec-backed type (3 641 definitions) and the
+one most requests touch. `Tool_Pickaxe_Iron.json`, abridged:
+
+```json
+{
+  "TranslationProperties": { "Name":        "server.items.Tool_Pickaxe_Iron.name",
+                             "Description": "server.items.Tool_Pickaxe_Crude.description" },
+  "Parent": "Tool_Pickaxe_Crude",
+  "Quality": "Uncommon",  "ItemLevel": 20,  "MaxDurability": 250,
+  "Model":   "Items/Tools/Pickaxe/Iron.blockymodel",
+  "Recipe": {
+    "TimeSeconds": 3.5,
+    "Input": [ { "ItemId": "Ingredient_Bar_Iron", "Quantity": 5 } ],
+    "BenchRequirement": [ { "Id": "Workbench", "Type": "Crafting",
+                            "Categories": ["Workbench_Tools"] } ]
+  },
+  "Tool": {
+    "Specs": [ { "Power": 0.5, "GatherType": "Rocks", "Quality": 3 } ],
+    "DurabilityLossBlockTypes": [ { "BlockSets": ["Stone","Rock","Ores"],
+                                    "DurabilityLossOnHit": 0.25 } ]
+  }
+}
+```
+
+Four facts worth carrying forward:
+
+1. **Recipes live inside the item**, not in a separate file. `Server/Item/Recipes/`
+   holds 403 more, so both forms exist.
+2. **Bench and category are one structure:**
+   `BenchRequirement[{Id, Type, Categories[]}]`. `Id` names a bench asset, `Type`
+   is a crafting-kind vocabulary (`Crafting`, `StructuralCrafting`), `Categories`
+   are ids the bench declares. `Server/Item/Category/` holds the category assets.
+3. **Inheritance is routine, not exotic.** The first tool opened during
+   verification used `Parent`, and even borrows the parent's *description key*. The
+   parent file is larger than the child (3 708 vs 2 201 bytes). A `get_asset` that
+   returns the raw file shows an agent a materially incomplete definition.
+4. **Vocabularies are bare strings throughout** — `GatherType` (`Rocks`, `Soils`,
+   `OreIron`, `VolcanicRocks`, `Benches`…), `BlockSets`, `Categories`, `Type`,
+   `Quality`. The corpus yields only *used* values; the codec schema yields the
+   complete set. For authoring against a user's own bench or category, that
+   difference is the whole answer.
+
+### Capability boundaries between asset types
+
+`[MEASURED]` **A gathering tool has no area of effect.** The complete `ItemTool`:
+
+```
+specs[], speed, durabilityLossBlockTypes, hitSoundLayerId, incorrectMaterialSoundLayerId
+```
+
+No width, radius, area or shape. Area and shape belong to a **different asset
+type**, `buildertool`, whose `BuilderTool` config carries `builtin_Width`,
+`builtin_Height`, `builtin_Thickness`, `builtin_Shape`, `builtin_Origin`,
+`builtin_Mask`, `builtin_Density`, `builtin_Spacing`, with an 11-value
+`BrushShape` enum (`Cube`, `Sphere`, `Cylinder`, `Cone`, `Pyramid`, `Dome`,
+`Diamond`, `Torus`, …).
+
+**This class of fact — where a capability lives, and where it demonstrably does
+not — is invisible to corpus search**, because absence cannot be found by searching
+what exists. It is the clearest justification for extracting schema, and it drives
+the `search_schema` tool in `04-MCP-SURFACE.md` and the canonical evaluation
+scenario in `09-EVALUATION.md`.
+
 `[VERIFIED]` Vanilla assets are browsable in-game: in the Asset Editor, switch to
 the `Hytale:Hytale` pack, locate an asset (e.g. `Armor_Bronze_Chest`), and copy it
 into your own pack as a starting point.

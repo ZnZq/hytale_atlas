@@ -50,6 +50,62 @@ attached that usually reveal whether a field is live or vestigial.
 
 ---
 
+## Scope boundary — what we extract, and what we do not
+
+**This list is fixed. Adding to it is a decision, not a discovery.**
+
+Phase 0 kept finding useful things in the JAR — validators, a reference graph, pack
+priority, editor write behaviour — and the natural drift is to reach for all of
+them. That drift is what this section exists to stop.
+
+### The line: read data, do not invoke behaviour
+
+| | Cost | Verdict |
+|---|---|---|
+| **Read data** — load classes, call `toSchema()`, serialise, exit | One process, one run per game version, output cached by content hash | **In scope** |
+| **Invoke behaviour** — run validators, populate `AssetStore`s, replicate engine lifecycle | Requires initialised stores and an engine-shaped environment; couples us to how the game *runs*, not just what it *declares* | **Out of scope** |
+
+The fragility is entirely on the second row. Reading a declaration is stable across
+patches in a way that depending on an initialisation sequence is not.
+
+Note the corollary, because it is easy to miss: **learning a rule from the JAR does
+not create a dependency on the JAR.** Pack priority (`PackSource.overrides()`,
+`OPEN-QUESTIONS.md` Q5) and Asset Editor write semantics (Q7) were both read
+statically and then written down. We implement those ourselves in a few lines. They
+are knowledge, not coupling.
+
+### What the extractor produces — the whole list
+
+1. **The asset type table** — `id`, `path`, `fileExtension` per registered type.
+   Without it, nothing else can be joined to a file on disk.
+2. **The codec schema per type** — `toSchema()` output: fields, types, optionality,
+   defaults, enum values, and the game's own `title` / `description` /
+   `enumDescriptions` prose.
+3. **Reference-typed field markers** — which fields point at which asset store.
+
+**Item 3 costs nothing.** `AssetKeyValidator.updateSchema(SchemaContext, Schema)`
+means a reference-validated field writes itself into the very schema item 2 already
+produces. The same is true of `Schema.hytaleParent` (`InheritSettings`), which is
+how inheritance semantics arrive — also free, also inside item 2.
+
+That is the entire extraction surface. One program, one run.
+
+### Explicitly excluded, with the trigger to revisit
+
+| Excluded | Why it looked attractive | Revisit when |
+|---|---|---|
+| **Q17** — executing the engine's validators | `validate_pack` would report exactly what the game rejects | Phases 1–3 ship and validation demonstrably misses real errors |
+| **Q19** — the engine's `AssetReferences` graph | Authoritative relationships instead of inferred ones | Schema-typed references prove insufficient in practice |
+| Pack priority *logic* | Already solved — we know the rule and implement it ourselves | Never; this is knowledge, not a dependency |
+| Editor write path | Same — knowledge, not a dependency | Never |
+
+Both exclusions are genuinely affordable. `validate_pack` degrades to schema
+conformance plus broken-reference detection, which is what the design originally
+specified. Reference confidence stays high for every field the schema types, which
+is the majority.
+
+**Do not pursue Q17 or Q19 during Phase 2.** They are filed, not scheduled.
+
 ## What `Schema` contains
 
 `com.hypixel.hytale.codec.schema.config.Schema` is a full JSON-Schema model:
@@ -268,9 +324,11 @@ construction rather than by string matching.
 Capture this during extraction — a `reference_target` on the flattened field list
 is what turns the resolver from heuristic to exact.
 
-Related, and worth investigating in the same pass: `AssetValidationResults` has
-first-class missing-reference handling, and `AssetReferences` suggests the engine
-maintains a reference graph of its own. See `OPEN-QUESTIONS.md` Q17 and Q19.
+Note what this does **not** require. `AssetValidationResults` has first-class
+missing-reference handling and `AssetReferences` suggests the engine maintains its
+own reference graph — but reading the marker out of the schema is a *declaration*,
+while using either of those would mean *invoking behaviour*. See §Scope boundary:
+Q17 and Q19 are filed, not scheduled.
 
 This is a strong argument for pulling codec extraction earlier in the roadmap —
 see `08-ROADMAP.md`, where it has been moved.
