@@ -112,8 +112,18 @@ export function searchAssets(
     ) as unknown as Row[];
 
     for (const row of rows) {
-      if (seen.has(row.logical_id)) continue; // keep the strictest match
-      seen.add(row.logical_id);
+      // Keyed on identifier AND type. Deduplicating on the identifier alone
+      // silently discarded every same-named asset of a different type: searching
+      // `Pickaxe_Mine` returned one row while four assets carry that name
+      // (CameraEffect, CameraShake, Interaction, RootInteraction), and the
+      // Interaction -- the one holding the mining logic -- was invisible. Not a
+      // limit truncation, which at least prints a total: a silent choice.
+      //
+      // Relaxation levels still dedupe correctly, because a repeat at a looser
+      // level carries the same identifier and the same type.
+      const key = `${row.logical_id} :: ${row.type}`;
+      if (seen.has(key)) continue; // keep the strictest match
+      seen.add(key);
       candidates.push({
         logicalId: row.logical_id,
         type: row.type,

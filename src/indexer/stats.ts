@@ -81,9 +81,18 @@ const ENUM_MIN_OCCURRENCES = 8;
  * `SingleMusicContainer` rather than `SingleTrackMusicContainer`.
  */
 function selectBranch(
-  branches: readonly { local: string; target: string }[],
+  branches: readonly { local: string; target: string; constant: string | null }[],
   discriminator: string,
 ): string | undefined {
+  // The schema's own declaration wins. Each branch states its discriminator in
+  // prose on its /Type field -- "must be set to the constant value \"Selector\""
+  // -- and that is authoritative where the name is only a convention.
+  // `SelectInteraction` is selected by `Selector`, which is not a prefix of it,
+  // so name-matching reported every one of its fields as unused while vanilla
+  // pickaxes and hatchets use it in their swing chains.
+  for (const branch of branches) {
+    if (branch.constant === discriminator) return branch.target;
+  }
   for (const branch of branches) {
     if (branch.local.startsWith(discriminator)) return branch.target;
   }
@@ -122,14 +131,34 @@ function normalisePointersAgainstSchema(db: Database): {
    * The other half of a polymorphic crossing: given the sibling `Type` from the
    * data, this says which branch it selects.
    */
-  const unionBranches = new Map<string, { local: string; target: string }[]>();
+  const unionBranches = new Map<
+    string,
+    { local: string; target: string; constant: string | null }[]
+  >();
+  /** '<namespace>|<pointer>' -> field carrying this union's discriminator. */
+  const discriminatorAt = new Map<string, string>();
+  /** Namespace -> the discriminator value the schema says selects it. */
+  const declaredConstant = new Map<string, string>();
+  for (const row of db
+    .prepare(
+      "SELECT asset_type, type_constant FROM schema_fields" +
+        " WHERE json_pointer = '/Type' AND type_constant IS NOT NULL",
+    )
+    .all() as unknown as { asset_type: string; type_constant: string }[]) {
+    declaredConstant.set(row.asset_type, row.type_constant);
+  }
 
   for (const row of db
-    .prepare("SELECT asset_type, json_pointer, ref_scope FROM schema_fields")
-    .all() as {
+    .prepare(
+      "SELECT asset_type, json_pointer, ref_scope, discriminator_property, discriminator_values" +
+        " FROM schema_fields",
+    )
+    .all() as unknown as {
     asset_type: string;
     json_pointer: string;
     ref_scope: string | null;
+    discriminator_property: string | null;
+    discriminator_values: string | null;
   }[]) {
     let set = byType.get(row.asset_type);
     if (set === undefined) {
@@ -141,10 +170,25 @@ function normalisePointersAgainstSchema(db: Database): {
     if (targets.length === 1) {
       refScopes.set(`${row.asset_type}|${row.json_pointer}`, targets[0]!);
     } else if (targets.length > 1) {
+      // hytaleSchemaTypeField, when present, states both the property that
+      // carries the discriminator and its value per branch, positionally. That
+      // is exact; everything below it is reconstruction.
+      const key = `${row.asset_type}|${row.json_pointer}`;
+      const declaredValues = scopes(row.discriminator_values);
+      if (row.discriminator_property !== null) {
+        discriminatorAt.set(key, row.discriminator_property);
+      }
       const branches = targets
-        .map((target) => ({ local: target.slice(target.lastIndexOf(":") + 1), target }))
+        .map((target, index) => ({
+          local: target.slice(target.lastIndexOf(":") + 1),
+          target,
+          constant:
+            declaredValues.length === targets.length
+              ? declaredValues[index]!
+              : (declaredConstant.get(target) ?? null),
+        }))
         .sort((a, b) => a.local.length - b.local.length || a.local.localeCompare(b.local));
-      unionBranches.set(`${row.asset_type}|${row.json_pointer}`, branches);
+      unionBranches.set(key, branches);
     }
   }
 
@@ -155,13 +199,24 @@ function normalisePointersAgainstSchema(db: Database): {
    * is per instance: two entries of `/Container/Containers` routinely take
    * different branches, and a wildcarded key would collapse them together.
    */
+  // Every property any union declares as its discriminator, not just `Type`.
+  // Collecting `/Type` alone meant the 15 unions keyed on `Id` or `Op` had no
+  // value to look up even once the declaration was read.
+  const properties = new Set(["Type", ...discriminatorAt.values()]);
   const discriminators = new Map<string, string>();
-  for (const row of db
-    .prepare(
-      "SELECT asset_id, json_pointer, raw_value FROM candidates WHERE json_pointer LIKE '%/Type'",
-    )
-    .all() as { asset_id: number; json_pointer: string; raw_value: string }[]) {
-    discriminators.set(discriminatorKey(row.asset_id, row.json_pointer), row.raw_value);
+  for (const property of properties) {
+    for (const row of db
+      .prepare(
+        "SELECT asset_id, json_pointer, raw_value FROM candidates" +
+          " WHERE value_kind = 'string' AND json_pointer LIKE '%/' || ?",
+      )
+      .all(property) as unknown as {
+      asset_id: number;
+      json_pointer: string;
+      raw_value: string;
+    }[]) {
+      discriminators.set(discriminatorKey(row.asset_id, row.json_pointer), row.raw_value);
+    }
   }
 
   /**
@@ -183,6 +238,26 @@ function normalisePointersAgainstSchema(db: Database): {
     assetId: number,
   ): { type: string; pointer: string } => {
     let type = startType;
+
+    // The asset's own type may itself be a pure union -- a file that IS an
+    // Interaction lands on a namespace declaring nothing but 102 branches. Resolve
+    // it before walking, from the document's own root discriminator, or 5 000-odd
+    // observations sit on a namespace with no fields to join to.
+    const startBranches = unionBranches.get(`${type}|`);
+    if (startBranches !== undefined) {
+      const discriminator = discriminators.get(
+        discriminatorKey(assetId, `/${discriminatorAt.get(`${type}|`) ?? "Type"}`),
+      );
+      const branch =
+        discriminator === undefined ? undefined : selectBranch(startBranches, discriminator);
+      if (branch !== undefined && byType.has(branch)) {
+        resolvedUnions++;
+        type = branch;
+      } else {
+        unresolvedUnions++;
+      }
+    }
+
     let prefix = "";
     let pointers = byType.get(type);
 
@@ -220,7 +295,9 @@ function normalisePointersAgainstSchema(db: Database): {
       if (scope === undefined) {
         const branches = unionBranches.get(`${type}|${next}`);
         if (branches !== undefined) {
-          const discriminator = discriminators.get(discriminatorKey(assetId, `${rawNext}/Type`));
+          const discriminator = discriminators.get(
+            discriminatorKey(assetId, `${rawNext}/${discriminatorAt.get(`${type}|${next}`) ?? "Type"}`),
+          );
           const branch =
             discriminator === undefined ? undefined : selectBranch(branches, discriminator);
           if (branch === undefined) {
@@ -241,6 +318,24 @@ function normalisePointersAgainstSchema(db: Database): {
       // pointer, which is not a field at all.
       if (scope !== undefined && byType.has(scope) && i < segments.length - 1) {
         type = scope;
+        // A namespace may be nothing but a union: Interaction.json is `anyOf`
+        // over 102 concrete definitions and declares no field of its own, so
+        // landing there is not the end of the journey. Take the second hop with
+        // the discriminator sitting at this same position in the data.
+        const rootBranches = unionBranches.get(`${type}|`);
+        if (rootBranches !== undefined) {
+          const discriminator = discriminators.get(
+            discriminatorKey(assetId, `${rawNext}/${discriminatorAt.get(`${type}|${next}`) ?? "Type"}`),
+          );
+          const branch =
+            discriminator === undefined ? undefined : selectBranch(rootBranches, discriminator);
+          if (branch !== undefined && byType.has(branch)) {
+            resolvedUnions++;
+            type = branch;
+          } else {
+            unresolvedUnions++;
+          }
+        }
         pointers = byType.get(type);
         prefix = "";
         rawPrefix = rawNext;
@@ -330,6 +425,23 @@ export function computeFieldStats(db: Database): StatsResult {
          WHERE sf.asset_type = field_stats.asset_type
            AND sf.json_pointer = field_stats.json_pointer
            AND sf.reference_target IS NOT NULL)
+    `);
+
+    // Values on the observed row itself, so an UNDECLARED field can still say
+    // what it holds. Without this, describe reported common:BenchRequirement./Set
+    // as used by 69 assets and could say nothing more about it -- the reader is
+    // left knowing a field exists and having no way to learn what goes in it.
+    db.exec(`
+      UPDATE field_stats
+         SET observed_values = (
+               SELECT group_concat(v, ' ') FROM (
+                 SELECT DISTINCT c.raw_value AS v
+                   FROM candidates c
+                  WHERE c.schema_scope = field_stats.asset_type
+                    AND c.schema_pointer = field_stats.json_pointer
+                  ORDER BY c.raw_value
+                  LIMIT ${ENUM_MAX_CARDINALITY}))
+       WHERE cardinality BETWEEN 1 AND ${ENUM_MAX_CARDINALITY}
     `);
 
     // Observed enumerations: low distinct-value count over enough occurrences.

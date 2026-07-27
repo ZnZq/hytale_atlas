@@ -21,6 +21,8 @@ export interface Candidate {
   /** `pointer` with array indices collapsed to `*`, matching schema_fields. */
   readonly schemaPointer: string;
   readonly value: string;
+  /** Only `string` can be a reference; the rest exist so the field is not "unused". */
+  readonly kind: "string" | "number" | "boolean";
 }
 
 /**
@@ -49,11 +51,23 @@ function escapeSegment(segment: string): string {
 }
 
 /**
- * Collects every string scalar worth testing against the symbol table.
+ * Collects every scalar leaf: strings to test against the symbol table, numbers
+ * and booleans so the observed layer knows they exist.
  *
  * Array indices are preserved here, unlike in schema pointers: a candidate
  * records where a value literally sits, so that an agent can be told which entry
  * of `Recipe.Input` is broken rather than merely that one of them is.
+ *
+ * **Numbers and booleans were originally skipped**, on the reasoning that they can
+ * never be references -- which is true, and which is handled by `value_kind`
+ * rather than by not looking. Skipping them meant all 1 963 non-string scalar
+ * fields were missing from `field_stats` and so reported as `unused`, a claim
+ * `describe_schema` makes about the corpus while it was really a claim about
+ * extraction. `Item./ItemLevel` was labelled unused while vanilla items set it to
+ * 40 and 5.
+ *
+ * Noise filtering stays string-only on purpose: `0`, `1` and `false` are ordinary
+ * values, not the placeholder junk `NOISE_VALUES` exists to drop.
  */
 export function collectCandidates(node: unknown, pointer = "", out: Candidate[] = []): Candidate[] {
   if (typeof node === "string") {
@@ -63,8 +77,20 @@ export function collectCandidates(node: unknown, pointer = "", out: Candidate[] 
       trimmed.length <= MAX_CANDIDATE_LENGTH &&
       !NOISE_VALUES.has(trimmed.toLowerCase())
     ) {
-      out.push({ pointer, schemaPointer: toSchemaPointer(pointer), value: trimmed });
+      out.push({ pointer, schemaPointer: toSchemaPointer(pointer), value: trimmed, kind: "string" });
     }
+    return out;
+  }
+  if (typeof node === "number" || typeof node === "boolean") {
+    // Non-finite numbers arrive as the repaired sentinel from parseJsonLenient and
+    // mean "unset", not "observed at this value".
+    if (typeof node === "number" && !Number.isFinite(node)) return out;
+    out.push({
+      pointer,
+      schemaPointer: toSchemaPointer(pointer),
+      value: String(node),
+      kind: typeof node === "number" ? "number" : "boolean",
+    });
     return out;
   }
   if (Array.isArray(node)) {
@@ -153,7 +179,7 @@ export function resolveCandidates(db: Database): ResolveResult {
       SELECT c.asset_id, a.id, 'asset', 'INHERITS_FROM', c.json_pointer, 'high'
         FROM candidates c
         JOIN assets a ON a.logical_id = c.raw_value
-       WHERE c.json_pointer = '/Parent' AND a.id <> c.asset_id
+       WHERE c.value_kind = 'string' AND c.json_pointer = '/Parent' AND a.id <> c.asset_id
     `);
 
     // Localization: the reference is an explicit field naming a real key, so this
@@ -170,7 +196,7 @@ export function resolveCandidates(db: Database): ResolveResult {
                WHEN c.raw_value LIKE 'server.%' THEN substr(c.raw_value, 8)
                WHEN c.raw_value LIKE 'common.%' THEN substr(c.raw_value, 8)
                ELSE c.raw_value END
-       WHERE c.raw_value LIKE '%.%.%' AND l.locale = 'en-US'
+       WHERE c.value_kind = 'string' AND c.raw_value LIKE '%.%.%' AND l.locale = 'en-US'
     `);
 
     // Files: Common/-relative paths carrying an extension.
@@ -179,7 +205,7 @@ export function resolveCandidates(db: Database): ResolveResult {
       SELECT c.asset_id, f.id, 'file', 'REFERENCES_FILE', c.json_pointer, 'high'
         FROM candidates c
         JOIN files f ON f.path = 'Common/' || c.raw_value
-       WHERE c.raw_value LIKE '%.%' AND c.raw_value NOT LIKE '% %'
+       WHERE c.value_kind = 'string' AND c.raw_value LIKE '%.%' AND c.raw_value NOT LIKE '% %'
     `);
 
     // Asset references, in two steps.
@@ -206,7 +232,7 @@ export function resolveCandidates(db: Database): ResolveResult {
         JOIN assets a
                ON a.logical_id = c.raw_value
               AND a.type = sf.reference_target
-       WHERE c.json_pointer <> '/Parent' AND a.id <> c.asset_id
+       WHERE c.value_kind = 'string' AND c.json_pointer <> '/Parent' AND a.id <> c.asset_id
     `);
 
     // Everything else: no declared target, or a declared target that nothing of
@@ -228,7 +254,8 @@ export function resolveCandidates(db: Database): ResolveResult {
         FROM candidates c
         JOIN assets src ON src.id = c.asset_id
         JOIN assets a ON a.logical_id = c.raw_value
-       WHERE c.json_pointer <> '/Parent'
+       WHERE c.value_kind = 'string'
+         AND c.json_pointer <> '/Parent'
          AND a.id <> c.asset_id
          AND NOT EXISTS (
                SELECT 1 FROM schema_fields sf
@@ -242,7 +269,7 @@ export function resolveCandidates(db: Database): ResolveResult {
     // ordinary dangling string, because the schema makes this one unambiguous.
     db.exec(`
       UPDATE candidates SET dangling = 2
-       WHERE EXISTS (
+       WHERE value_kind = 'string' AND EXISTS (
              SELECT 1 FROM assets src
                JOIN schema_fields sf
                  ON sf.asset_type = src.type
@@ -258,7 +285,7 @@ export function resolveCandidates(db: Database): ResolveResult {
     // Mark candidates that named something identifier-shaped but matched nothing.
     db.exec(`
       UPDATE candidates SET dangling = 1
-       WHERE raw_value GLOB '[A-Za-z]*[_A-Za-z0-9]*'
+       WHERE value_kind = 'string' AND raw_value GLOB '[A-Za-z]*[_A-Za-z0-9]*'
          AND raw_value NOT LIKE '% %'
          AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.logical_id = candidates.raw_value)
          AND NOT EXISTS (SELECT 1 FROM lang_keys l WHERE l.key = candidates.raw_value)

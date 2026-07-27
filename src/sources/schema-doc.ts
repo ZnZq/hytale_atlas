@@ -67,6 +67,22 @@ export interface SchemaField {
    * not rebase through it. Read it with `scopes()`.
    */
   readonly refScope: string | null;
+  /**
+   * The discriminator value that selects this definition, when the schema says so.
+   *
+   * Every polymorphic branch declares it in prose on its own `/Type` field: *"it
+   * must be set to the constant value \"Selector\" to function as this type"*.
+   * Reading it removes the guesswork: deriving the discriminator from the branch
+   * NAME works for `BreakBlockInteraction` -> `BreakBlock` and fails for
+   * `SelectInteraction` -> `Selector`, which is not a prefix of it. That single
+   * mismatch made `describe common:SelectInteraction` report every field as
+   * `unused` while vanilla pickaxes and hatchets use it in their swing chains.
+   */
+  readonly typeConstant: string | null;
+  /** Field carrying the discriminator for this union, from the schema itself. */
+  readonly discriminatorProperty: string | null;
+  /** Discriminator values, space separated and aligned with `refScope`. */
+  readonly discriminatorValues: string | null;
 }
 
 export interface SchemaDefinition {
@@ -250,6 +266,101 @@ function hadNonFiniteDefault(
   return false;
 }
 
+export interface UnionDeclaration {
+  /** Field carrying the discriminator: `Type` (229), `Id` (14) or `Op` (1). */
+  readonly property: string;
+  /** Discriminator values, positionally aligned with `scopes`. */
+  readonly values: readonly string[];
+  /** Branch namespaces, positionally aligned with `values`. */
+  readonly scopes: readonly string[];
+}
+
+/**
+ * Reads `hytaleSchemaTypeField` off a union node, when it is present and usable.
+ *
+ * The block sits either on the node carrying the branches, or on a wrapper whose
+ * only content is the union -- `BlockType./Bench` is
+ * `anyOf[0] = {title, anyOf: [...refs], hytaleSchemaTypeField}`. Both are read.
+ *
+ * Returns null unless every branch is a `$ref` and the counts line up, so a
+ * partially-declared union is left to the fallbacks rather than half-trusted.
+ */
+function unionDeclaration(node: Node, currentFile: string): UnionDeclaration | null {
+  const direct = readDeclaration(node, currentFile);
+  if (direct !== null) return direct;
+  // One level of wrapper: anyOf whose single object branch holds the real union.
+  for (const key of ["anyOf", "oneOf"]) {
+    const branches = node[key];
+    if (!Array.isArray(branches)) continue;
+    for (const branch of branches) {
+      const inner = asNode(branch);
+      if (inner === null) continue;
+      const found = readDeclaration(inner, currentFile);
+      if (found !== null) return found;
+    }
+  }
+  return null;
+}
+
+function readDeclaration(node: Node, currentFile: string): UnionDeclaration | null {
+  const field = asNode(node["hytaleSchemaTypeField"]);
+  if (field === null) return null;
+  const property = asString(field["property"]);
+  const values = field["values"];
+  if (property === null || !Array.isArray(values)) return null;
+
+  const branches = node["anyOf"] ?? node["oneOf"];
+  if (!Array.isArray(branches) || branches.length !== values.length) return null;
+
+  const scopes: string[] = [];
+  for (const branch of branches) {
+    const branchNode = asNode(branch);
+    const ref = branchNode === null ? null : asString(branchNode["$ref"]);
+    if (ref === null) return null;
+    const scope = scopeOfRef(ref, currentFile);
+    if (scope === null) return null;
+    scopes.push(scope);
+  }
+  const names = values.filter((v): v is string => typeof v === "string");
+  if (names.length !== scopes.length) return null;
+  return { property, values: names, scopes };
+}
+
+/** Attaches a read declaration to the field already emitted at `pointer`. */
+function upgradeUnion(ctx: FlattenContext, pointer: string, declared: UnionDeclaration): void {
+  const index = ctx.out.findIndex(
+    (f) => f.assetType === ctx.assetType && f.pointer === pointer,
+  );
+  if (index < 0) return;
+  ctx.out[index] = {
+    ...ctx.out[index]!,
+    refScope: declared.scopes.join(" "),
+    discriminatorProperty: declared.property,
+    discriminatorValues: declared.values.join(" "),
+  };
+}
+
+/**
+ * Branch namespaces when a node is nothing but a union of `$ref`s.
+ *
+ * Returns empty for anything else, so a union that mixes refs with inline shapes
+ * is left alone rather than half-recorded.
+ */
+function rootUnionScopes(node: Node, currentFile: string): string[] {
+  const branches = node["anyOf"] ?? node["oneOf"];
+  if (!Array.isArray(branches)) return [];
+  const out: string[] = [];
+  for (const branch of branches) {
+    const asNodeBranch = asNode(branch);
+    const ref = asNodeBranch === null ? null : asString(asNodeBranch["$ref"]);
+    if (ref === null) return [];
+    const scope = scopeOfRef(ref, currentFile);
+    if (scope === null) return [];
+    out.push(scope);
+  }
+  return out;
+}
+
 /** The namespaces a refScope names -- more than one means a polymorphic union. */
 export function scopes(refScope: string | null): string[] {
   return refScope === null || refScope === "" ? [] : refScope.split(" ");
@@ -317,7 +428,23 @@ function emit(
     // was first written.
     referenceTarget: asString(node["hytaleAssetRef"]),
     refScope,
+    typeConstant: declaredConstant(asString(node["description"])),
+    discriminatorProperty: null,
+    discriminatorValues: null,
   });
+}
+
+/**
+ * The constant a polymorphic branch declares for its own discriminator.
+ *
+ * The generator states it in prose and nowhere else -- there is no `const` or
+ * single-valued `enum` to read -- so this is the only machine-readable form
+ * available. Anchored on the exact sentence it always emits, so a description
+ * that merely quotes something is not mistaken for a declaration.
+ */
+function declaredConstant(description: string | null): string | null {
+  if (description === null) return null;
+  return /must be set to the constant value "([^"]+)"/.exec(description)?.[1] ?? null;
 }
 
 /**
@@ -364,6 +491,39 @@ function flatten(
     return;
   }
 
+  // A type whose ROOT is a union of $refs and nothing else -- Interaction.json is
+  // `anyOf` over 102 concrete interaction definitions, with no properties of its
+  // own. Skipping the root because `pointer === ""` left that namespace entirely
+  // empty, so every observation that rebased into it had nowhere to land:
+  // `common:BreakBlockInteraction` had zero observed fields while the corpus uses
+  // it constantly, and 1 689 `RootInteraction./Interactions/*/Parent` rows sat
+  // unjoined. Recorded at the empty pointer so `align()` can take the second hop
+  // using the discriminator in the data.
+  if (pointer === "" && !ctx.seenPointers.has("")) {
+    const branches = rootUnionScopes(node, currentFile);
+    if (branches.length > 1) {
+      ctx.seenPointers.add("");
+      ctx.out.push({
+        assetType: ctx.assetType,
+        pointer: "",
+        declaredType: Array.isArray(node["anyOf"]) ? "anyOf" : "oneOf",
+        optional: true,
+        defaultValue: null,
+        defaultUnset: false,
+        enumValues: null,
+        title: asString(node["title"]),
+        description: null,
+        inheritsProperty: false,
+        mergesProperties: false,
+        referenceTarget: null,
+        refScope: branches.join(" "),
+        typeConstant: null,
+        discriminatorProperty: null,
+        discriminatorValues: null,
+      });
+    }
+  }
+
   if (pointer !== "") {
     emit(ctx, pointer, node, optional, hadNonFiniteDefault(ctx, currentFile, sourcePointer));
   }
@@ -403,6 +563,26 @@ function flatten(
   const items = asNode(node["items"]);
   if (items !== null) {
     flatten(ctx, items, `${pointer}/*`, `${sourcePointer}/items`, currentFile, depth + 1, true);
+  }
+
+  // The generator DECLARES its discriminators, and this reads that declaration
+  // rather than reconstructing it.
+  //
+  // Two heuristics preceded this and both were wrong in ways that cost real
+  // investigation. Matching the discriminator value against the branch NAME by
+  // prefix works for `BreakBlock` -> `BreakBlockInteraction` and fails for
+  // `Selector` -> `SelectInteraction`, which reported every field of a type used
+  // 415 times as unused. And the discriminator PROPERTY was hardcoded to `Type`,
+  // while 15 of the 244 declarations name `Id` or `Op` -- those unions could
+  // never resolve at all, including `ScriptedBrushAsset./Operations/*`, 56
+  // branches that were recorded as having no discriminator when the schema says
+  // it is `Id`.
+  //
+  // This is the third machine-readable marker in this schema found only after
+  // being reconstructed by hand; `hytaleAssetRef` was the first two occasions.
+  const declared = unionDeclaration(node, currentFile);
+  if (declared !== null && pointer !== "") {
+    upgradeUnion(ctx, pointer, declared);
   }
 
   // Polymorphic unions: every branch contributes fields at the same pointer, and

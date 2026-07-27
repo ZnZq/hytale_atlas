@@ -156,8 +156,9 @@ export function ingestSchemas(db: Database, set: GeneratedSchemaSet): SchemaInge
     const insField = db.prepare(
       `INSERT INTO schema_fields
          (asset_type, json_pointer, declared_type, optional, default_value, default_unset,
-          enum_values, title, description, reference_target, ref_scope, inherits_property, merges_properties)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+          enum_values, title, description, reference_target, ref_scope, inherits_property, merges_properties,
+          type_constant, discriminator_property, discriminator_values)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT (asset_type, json_pointer) DO UPDATE SET
          declared_type = excluded.declared_type, optional = excluded.optional,
          default_value = excluded.default_value, default_unset = excluded.default_unset,
@@ -166,7 +167,10 @@ export function ingestSchemas(db: Database, set: GeneratedSchemaSet): SchemaInge
          reference_target = excluded.reference_target,
          ref_scope = excluded.ref_scope,
          inherits_property = excluded.inherits_property,
-         merges_properties = excluded.merges_properties`,
+         merges_properties = excluded.merges_properties,
+         type_constant = excluded.type_constant,
+         discriminator_property = excluded.discriminator_property,
+         discriminator_values = excluded.discriminator_values`,
     );
     const insFts = db.prepare(
       "INSERT INTO schema_fts (asset_type, json_pointer, terms, title, description, enum_values)" +
@@ -192,6 +196,9 @@ export function ingestSchemas(db: Database, set: GeneratedSchemaSet): SchemaInge
         field.refScope,
         field.inheritsProperty ? 1 : 0,
         field.mergesProperties ? 1 : 0,
+        field.typeConstant,
+        field.discriminatorProperty,
+        field.discriminatorValues,
       );
 
       // Every field, not only those carrying prose. Restricting to documented

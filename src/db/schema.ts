@@ -21,7 +21,7 @@
  * makes a bump orphan old databases rather than silently reusing one whose shape
  * no longer matches.
  */
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 12;
 
 export const SCHEMA_SQL = `
 -- ---------------------------------------------------------------------------
@@ -199,6 +199,15 @@ CREATE TABLE IF NOT EXISTS candidates (
   -- container. Filled by pass 3; NULL until then.
   schema_scope     TEXT,
   raw_value        TEXT NOT NULL,
+  -- 'string' | 'number' | 'boolean'. Only strings can be references, so edge
+  -- resolution filters on this; the observed layer counts all of them.
+  --
+  -- Collecting strings alone was a silent, systematic lie. Every numeric and
+  -- boolean field -- 1 963 of them -- was absent from field_stats and therefore
+  -- labelled 'unused' by describe_schema, including ItemLevel, which real items
+  -- plainly set. 'unused' read as a fact about the corpus while it was really a
+  -- fact about what extraction bothered to look at.
+  value_kind       TEXT NOT NULL DEFAULT 'string',
   resolved_edge_id INTEGER REFERENCES edges(id) ON DELETE SET NULL,
   dangling         INTEGER NOT NULL DEFAULT 0
 ) STRICT;
@@ -229,6 +238,17 @@ CREATE TABLE IF NOT EXISTS schema_fields (
   -- what vanilla happens to use, a declared one is what the game accepts, and
   -- presenting the first as the second would be a lie.
   observed_values   TEXT,
+  -- Discriminator value that selects this definition, read from the schema's own
+  -- prose. Derived from the branch NAME it would be wrong: SelectInteraction is
+  -- selected by 'Selector', which is not a prefix of it.
+  type_constant     TEXT,
+  -- Union discriminator, declared by the schema in hytaleSchemaTypeField.
+  -- The property is NOT always 'Type': 229 declarations say Type, 14 say Id and
+  -- one says Op, and hardcoding Type meant those 15 unions never resolved.
+  discriminator_property TEXT,
+  -- Space separated, positionally aligned with ref_scope. No declared value
+  -- contains a space (checked across all 244 declarations).
+  discriminator_values   TEXT,
   title             TEXT,
   description       TEXT,
   -- Asset type this field points at, from hytale.hytaleAssetRef. 932 fields carry
@@ -262,6 +282,10 @@ CREATE TABLE IF NOT EXISTS schema_defs (
 -- Aggregate statistics from the corpus. Computed over inheritance-resolved
 -- assets: raw files undercount, because an inherited field never appears in the
 -- child document.
+-- Observed values live here as well as on schema_fields, because an UNDECLARED
+-- field has no schema_fields row to hang them on. common:BenchRequirement./Set is
+-- used by 69 assets and declared nowhere; describe could say it existed and
+-- nothing else, which is a dead end rather than an answer.
 CREATE TABLE IF NOT EXISTS field_stats (
   asset_type   TEXT NOT NULL,
   json_pointer TEXT NOT NULL,
@@ -270,6 +294,8 @@ CREATE TABLE IF NOT EXISTS field_stats (
   value_types  TEXT,
   target_types TEXT,
   cardinality  INTEGER,
+  -- Values seen, when few enough to enumerate. NOT the legal set.
+  observed_values TEXT,
   PRIMARY KEY (asset_type, json_pointer)
 ) STRICT;
 

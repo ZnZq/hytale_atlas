@@ -16,6 +16,77 @@ import { buildRelaxedMatchExpressions } from "../util/text.ts";
  * surfacing rather than hiding.
  */
 
+/**
+ * True when a declared type holds other fields rather than a value of its own.
+ *
+ * Containers never produce a candidate, so absence from the observed layer says
+ * nothing about whether the corpus uses them. Reporting them as `unused` was the
+ * same error as `search_schema` claiming a capability did not exist: a limit of
+ * extraction presented as a fact about the data.
+ */
+export function isContainer(declaredType: string | null): boolean {
+  if (declaredType === null) return false;
+  return (
+    declaredType.includes("object") ||
+    declaredType.includes("array") ||
+    declaredType === "anyOf" ||
+    declaredType === "oneOf" ||
+    declaredType.startsWith("$ref")
+  );
+}
+
+/**
+ * Repairs a `--field` argument that a shell mangled, and accepts looser forms.
+ *
+ * A JSON Pointer starts with `/`, which is hostile on Windows: MSYS (Git Bash,
+ * and therefore most agent harnesses here) rewrites a leading-slash argument into
+ * a Windows path, so `--field /BlockType` reaches the process as
+ * `C:/Program Files/Git/BlockType`. The pointer never arrives, the lookup finds
+ * nothing, and the failure looks like the field does not exist -- an agent
+ * testing this concluded `--field` was "completely broken" after six attempts,
+ * including one pointer copied verbatim from our own output.
+ *
+ * So: strip a drive-letter prefix, and treat a missing leading slash as fine.
+ */
+export function normalizeFieldPointer(field: string): string {
+  let out = field;
+  const drive = /^[A-Za-z]:[\\/]/.test(out);
+  if (drive) {
+    // Keep only the tail the user actually typed. MSYS prepends its install root,
+    // whose segments are real directories, so cut at the last one that exists in
+    // no pointer: the first segment starting with an upper-case letter after the
+    // known root is the safest anchor we have, and callers are told what we did.
+    const segments = out.replace(/\\/g, "/").split("/");
+    const git = segments.findIndex((s) => s.toLowerCase() === "git" || s.toLowerCase() === "usr");
+    out = "/" + (git >= 0 ? segments.slice(git + 1) : segments.slice(1)).join("/");
+  }
+  if (!out.startsWith("/")) out = `/${out}`;
+  return out.replace(/\/+$/, "") || "/";
+}
+
+/** True when a `--field` value shows signs of shell path mangling. */
+export function looksMangled(field: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(field);
+}
+
+/** Declared pointers of a type that begin with `prefix`, for "did you mean". */
+export function pointersLike(
+  db: Database,
+  assetType: string,
+  prefix: string,
+  limit = 8,
+): string[] {
+  return (
+    db
+      .prepare(
+        `SELECT json_pointer FROM schema_fields
+          WHERE asset_type = ? AND json_pointer LIKE ? || '%'
+          ORDER BY length(json_pointer), json_pointer LIMIT ?`,
+      )
+      .all(assetType, prefix, limit) as unknown as { json_pointer: string }[]
+  ).map((r) => r.json_pointer);
+}
+
 export interface DeclaredLayer {
   readonly type: string | null;
   readonly optional: boolean;
@@ -144,7 +215,8 @@ export function describeSchema(
             )
        SELECT ?1 AS asset_type, p.json_pointer,
               sf.declared_type, sf.optional, sf.default_value, sf.default_unset,
-              sf.enum_values, sf.observed_values, sf.title, sf.description,
+              sf.enum_values, coalesce(sf.observed_values, fs.observed_values) AS observed_values,
+              sf.title, sf.description,
               sf.reference_target, sf.inherits_property, sf.merges_properties,
               fs.count, fs.of_total, fs.cardinality, fs.target_types
          FROM p
@@ -174,7 +246,31 @@ export interface SchemaHit {
  * question a corpus search structurally cannot, because absence is invisible to a
  * search over what exists. See `docs/evaluation/README.md` on the 3x3 pickaxe.
  */
-export function searchSchema(db: Database, query: string, limit = 20): SchemaHit[] {
+export interface SchemaSearchResult {
+  readonly hits: readonly SchemaHit[];
+  /**
+   * How much the query had to be loosened. 0 means every term matched as typed.
+   *
+   * Reported because a loosened match is a different kind of answer. Searching
+   * "quarry" returned CurveType, EasingType and MoonPhaseWeightModifiers -- three
+   * rows with no visible relation to the query, indistinguishable from real hits,
+   * because suffix-trimming reduced the term until something matched. A caller
+   * drawing a negative conclusion needs to know which of the two they got.
+   */
+  readonly relaxation: number;
+  /** True when terms were ORed rather than ANDed to find anything at all. */
+  readonly widened: boolean;
+}
+
+export function searchSchema(db: Database, query: string, limit = 20): readonly SchemaHit[] {
+  return searchSchemaDetailed(db, query, limit).hits;
+}
+
+export function searchSchemaDetailed(
+  db: Database,
+  query: string,
+  limit = 20,
+): SchemaSearchResult {
   const statement = db.prepare(
     `SELECT asset_type, json_pointer, title, description
        FROM schema_fts WHERE schema_fts MATCH ? ORDER BY rank LIMIT ?`,
@@ -184,12 +280,17 @@ export function searchSchema(db: Database, query: string, limit = 20): SchemaHit
   // Schema search is the opposite: a user asking "brush width shape area" is
   // describing a capability from several angles and expects any of them to hit.
   // ANDing returned nothing for exactly that query while each term alone matched.
+  const strict = buildRelaxedMatchExpressions(query);
   const expressions = [
-    ...buildRelaxedMatchExpressions(query),
-    ...buildRelaxedMatchExpressions(query).map((e) => e.split(" AND ").join(" OR ")),
+    ...strict.map((e, i) => ({ e, relaxation: i, widened: false })),
+    ...strict.map((e, i) => ({
+      e: e.split(" AND ").join(" OR "),
+      relaxation: i,
+      widened: true,
+    })),
   ];
 
-  for (const expression of expressions) {
+  for (const { e: expression, relaxation, widened } of expressions) {
     const rows = statement.all(expression, limit) as unknown as {
       asset_type: string;
       json_pointer: string;
@@ -197,15 +298,19 @@ export function searchSchema(db: Database, query: string, limit = 20): SchemaHit
       description: string | null;
     }[];
     if (rows.length > 0) {
-      return rows.map((r) => ({
-        assetType: r.asset_type,
-        pointer: r.json_pointer,
-        title: r.title,
-        description: r.description,
-      }));
+      return {
+        hits: rows.map((r) => ({
+          assetType: r.asset_type,
+          pointer: r.json_pointer,
+          title: r.title,
+          description: r.description,
+        })),
+        relaxation,
+        widened,
+      };
     }
   }
-  return [];
+  return { hits: [], relaxation: 0, widened: false };
 }
 
 export interface UndocumentedField {
@@ -238,10 +343,19 @@ export function findUndocumented(
 
   const rows = db
     .prepare(
+      // Containers are excluded, not merely deprioritised. An object or array
+      // pointer holds no scalar of its own, so it can never reach field_stats
+      // however heavily the corpus uses it -- listing them here made a limit of
+      // extraction look like a discovery, which is the exact failure this tool
+      // exists to avoid.
       `SELECT sf.asset_type, sf.json_pointer, sf.declared_type, sf.title,
               sf.description, sf.reference_target
          FROM schema_fields sf
-        WHERE NOT EXISTS (SELECT 1 FROM field_stats fs
+        WHERE ifnull(sf.declared_type,'') NOT LIKE '%object%'
+          AND ifnull(sf.declared_type,'') NOT LIKE '%array%'
+          AND ifnull(sf.declared_type,'') NOT LIKE '$ref%'
+          AND ifnull(sf.declared_type,'') NOT IN ('anyOf','oneOf')
+          AND NOT EXISTS (SELECT 1 FROM field_stats fs
                            WHERE fs.asset_type = sf.asset_type
                              AND fs.json_pointer = sf.json_pointer)${filter}
         ORDER BY sf.asset_type, sf.json_pointer

@@ -258,6 +258,119 @@ Current state: **630 of 2 005 observed pointers** join a declared field, across
 543 rows of genuine recursion in `common:DensityTerrainAsset` that will never join
 at a fixed depth.
 
+### Blind-agent trial: the whole surface, exercised by someone who knows nothing
+
+An agent with no access to this repository — no source, no docs, no schema files,
+only `node dist/cli/main.js` — was given the modder's own sentence: *"create a new
+pickaxe that mines 3×3 and add its recipe to my new workbench, in the tools
+category"*. It ran 51 commands.
+
+It succeeded on the parts that matter. Starting from `search "pickaxe"` it found
+`Item.Tool.Specs[]` and `ItemToolSpec`, established that recipes are **embedded in
+the item they craft** rather than standalone (checked, not assumed — `search
+"recipe"` returns no standalone assets), and worked out that
+`Recipe.BenchRequirement[].Id` matches a bench's own `BlockType.Bench.Id`. It also
+found a distinction nobody here had noticed: `Fieldcraft` categories are separate
+`FieldcraftCategory` **assets**, while a workbench declares its categories inline —
+two systems that can both be called "Tools".
+
+On 3×3 it produced the right answer for the right reason: **not expressible**,
+checked from eight angles, ending at `Matchers/*/Face` — one face of one block. It
+strengthened the negative with a counterexample, `UseWateringCanInteraction`, which
+has `RadiusX`/`RadiusZ` — so the engine can do area effects and simply does not
+expose them to tools. That is the class of answer a corpus search structurally
+cannot give.
+
+It also found eight defects. All eight are fixed; the last was the worst.
+
+| Defect | Was | Now |
+|---|---|---|
+| `status` | printed the constant *"Index: not built (indexing is not implemented yet)"* long after indexing worked, so the first thing a user saw was the tool calling itself broken | reads the cache: assets, typed, schema fields, edges, locales, path |
+| `undocumented <Type>` | positional accepted then dropped — returned the whole unscoped corpus and looked like an answer | scoped, and says so |
+| `describe` truncation | stopped at 60 with only a total, so a type appeared to end mid-alphabet | names the flag: *"showing 60 of 96. Use --limit 96"* |
+| `describe Item Tool` | second positional swallowed; identical full dump | errors, suggesting `--field /Tool` |
+| `common:` namespace | undiscoverable; found by trial and error | `describe ItemTool` suggests `common:ItemTool` |
+| `validate` | listed in `--help` as a working command | moved under "Not implemented yet" |
+| `search` | `Goblin_Pickaxe` is an `ItemPlayerAnimations`, indistinguishable from a real tool without a `get` each | prints the asset type in every row |
+| `unused` | see below | see below |
+
+### `unused` was a lie about 96 % of the schema
+
+The agent noticed `Item./ItemLevel` labelled `unused` while real items set it to
+40. It guessed the cause was something about `$ref`. The truth was worse:
+**candidate extraction collected string scalars only**, so every numeric and
+boolean field was absent from the observed layer by construction.
+
+```
+non-string scalar fields:            1 963
+  of those labelled "unused":        1 963   ← 100 %
+all fields:                         17 400
+  labelled "unused":                16 770   ← 96.4 %
+```
+
+Numbers and booleans are now collected with a `value_kind`, and edge building
+filters on it. The result is exactly what it should be: the observed layer grew
+from 2 005 fields across 247 types to **5 008 across 310**, `ItemLevel` reports
+1 192 assets — and **edge counts are byte-identical** (118 996 references, 33 782
+file, 4 575 inherits, 5 546 localized; 0 edges from non-string candidates), so
+nothing leaked into references.
+
+Containers were the other half. An object or array holds no scalar of its own and
+can never appear in the observed layer however heavily it is used, so all 7 959 of
+them were labelled `unused` too. They now read `(container)`, and
+`find_undocumented` excludes them outright.
+
+**The remaining honesty gap is stated in the output rather than hidden.** 8 447
+non-container fields are still unlabelled by observation, and some of those are
+join failures rather than genuine absence — the declared/observed join is ~31 %.
+`undocumented` now says so in its header and points the reader at
+`describe --field` to confirm.
+
+**This is the third instance of one bug.** `search_schema` claimed capabilities did
+not exist; `find_undocumented` rested on the same logic; `describe`'s `unused` was
+the same again. Each time, a limit of extraction was printed as a fact about the
+game. The audit predicted the second and third in writing before they were found —
+and an agent that had never seen this codebase walked straight into them anyway,
+which is the useful part.
+
+### Second trial, on the fixed tool — five more, one self-inflicted
+
+The same blind trial was re-run against the repaired CLI. **None of the eight
+recurred.** It found five more.
+
+- **`--field` appeared to be entirely broken**, failing six times including on a
+  pointer copied verbatim from our own output. The cause was not our code: a JSON
+  Pointer starts with `/`, and **MSYS rewrites a leading-slash argument into a
+  Windows path**, so `--field /BlockType` reaches the process as
+  `C:/Program Files/Git/BlockType`. Under Git Bash — which is what most agent
+  harnesses use here — the flag could never work. `normalizeFieldPointer()` now
+  recovers the pointer and says so, and the leading slash is optional
+  (`--field Tool/Speed`), which sidesteps the shell entirely.
+- **The error message hid that cause, and I introduced it.** Checking the type
+  before the field reported a missing *field* as a missing *type*, emitting
+  `No type 'Item'. Did you mean: describe Item` — a suggestion identical to what
+  had just been typed. Field misses now report the nearest declared pointers by
+  walking up the path.
+- **Namespace suggestions only worked one way.** `describe ItemTool` proposed
+  `common:ItemTool`, but `describe common:ItemToolSpec` — the opposite mistake,
+  and just as easy — got nothing. Both directions now.
+- **`bench` printed two identifiers per row and labelled neither.** The agent
+  assumed the rightmost was the key. It is the declaring asset; the key is the
+  leftmost, and *that* is also what a recipe's `BenchRequirement.Id` must carry.
+  Getting this wrong writes a recipe that fails silently at runtime. The listing
+  is now headed, and `bench Bench_WorkBench` answers with the id to use instead.
+- **`get` resolved a name collision in silence.** `get Pickaxe_Mine` returned a
+  `CameraEffect` to an agent tracing an `Interaction`, which reasonably concluded
+  the interaction chain had a dead reference. **Four assets carry that name** —
+  `CameraEffect`, `CameraShake`, `Interaction`, `RootInteraction`. The interaction
+  it wanted existed the whole time. `get` now lists the alternatives and takes
+  `--type` to choose.
+
+The pattern across both trials is the same one this document keeps recording: the
+tool was confident where it should have been uncertain. Four of these five were
+messages that stated something false or hid something true, not failures to
+compute.
+
 ### `search_schema` answered "this capability does not exist" about fields that do
 
 Found while checking a claim in this document. `search-schema GatherType` returned
