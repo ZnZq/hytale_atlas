@@ -211,7 +211,7 @@ engineering-side, not feasibility-side**.
 | Risk | Severity | Status after Phase 0 |
 |---|---|---|
 | Pack format changes between EA versions | High | **Unchanged.** Still the governing constraint: never hardcode schema. Two patchlines already coexist on one machine, so cache by content hash |
-| **Corpus scale** | **High** 🆕 | `Assets.zip` measured at **3.43 GB / 60 148 entries** — an order of magnitude above the original budget. Streaming extraction is mandatory. Mitigating measurement: the central directory reads in ~0.5 s, so pass 1 is free |
+| **Corpus scale** | **High** → Medium | `Assets.zip` measured at **3.43 GB / 60 148 entries** — an order of magnitude above the original budget. Streaming extraction is mandatory. Downgraded after implementation: enumerating all entries costs ~4 s and decompressing one asset JSON ~0.13 ms, so the archive is navigable; the cost is in how many entries we choose to parse |
 | ~~Path → asset type mapping~~ | ~~High~~ → **Low** | **Retired.** The engine ships the table and the resolver: `AssetEditorAssetType{id, path, fileExtension}` plus `AssetTypeRegistry.getAssetTypeHandlerForPath(Path)`. Execution, not a design unknown — but it must be extracted **before** Phase 1's pass 1 (`08-ROADMAP.md` §Prerequisite) |
 | Asset inheritance (`Parent`) | Medium 🆕 | Definitions are not self-contained. Affects `get_asset` and field statistics. Merge semantics still open — `OPEN-QUESTIONS.md` Q18 |
 | ~~Search fails on natural-language intent~~ | ~~High~~ → **Low** | **Retired.** Explicit `TranslationProperties.Name` references, 99.9 % item coverage, 5 locales. Embeddings not needed. Residual risk is parser correctness (ICU MessageFormat, root-prefix rewrite), not data availability |

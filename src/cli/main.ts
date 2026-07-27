@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { detectInstallation, detectProject } from "../sources/detect.js";
+import { detectInstallation, detectProject } from "../sources/detect.ts";
 
 /**
  * CLI entry point.

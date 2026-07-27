@@ -5,6 +5,14 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
 
+    // Source imports relative paths with a .ts extension, which is what
+    // `node --experimental-strip-types` resolves, so tests run straight from src
+    // with no build step. tsc rewrites those specifiers to .js on emit, so the
+    // published dist/ is ordinary ESM. Without the rewrite the two runners would
+    // disagree about every relative import.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+
     "rootDir": "src",
     "outDir": "dist",
 

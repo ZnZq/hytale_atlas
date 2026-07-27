@@ -243,12 +243,14 @@ The first run is slow — **`Assets.zip` measures 3.43 GB across 60 148 entries*
 order of magnitude beyond the "hundreds of megabytes" this document originally
 assumed — and this is the moment a user decides whether to keep the tool.
 
-One measurement makes the budget less alarming than the size suggests: the ZIP
-**central directory reads in ~0.5 s**, so pass 1 over paths is effectively
-instant. All real cost is decompressing entry contents. Report progress against
-entries processed, and consider deferring the bulk of content parsing for
-directories the user is unlikely to query first (`Server/World` and
-`Server/Prefabs` alone are a third of the archive).
+Two measurements make the budget less alarming than the size suggests: the central
+directory read costs **~4 s** for all 60 148 entries, and decompressing one asset
+JSON costs **~0.13 ms**. So enumerating the corpus is cheap and random access is
+very cheap; the cost is in how many entries you choose to parse.
+
+Report progress against entries processed, and consider deferring the bulk of
+content parsing for directories the user is unlikely to query first —
+`Server/World` and `Server/Prefabs` alone are a third of the archive.
 
 Requirements:
 

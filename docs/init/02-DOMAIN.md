@@ -213,9 +213,25 @@ so a cache key combining both hashes cannot go out of sync.
 roughly an order of magnitude above what the original design budgeted for, and it
 makes streaming, per-entry extraction non-negotiable.
 
-One measurement cuts the other way and is worth planning around: the ZIP **central
-directory reads in ~0.5 s**. Pass 1, which needs only paths, is therefore
-effectively free. All real cost is in decompressing entry *contents*.
+One property cuts the other way and is worth planning around: the ZIP central
+directory is a compact index yielding every path and size without touching
+compressed data, and per-entry random access is very cheap.
+
+`[MEASURED]` Against the release archive, through the implemented reader
+(`src/sources/archive.ts`):
+
+| Operation | Cost |
+|---|---|
+| Read the central directory (60 148 entries) | **~4.0 s** |
+| `list()` over a 3 641-entry prefix | ~1 ms |
+| Decompress one asset JSON | **~0.13 ms** |
+
+An earlier revision of this document claimed ~0.5 s for the directory read and
+concluded pass 1 was "effectively free". The 0.5 s figure was real but measured
+through .NET's `ZipArchive`; **our reader costs ~4 s**, and the difference is the
+library's per-entry walk, not the archive format. Pass 1 is cheap and cached, not
+free. If that ever matters, hand-rolling the directory read recovers the 0.5 s —
+it is a reader problem, not a design problem.
 
 `[MEASURED]` The archive root carries **`CommonAssetsIndex.hashes`** (3 028 686
 bytes) — a precomputed `<sha256> <path>` manifest covering the `Common/` tree,
