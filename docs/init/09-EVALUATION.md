@@ -140,9 +140,17 @@ aggregate — an aggregate score hides exactly the failure this task exists to e
 Search quality is the single largest identified risk (`01-VISION.md` §Risk
 register), and it can be tested before any MCP work exists.
 
+**Built: `../evaluation/search-phrases.json`** — 36 phrases with ground truth
+verified against the release corpus, in six tiers. See `../evaluation/README.md`.
+
 Build a set of ~30 pairs of *natural-language phrase* → *expected asset ID*, drawn
 from how a real creator would speak: "cave spider", "iron pickaxe", "flaming sword",
 "the blue flowers", "torch".
+
+*(Retained for provenance. Note that measurement moved "cave spider" out of the
+localization tier: `Spider_Cave` contains both query tokens, so it tests
+tokenisation rather than localization. Suggestive examples are not evidence until
+checked against the corpus.)*
 
 Then measure recall@5 under three configurations:
 

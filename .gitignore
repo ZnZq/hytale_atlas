@@ -1,0 +1,49 @@
+# ---------------------------------------------------------------------------
+# Hytale-derived data — NEVER COMMIT
+#
+# The Hytale EULA v2.2 §3.3 forbids distributing the Game "in whole or in part,
+# including its source code, any decryption keys or any other files pertaining to
+# the Game", and §4.2 conditions the interoperability exception on not disclosing
+# proprietary information. See docs/init/02-DOMAIN.md §Legal.
+#
+# Generated schemas, extracted corpora, decompiled sources and cached indexes all
+# fall under this. They are produced locally, from the user's own installation,
+# and stay there.
+# ---------------------------------------------------------------------------
+local/
+*.hytale-cache/
+Assets.zip
+HytaleServer.jar
+**/Schema/*.json
+
+# Node / TypeScript
+node_modules/
+dist/
+build/
+out/
+*.tsbuildinfo
+.npm/
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+
+# Index artifacts
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~

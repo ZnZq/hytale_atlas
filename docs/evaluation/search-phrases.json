@@ -1,0 +1,112 @@
+{
+  "$comment": [
+    "Search evaluation set for 09-EVALUATION.md §Search. Written BEFORE the index",
+    "exists, so the design cannot be tuned to its own test.",
+    "",
+    "Ground truth verified 2026-07-27 against Server/Languages/en-US/server.lang",
+    "in the release patchline. Re-verify on a new patchline before trusting a run.",
+    "",
+    "On the legal constraint (02-DOMAIN.md §Legal): this file names ~40 public asset",
+    "identifiers and quotes short display strings as test fixtures. That is not",
+    "redistribution of the corpus under EULA v2.2 §3.3 -- it is the minimum needed to",
+    "state an expected answer. Do not grow it into an asset listing; generated",
+    "schemas and extracted corpora stay in local/ and are gitignored."
+  ],
+
+  "metric": {
+    "primary": "recall@5 -- does expected_any appear in the top 5 results",
+    "configurations": [
+      "1. FTS over asset identifiers only",
+      "2. FTS over identifiers + localized names",
+      "3. FTS over identifiers + localized names + descriptions",
+      "4. plus embeddings, only if 2-3 prove insufficient"
+    ],
+    "report_by_tier": true,
+    "$comment": [
+      "Report per tier, never as a single aggregate. An aggregate hides the whole",
+      "point: tier lexical-id passes under every configuration and would mask a",
+      "total failure on lexical-name."
+    ]
+  },
+
+  "tiers": {
+    "lexical-id": "Query words appear in the identifier. Config 1 should already pass. Control group -- if these fail, the index is broken, not the design.",
+    "lexical-name": "Query words appear ONLY in the localized display name. Config 1 must fail and config 2 must pass. THIS TIER IS THE DECISION POINT for whether localization indexing earns its place. Cases marked \"overlap\": \"partial\" share a token with the identifier and are therefore weaker evidence -- config 1 can reach the right family by that token alone. Score the 12 clean cases separately from the 3 partial ones; the clean subset is what the decision rests on.",
+    "lexical-description": "Query words appear only in the description. Separates indexing names from indexing descriptions -- only 305 items have descriptions, so this tier is small by nature.",
+    "semantic": "No literal overlap with identifier, name or description. Expected to fail configs 1-3. Measures the headroom embeddings would buy; do NOT treat failures here as bugs.",
+    "disambiguation": "The phrase is genuinely ambiguous. Correct behaviour is surfacing both senses, not picking one. Scored as: are both senses present in the top 5.",
+    "noise-rejection": "Vanilla ships 180 Prototype_, 28 Debug_, 17 Template_, 13 Filter_ and 6 Test_ items. A real asset must outrank them. Scored as: is the top result a non-noise asset."
+  },
+
+  "cases": [
+    { "phrase": "iron pickaxe", "tier": "lexical-id", "expected_any": ["Tool_Pickaxe_Iron"], "display": "Iron Pickaxe" },
+    { "phrase": "adamantite ore", "tier": "lexical-id", "expected_any": ["Ore_Adamantite"], "display": "Adamantite Ore" },
+    { "phrase": "crude ladder", "tier": "lexical-id", "expected_any": ["Furniture_Crude_Ladder"], "display": "Crude Ladder" },
+    { "phrase": "grilled fish", "tier": "lexical-id", "expected_any": ["Food_Fish_Grilled"], "display": "Grilled Fish" },
+    { "phrase": "wooden boat", "tier": "lexical-id", "expected_any": ["Vehicle_Wood_Boat"], "display": "Wooden Boat" },
+
+    { "phrase": "forge", "tier": "lexical-name", "expected_any": ["Bench_Armory"], "display": "Forge",
+      "why": "The identifier says Armory. Nothing in the identifier space contains 'forge'." },
+    { "phrase": "blacksmith's anvil", "tier": "lexical-name", "expected_any": ["Bench_Weapon"], "display": "Blacksmith's Anvil",
+      "why": "Identifier is Bench_Weapon -- neither word appears in it." },
+    { "phrase": "tanning rack", "tier": "lexical-name", "expected_any": ["Bench_Tannery"], "display": "Tanning Rack" },
+    { "phrase": "woodcutter's block", "tier": "lexical-name", "expected_any": ["Bench_Lumbermill"], "display": "Woodcutter's Block" },
+    { "phrase": "chef's stove", "tier": "lexical-name", "expected_any": ["Bench_Cooking"], "display": "Chef's Stove" },
+    { "phrase": "alchemist's workbench", "tier": "lexical-name", "expected_any": ["Bench_Alchemy"], "display": "Alchemist's Workbench" },
+    { "phrase": "adamantite cuirass", "tier": "lexical-name", "overlap": "partial", "expected_any": ["Armor_Adamantite_Chest"], "display": "Adamantite Cuirass",
+      "why": "The canonical example from 03-ARCHITECTURE.md: identifier says Chest, player sees Cuirass. NOTE: 'adamantite' also appears in the identifier, so config 1 can reach the right family and may land it in the top 5 by luck. The discriminating token is 'cuirass' alone. Weaker evidence than the clean cases -- weight accordingly." },
+    { "phrase": "woolen helm", "tier": "lexical-name", "expected_any": ["Armor_Cloth_Wool_Head"], "display": "Woolen Helm" },
+    { "phrase": "goblin throne", "tier": "lexical-name", "expected_any": ["Deco_Chair_Scrap"], "display": "Goblin Throne",
+      "why": "Zero token overlap with the identifier." },
+    { "phrase": "dead embers", "tier": "lexical-name", "expected_any": ["Deco_Campfire_Off"], "display": "Dead Embers" },
+    { "phrase": "cave spider", "tier": "lexical-id", "expected_any": ["Spider_Cave"], "display": "Cave Spider",
+      "why": "01-VISION.md uses this phrase as its motivating example, but measurement moved it out of lexical-name: the identifier Spider_Cave contains BOTH query tokens, merely reordered. It tests underscore tokenisation and word-order independence, not localization. Keeping it mislabelled would have made configs 1 and 2 look equivalent -- exactly the trap 09-EVALUATION.md warns about." },
+    { "phrase": "rattlesnake", "tier": "lexical-name", "expected_any": ["Snake_Rattle"], "display": "Rattlesnake",
+      "why": "Single token in the name, two underscore-separated tokens in the identifier -- tests tokenizer behaviour as much as source." },
+    { "phrase": "greenfinch", "tier": "lexical-name", "expected_any": ["Finch_Green"], "display": "Greenfinch" },
+    { "phrase": "rootling merchant", "tier": "lexical-name", "overlap": "partial", "expected_any": ["Kweebec_Merchant"], "display": "Rootling Merchant",
+      "why": "'Kweebec' is the internal species name; players only ever see 'Rootling'. 'merchant' overlaps the identifier, so config 1 can reach merchants generally -- 'rootling' is the discriminating token." },
+    { "phrase": "ember dragon", "tier": "lexical-name", "overlap": "partial", "expected_any": ["Dragon_Fire"], "display": "Ember Dragon",
+      "why": "'dragon' overlaps; 'ember' is the discriminating token. Config 1 will find dragons but cannot tell Fire from the rest." },
+    { "phrase": "bedroll", "tier": "lexical-name", "expected_any": ["Furniture_Crude_Bed"], "display": "Crude Bedroll" },
+
+    { "phrase": "invisible block to wall off an area", "tier": "lexical-description", "expected_any": ["Barrier"], "display": "Barrier Block",
+      "why": "'Invisible' appears only in the description: 'Invisible Block use to block off areas.'" },
+    { "phrase": "quickly regain health", "tier": "lexical-description", "expected_any": ["Bandage_Crude"], "display": "Bandage",
+      "why": "Description opens 'Use to quickly regain health.' The name is just 'Bandage'." },
+    { "phrase": "built-in kitchen for advanced dishes", "tier": "lexical-description", "expected_any": ["Bench_Cooking"], "display": "Chef's Stove",
+      "why": "Matches the description verbatim; neither identifier nor name contains 'kitchen'." },
+    { "phrase": "used to create potions and elixirs", "tier": "lexical-description", "expected_any": ["Bench_Alchemy"], "display": "Alchemist's Workbench" },
+
+    { "phrase": "somewhere to sleep", "tier": "semantic", "expected_any": ["Furniture_Crude_Bed", "Furniture_Ancient_Bed"], "display": "Crude Bedroll / Ruined Wooden Bed",
+      "why": "No shared token with identifier, name or description." },
+    { "phrase": "where do I craft armor", "tier": "semantic", "expected_any": ["Bench_Armour", "Bench_Armory"], "display": "Armorer's Workbench / Forge" },
+    { "phrase": "light I can mount on a wall", "tier": "semantic", "expected_any": ["Furniture_Crude_Torch", "Furniture_Ancient_Torch", "Deco_Lantern"], "display": "Crude Torch / Ancient Torch / Lantern" },
+    { "phrase": "container to store my stuff", "tier": "semantic", "expected_any": ["Furniture_Crude_Chest_Small", "Furniture_Crude_Chest_Large"], "display": "Wooden Chest / Crude Double Chest" },
+    { "phrase": "something to heal with", "tier": "semantic", "expected_any": ["Bandage_Crude"], "display": "Bandage" },
+
+    { "phrase": "chest", "tier": "disambiguation",
+      "expected_any": ["Furniture_Crude_Chest_Small", "Furniture_Crude_Chest_Large"],
+      "expected_also": ["Armor_Adamantite_Chest", "Armor_Wood_Chest", "Armor_Bronze_Ornate_Chest"],
+      "why": "Two unrelated senses: storage furniture, and the chest armor slot. Both must surface; picking one silently is the failure." },
+    { "phrase": "campfire", "tier": "disambiguation",
+      "expected_any": ["Bench_Campfire"],
+      "expected_also": ["Furniture_Crude_Brazier", "Deco_Campfire_Off"],
+      "why": "Bench_Campfire is named exactly 'Campfire'; Furniture_Crude_Brazier is 'Small Campfire' and Deco_Campfire_Off is 'Dead Embers'. Exact-name match should win, near matches should still appear." },
+    { "phrase": "woolen boots", "tier": "disambiguation", "expected_any": ["Armor_Wool_Legs"], "display": "Woolen Boots",
+      "why": "TRAP. The identifier says Legs; the display name says Boots. Any system reasoning from identifiers puts this in the wrong equipment slot. Verified, not a typo on our side." },
+
+    { "phrase": "sword", "tier": "noise-rejection",
+      "expected_any": ["Weapon_Sword_Adamantite"],
+      "must_not_rank_first": ["Sword_Signature_Test", "Template_Weapon_Sword"],
+      "why": "'Sword_Signature_Test' is literally named 'TEST Iron Sword' and its identifier starts with the query word -- an identifier-weighted ranker will float it to the top." },
+    { "phrase": "arrow", "tier": "noise-rejection",
+      "expected_any": ["Weapon_Arrow_Crude", "Weapon_Arrow_Iron", "Weapon_Arrow_Clearshot"],
+      "must_not_rank_first": ["Prototype_Human_Ruins_Sign_Arrow"],
+      "why": "The prototype is a decorative sign, not a projectile." },
+    { "phrase": "cactus flower", "tier": "noise-rejection",
+      "expected_any": [],
+      "must_not_rank_first": ["Prototype_Cactus_Flower_Giant_White", "Prototype_Cactus_Flower_Giant_Yellow"],
+      "why": "Every match is a Prototype_. Correct behaviour is to return them while marking them as prototypes -- an empty expected_any means we are scoring the labelling, not the recall." }
+  ]
+}
