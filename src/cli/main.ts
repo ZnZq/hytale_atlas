@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { detectInstallation, detectProject } from "../sources/detect.ts";
+import { cmdEval, cmdIndex, cmdSearch } from "./commands.ts";
 
 /**
  * CLI entry point.
@@ -14,6 +15,9 @@ const USAGE = `hytale-atlas — unofficial local index of Hytale assets
 
   hytale-atlas                 Detect, index, report. Idempotent.
   hytale-atlas status          Sources, patchline, tier, epoch, coverage
+  hytale-atlas index           Build the corpus index (cached globally)
+  hytale-atlas search <query>  Search assets in any indexed locale
+  hytale-atlas eval            Run the search evaluation set, recall@5 per tier
   hytale-atlas --mcp           Serve MCP over stdio (requires a warm cache)
   hytale-atlas validate        Run pack validation; non-zero exit on errors
   hytale-atlas clean [--all]   Drop this project's index, or the global cache
@@ -22,16 +26,22 @@ Options
   --assets <path>              Explicit Assets.zip override
   --jar <path>                 Explicit HytaleServer.jar override
   --patchline <name>           Select a non-active patchline
+  --force                      Rebuild even if a cached index exists
+  --limit <n>                  Result limit for search
+  --set <path>                 Evaluation set (default docs/evaluation/search-phrases.json)
   -h, --help                   This message
 `;
 
 interface Args {
   readonly command: string;
   readonly flags: ReadonlyMap<string, string | true>;
+  /** Positional arguments after the command, e.g. the search query. */
+  readonly rest: readonly string[];
 }
 
 function parseArgs(argv: readonly string[]): Args {
   const flags = new Map<string, string | true>();
+  const rest: string[] = [];
   let command = "index";
   let seenCommand = false;
 
@@ -51,9 +61,11 @@ function parseArgs(argv: readonly string[]): Args {
     } else if (!seenCommand) {
       command = a;
       seenCommand = true;
+    } else {
+      rest.push(a);
     }
   }
-  return { command, flags };
+  return { command, flags, rest };
 }
 
 /**
@@ -112,7 +124,7 @@ function cmdStatus(args: Args): number {
   return install.assetsZip ? 0 : 1;
 }
 
-function main(): number {
+function main(): number | Promise<number> {
   const args = parseArgs(process.argv.slice(2));
 
   if (args.flags.has("help")) {
@@ -124,6 +136,17 @@ function main(): number {
     case "status":
       return cmdStatus(args);
     case "index":
+      return cmdIndex(opts(args));
+    case "search": {
+      const query = args.rest.join(" ");
+      if (query.length === 0) {
+        process.stderr.write("usage: hytale-atlas search <query>\n");
+        return 2;
+      }
+      return cmdSearch(query, opts(args));
+    }
+    case "eval":
+      return cmdEval(opts(args));
     case "validate":
     case "clean":
       process.stderr.write(
@@ -136,4 +159,35 @@ function main(): number {
   }
 }
 
-process.exitCode = main();
+function opts(args: Args) {
+  const str = (k: string): string | undefined => {
+    const v = args.flags.get(k);
+    return typeof v === "string" ? v : undefined;
+  };
+  const num = (k: string): number | undefined => {
+    const v = str(k);
+    return v === undefined ? undefined : Number(v);
+  };
+  return {
+    ...(str("assets") !== undefined ? { assets: str("assets")! } : {}),
+    ...(str("patchline") !== undefined ? { patchline: str("patchline")! } : {}),
+    ...(str("set") !== undefined ? { set: str("set")! } : {}),
+    ...(num("limit") !== undefined ? { limit: num("limit")! } : {}),
+    ...(args.flags.has("force") ? { force: true } : {}),
+  };
+}
+
+const code = main();
+if (code instanceof Promise) {
+  code.then(
+    (c) => {
+      process.exitCode = c;
+    },
+    (err: unknown) => {
+      process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
+      process.exitCode = 1;
+    },
+  );
+} else {
+  process.exitCode = code;
+}
