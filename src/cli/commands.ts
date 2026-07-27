@@ -2,6 +2,7 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 
 import { openDatabase } from "../db/open.ts";
 import { buildSearchIndex } from "../indexer/corpus.ts";
+import { resolveCandidates } from "../indexer/references.ts";
 import { TypeResolver, applyTypes, ingestSchemas } from "../indexer/schema.ts";
 import { type AssetLoader, resolveAsset } from "../query/asset.ts";
 import { searchAssets } from "../query/search.ts";
@@ -223,10 +224,23 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
       },
     });
     process.stdout.write("\r".padEnd(48) + "\r");
+
+    // Pass 2 resolution: one indexed join per edge kind, now that the symbol
+    // table is complete.
+    const edges = resolveCandidates(db);
+
     process.stdout.write(
       [
         `Indexed ${formatCount(result.assets)} assets ` +
-          `(${formatCount(result.typed)} typed, ${formatCount(result.localized)} localized)`,
+          `(${formatCount(result.typed)} typed, ${formatCount(result.localized)} localized), ` +
+          `${formatCount(result.files)} files`,
+        `Edges: ${formatCount(edges.references)} references ` +
+          `(${formatCount(edges.ambiguous)} low-confidence), ` +
+          `${formatCount(edges.fileReferences)} to files, ` +
+          `${formatCount(edges.inherits)} inherits, ` +
+          `${formatCount(edges.localizedBy)} localized-by`,
+        `Candidates: ${formatCount(edges.candidates)} recorded, ` +
+          `${formatCount(edges.dangling)} unresolved`,
         `Localization: ${result.locales.length} locales, ` +
           `${formatCount(result.langKeys)} keys, ` +
           `${formatCount(result.ftsRows)} search rows`,

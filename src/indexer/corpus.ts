@@ -11,16 +11,17 @@ import {
   parseLang,
 } from "../sources/lang.ts";
 import { normalizeSearchText } from "../util/text.ts";
+import { collectCandidates } from "./references.ts";
 
 /**
- * Builds the search slice of the index: assets, localization, and FTS.
+ * Builds the frozen index: assets, files, localization, FTS and pass-2 candidates.
  *
- * **This is deliberately not pass 1.** It skips asset types, reference edges,
- * candidates and inheritance, because the point is to measure the project's
- * central claim — that indexing localized strings makes natural-language search
- * work — before building anything that depends on the answer
- * (`docs/init/09-EVALUATION.md` §Search). Asset type resolution needs the
- * generated schema's type table and is the next slice.
+ * Passes 1 and 2 share one walk over the archive. Pass 1 collects the symbol
+ * table (assets, files, lang keys); pass 2 records every string scalar as a
+ * candidate. Resolution is deliberately left to `resolveCandidates()` afterwards,
+ * because a candidate can only be matched once the symbol table is complete, and
+ * a second walk over 3.4 GB to achieve that would cost more than the indexed join
+ * it replaces (`docs/init/03-ARCHITECTURE.md` Indexing: three passes).
  */
 
 export interface BuildOptions {
@@ -31,13 +32,36 @@ export interface BuildOptions {
    *
    * Supplied by schema ingestion, which must therefore run first. Without it every
    * asset is untyped, and search cannot tell an item from a worldgen prefab or an
-   * animation — the defect the first evaluation run measured.
+   * animation -- the defect the first evaluation run measured.
    */
   readonly types?: { resolve(path: string): string | null };
+  /**
+   * Roots indexed as assets but excluded from pass-2 candidate extraction.
+   *
+   * Measured on the release corpus: `Server/Prefabs/` alone produced **20.6 of
+   * 21.2 million candidates** from 7 812 files -- about 2 600 strings each -- and
+   * `Server/World/` a further 365 thousand. They are voxel data, not authored
+   * references: the top values are `Empty` (5.9M), `Rock_Stone` (2.2M) and
+   * `Rock_Slate` (1.4M), one per block placed.
+   *
+   * Combined with 2 564 colliding `logical_id`s (461 files are named
+   * `Entry.node`), the cross product produced 60.8 million edges of which 60.7
+   * million were low-confidence, and a 7.5 GB database -- larger than the 3.4 GB
+   * archive it indexes.
+   *
+   * These roots stay searchable and typed; they simply contribute no edges.
+   */
+  readonly skipCandidatesIn?: readonly string[];
   /** Reports progress; called every `progressEvery` assets. */
   readonly onProgress?: (done: number, total: number) => void;
   readonly progressEvery?: number;
 }
+
+/** Voxel-data roots: indexed as assets, excluded from the reference graph. */
+export const DEFAULT_CANDIDATE_EXCLUSIONS: readonly string[] = [
+  "Server/Prefabs/",
+  "Server/World/",
+];
 
 export interface BuildResult {
   readonly assets: number;
@@ -45,8 +69,23 @@ export interface BuildResult {
   readonly localized: number;
   readonly ftsRows: number;
   readonly langKeys: number;
+  readonly files: number;
+  readonly candidates: number;
   readonly locales: readonly string[];
   readonly elapsedMs: number;
+}
+
+/** Classifies a non-JSON archive entry, for the `files` table. */
+function fileKind(path: string): string {
+  const dot = path.lastIndexOf(".");
+  const ext = dot < 0 ? "" : path.slice(dot + 1).toLowerCase();
+  switch (ext) {
+    case "png": case "jpg": case "jpeg": case "tga": return "texture";
+    case "blockymodel": case "bbmodel": return "model";
+    case "ogg": case "wav": case "mp3": return "audio";
+    case "ui": return "ui";
+    default: return "other";
+  }
 }
 
 /** A translation reference found inside an asset document. */
@@ -129,7 +168,13 @@ export async function buildSearchIndex(
   db: Database,
   options: BuildOptions = {},
 ): Promise<BuildResult> {
-  const { roots = ["Server/"], types, onProgress, progressEvery = 2000 } = options;
+  const {
+    roots = ["Server/"],
+    types,
+    skipCandidatesIn = DEFAULT_CANDIDATE_EXCLUSIONS,
+    onProgress,
+    progressEvery = 2000,
+  } = options;
   const started = Date.now();
 
   const { catalog, files: langFiles } = await loadLangCatalog(archive);
@@ -153,15 +198,32 @@ export async function buildSearchIndex(
       }
     }
 
+    // Non-JSON entries become File nodes, so that a reference to
+    // "Icons/ItemsGenerated/X.png" can be told from a dangling one.
+    const insFile = db.prepare(
+      "INSERT INTO files (pack_id, path, kind) VALUES (1,?,?)" +
+        " ON CONFLICT (pack_id, path) DO NOTHING",
+    );
+    let files = 0;
+    for (const entry of archive.entries) {
+      if (entry.path.endsWith(".json") || entry.path.endsWith(".lang")) continue;
+      insFile.run(entry.path, fileKind(entry.path));
+      files++;
+    }
+
     const insAsset = db.prepare(
       "INSERT INTO assets (pack_id, logical_id, type, path, last_changed_epoch) VALUES (1,?,?,?,0)" +
         " ON CONFLICT (pack_id, path) DO NOTHING",
     );
+    const insCandidate = db.prepare(
+      "INSERT INTO candidates (asset_id, json_pointer, raw_value) VALUES (?,?,?)",
+    );
+    const assetIdOf = db.prepare("SELECT id FROM assets WHERE pack_id = 1 AND path = ?");
     const insFts = db.prepare(
       "INSERT INTO assets_fts (logical_id, type, locale, display_name, description) VALUES (?,?,?,?,?)",
     );
 
-    const candidates = archive.entries.filter(
+    const assetEntries = archive.entries.filter(
       (e) => e.path.endsWith(".json") && roots.some((r) => e.path.startsWith(r)),
     );
 
@@ -169,8 +231,9 @@ export async function buildSearchIndex(
     let typed = 0;
     let localized = 0;
     let ftsRows = 0;
+    let candidates = 0;
 
-    for (const entry of candidates) {
+    for (const entry of assetEntries) {
       const id = assetIdFromPath(entry.path);
       const assetType = types?.resolve(entry.path) ?? null;
       if (assetType !== null) typed++;
@@ -184,10 +247,25 @@ export async function buildSearchIndex(
         continue; // malformed asset: still indexed by id, just not localized
       }
 
+      // Pass 2: every string scalar becomes a candidate, resolved later by an
+      // indexed join rather than by a second walk over the archive.
+      //
+      // Voxel roots are skipped -- see skipCandidatesIn. They stay searchable and
+      // typed; they contribute no edges.
+      if (!skipCandidatesIn.some((prefix) => entry.path.startsWith(prefix))) {
+        const row = assetIdOf.get(entry.path) as { id: number } | undefined;
+        if (row !== undefined) {
+          for (const candidate of collectCandidates(doc)) {
+            insCandidate.run(row.id, candidate.pointer, candidate.value);
+            candidates++;
+          }
+        }
+      }
+
       const refs = collectReferences(doc);
       if (refs.length === 0) {
         // No display name anywhere. Index the identifier alone so the asset is at
-        // least reachable — this is the population validate_pack will flag.
+        // least reachable -- this is the population validate_pack will flag.
         insFts.run(id, assetType ?? "", "", normalizeSearchText(id.replace(/_/g, " ")), "");
         ftsRows++;
         continue;
@@ -217,7 +295,7 @@ export async function buildSearchIndex(
         ftsRows++;
       }
 
-      if (onProgress && assets % progressEvery === 0) onProgress(assets, candidates.length);
+      if (onProgress && assets % progressEvery === 0) onProgress(assets, assetEntries.length);
     }
 
     setMeta(db, "source_archive", archive.path);
@@ -231,6 +309,8 @@ export async function buildSearchIndex(
       localized,
       ftsRows,
       langKeys,
+      files,
+      candidates,
       locales: catalog.locales,
       elapsedMs: Date.now() - started,
     };
