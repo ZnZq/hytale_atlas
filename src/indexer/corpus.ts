@@ -26,6 +26,14 @@ import { normalizeSearchText } from "../util/text.ts";
 export interface BuildOptions {
   /** Archive roots to walk for asset JSON. */
   readonly roots?: readonly string[];
+  /**
+   * Assigns an asset type to each path.
+   *
+   * Supplied by schema ingestion, which must therefore run first. Without it every
+   * asset is untyped, and search cannot tell an item from a worldgen prefab or an
+   * animation — the defect the first evaluation run measured.
+   */
+  readonly types?: { resolve(path: string): string | null };
   /** Reports progress; called every `progressEvery` assets. */
   readonly onProgress?: (done: number, total: number) => void;
   readonly progressEvery?: number;
@@ -33,6 +41,7 @@ export interface BuildOptions {
 
 export interface BuildResult {
   readonly assets: number;
+  readonly typed: number;
   readonly localized: number;
   readonly ftsRows: number;
   readonly langKeys: number;
@@ -120,7 +129,7 @@ export async function buildSearchIndex(
   db: Database,
   options: BuildOptions = {},
 ): Promise<BuildResult> {
-  const { roots = ["Server/"], onProgress, progressEvery = 2000 } = options;
+  const { roots = ["Server/"], types, onProgress, progressEvery = 2000 } = options;
   const started = Date.now();
 
   const { catalog, files: langFiles } = await loadLangCatalog(archive);
@@ -145,11 +154,11 @@ export async function buildSearchIndex(
     }
 
     const insAsset = db.prepare(
-      "INSERT INTO assets (pack_id, logical_id, path, last_changed_epoch) VALUES (1,?,?,0)" +
+      "INSERT INTO assets (pack_id, logical_id, type, path, last_changed_epoch) VALUES (1,?,?,?,0)" +
         " ON CONFLICT (pack_id, path) DO NOTHING",
     );
     const insFts = db.prepare(
-      "INSERT INTO assets_fts (logical_id, type, locale, display_name, description) VALUES (?,'',?,?,?)",
+      "INSERT INTO assets_fts (logical_id, type, locale, display_name, description) VALUES (?,?,?,?,?)",
     );
 
     const candidates = archive.entries.filter(
@@ -157,12 +166,15 @@ export async function buildSearchIndex(
     );
 
     let assets = 0;
+    let typed = 0;
     let localized = 0;
     let ftsRows = 0;
 
     for (const entry of candidates) {
       const id = assetIdFromPath(entry.path);
-      insAsset.run(id, entry.path);
+      const assetType = types?.resolve(entry.path) ?? null;
+      if (assetType !== null) typed++;
+      insAsset.run(id, assetType, entry.path);
       assets++;
 
       let doc: unknown;
@@ -176,7 +188,7 @@ export async function buildSearchIndex(
       if (refs.length === 0) {
         // No display name anywhere. Index the identifier alone so the asset is at
         // least reachable — this is the population validate_pack will flag.
-        insFts.run(id, "", normalizeSearchText(id.replace(/_/g, " ")), "");
+        insFts.run(id, assetType ?? "", "", normalizeSearchText(id.replace(/_/g, " ")), "");
         ftsRows++;
         continue;
       }
@@ -197,6 +209,7 @@ export async function buildSearchIndex(
       for (const [locale, { name, description }] of perLocale) {
         insFts.run(
           id,
+          assetType ?? "",
           locale,
           normalizeSearchText(`${id.replace(/_/g, " ")} ${name}`),
           normalizeSearchText(description),
@@ -214,6 +227,7 @@ export async function buildSearchIndex(
 
     return {
       assets,
+      typed,
       localized,
       ftsRows,
       langKeys,

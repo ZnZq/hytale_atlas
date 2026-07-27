@@ -2,9 +2,11 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 
 import { openDatabase } from "../db/open.ts";
 import { buildSearchIndex } from "../indexer/corpus.ts";
+import { TypeResolver, ingestSchemas } from "../indexer/schema.ts";
 import { searchAssets } from "../query/search.ts";
 import { AssetArchive, archiveStamp } from "../sources/archive.ts";
 import { detectInstallation } from "../sources/detect.ts";
+import { readGeneratedSchemas } from "../sources/schema-doc.ts";
 import { frozenDbPath, frozenKey } from "../util/paths.ts";
 
 /** Resolves the archive to index, honouring an explicit override. */
@@ -26,7 +28,18 @@ export interface IndexArgs {
   readonly assets?: string;
   readonly patchline?: string;
   readonly force?: boolean;
+  /** Directory produced by `--generate-asset-schema`. */
+  readonly schema?: string;
 }
+
+/**
+ * Default location for a previously generated schema set.
+ *
+ * Hytale-derived and therefore gitignored. The subprocess driver that produces it
+ * automatically is not built yet; until then this is where a manual run is
+ * expected to land (`docs/init/05-CODEC-EXTRACTION.md`).
+ */
+const DEFAULT_SCHEMA_DIR = "local/schema-release";
 
 export async function cmdIndex(args: IndexArgs): Promise<number> {
   const archivePath = await resolveArchive(args.assets, args.patchline);
@@ -49,7 +62,27 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
 
   const db = openDatabase(dbPath);
   try {
+    // Schema first: it supplies the path -> type map, and an asset indexed without
+    // a type cannot later be told apart from a worldgen prefab or an animation.
+    let resolver: TypeResolver | undefined;
+    const schemaDir = args.schema ?? DEFAULT_SCHEMA_DIR;
+    if (existsSync(schemaDir)) {
+      const set = readGeneratedSchemas(schemaDir);
+      const ingested = ingestSchemas(db, set);
+      resolver = new TypeResolver(set.types);
+      process.stdout.write(
+        `  schema: ${ingested.types} types, ${ingested.fields.toLocaleString()} fields, ` +
+          `${ingested.definitions.toLocaleString()} shared definitions\n`,
+      );
+      for (const warning of set.warnings) process.stdout.write(`  note: ${warning}\n`);
+    } else {
+      process.stdout.write(
+        `  schema: not found at ${schemaDir} — assets will be untyped (tier 1)\n`,
+      );
+    }
+
     const result = await buildSearchIndex(archive, db, {
+      ...(resolver ? { types: resolver } : {}),
       onProgress: (done, total) => {
         process.stdout.write(`\r  parsed ${done.toLocaleString()} / ${total.toLocaleString()}`);
       },
@@ -58,7 +91,7 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
     process.stdout.write(
       [
         `Indexed ${result.assets.toLocaleString()} assets ` +
-          `(${result.localized.toLocaleString()} localized)`,
+          `(${result.typed.toLocaleString()} typed, ${result.localized.toLocaleString()} localized)`,
         `Localization: ${result.locales.length} locales, ` +
           `${result.langKeys.toLocaleString()} keys, ` +
           `${result.ftsRows.toLocaleString()} search rows`,
@@ -156,8 +189,13 @@ export async function cmdEval(args: {
       if (!ids.some((id) => c.expected_any.includes(id))) {
         reasons.push(`expected ${c.expected_any[0]}`);
       }
-      for (const also of c.expected_also ?? []) {
-        if (!ids.includes(also)) reasons.push(`missing second sense ${also}`);
+      // `expected_also` means "the other sense must also surface", so ANY of the
+      // listed assets satisfies it. Requiring all of them tested something else
+      // entirely — that one family occupies most of the page — which is the
+      // opposite of what a disambiguation case is for.
+      const also = c.expected_also ?? [];
+      if (also.length > 0 && !also.some((id) => ids.includes(id))) {
+        reasons.push(`second sense missing (any of ${also.slice(0, 2).join(", ")}…)`);
       }
       const top = ids[0];
       if (top !== undefined && (c.must_not_rank_first ?? []).includes(top)) {

@@ -172,6 +172,7 @@ function opts(args: Args) {
     ...(str("assets") !== undefined ? { assets: str("assets")! } : {}),
     ...(str("patchline") !== undefined ? { patchline: str("patchline")! } : {}),
     ...(str("set") !== undefined ? { set: str("set")! } : {}),
+    ...(str("schema") !== undefined ? { schema: str("schema")! } : {}),
     ...(num("limit") !== undefined ? { limit: num("limit")! } : {}),
     ...(args.flags.has("force") ? { force: true } : {}),
   };
