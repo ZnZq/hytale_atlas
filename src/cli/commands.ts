@@ -2,12 +2,14 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 
 import { openDatabase } from "../db/open.ts";
 import { buildSearchIndex } from "../indexer/corpus.ts";
-import { TypeResolver, ingestSchemas } from "../indexer/schema.ts";
+import { TypeResolver, applyTypes, ingestSchemas } from "../indexer/schema.ts";
 import { searchAssets } from "../query/search.ts";
 import { AssetArchive, archiveStamp } from "../sources/archive.ts";
 import { detectInstallation } from "../sources/detect.ts";
+import { TELEMETRY_DISCLOSURE, withGeneratedSchemas } from "../sources/schema-gen.ts";
 import { readGeneratedSchemas } from "../sources/schema-doc.ts";
 import { frozenDbPath, frozenKey } from "../util/paths.ts";
+import { askConsent } from "./consent.ts";
 
 /** Resolves the archive to index, honouring an explicit override. */
 async function resolveArchive(
@@ -22,6 +24,114 @@ async function resolveArchive(
     );
   }
   return install.assetsZip;
+}
+
+export interface GenerateSchemaArgs {
+  readonly assets?: string;
+  readonly jar?: string;
+  readonly patchline?: string;
+  /** Consent pre-granted, e.g. by `--yes`. */
+  readonly yes?: boolean;
+  /** Keep the generated files here instead of discarding them. */
+  readonly keep?: string;
+  readonly dryRun?: boolean;
+}
+
+/**
+ * Generates schemas by running the game's own batch mode, then ingests them.
+ *
+ * Consent is required before anything runs: the generator reports telemetry that
+ * cannot be disabled (`docs/init/05-CODEC-EXTRACTION.md` §Hazards).
+ */
+export async function cmdGenerateSchema(args: GenerateSchemaArgs): Promise<number> {
+  const install = detectInstallation(args.patchline);
+  const serverJar = args.jar ?? install?.serverJar;
+  const assetsZip = args.assets ?? install?.assetsZip;
+  const java = install?.bundledJava ?? "java";
+
+  if (!serverJar || !assetsZip) {
+    process.stderr.write(
+      "Need both HytaleServer.jar and Assets.zip. Pass --jar and --assets, or set HYTALE_ROOT.\n",
+    );
+    return 1;
+  }
+
+  if (args.dryRun) {
+    process.stdout.write(
+      [
+        "Would run:",
+        `  ${java} -jar ${serverJar} \\`,
+        "    --bare --disable-sentry \\",
+        `    --assets ${assetsZip} \\`,
+        "    --generate-asset-schema <fresh temp directory>",
+        "",
+        TELEMETRY_DISCLOSURE,
+        "",
+      ].join("\n"),
+    );
+    return 0;
+  }
+
+  const consented = await askConsent({
+    ...(args.yes === true ? { granted: true } : {}),
+    disclosure: TELEMETRY_DISCLOSURE,
+    question: "Generate asset schemas now?",
+  });
+  if (!consented) {
+    process.stdout.write("Cancelled. Nothing was run.\n");
+    return 1;
+  }
+
+  const stamp = await archiveStamp(assetsZip);
+  const dbPath = frozenDbPath(frozenKey(assetsZip, stamp));
+  const db = openDatabase(dbPath);
+
+  try {
+    const { result, value } = await withGeneratedSchemas(
+      {
+        serverJar,
+        assetsZip,
+        java,
+        consent: true,
+        ...(args.keep !== undefined ? { keepAt: args.keep } : {}),
+        onLine: (line) => {
+          if (/WARN|ERROR|Shutdown/.test(line)) process.stdout.write(`  ${line.trim()}\n`);
+        },
+      },
+      (outDir) => {
+        const set = readGeneratedSchemas(outDir);
+        return { set, ingested: ingestSchemas(db, set) };
+      },
+    );
+
+    if (result.shutdownReason !== "schemaGenerated") {
+      process.stderr.write(
+        `Generator stopped with '${result.shutdownReason ?? "unknown reason"}' ` +
+          `(exit ${result.exitCode}${result.timedOut ? ", timed out" : ""}).\n`,
+      );
+      return 1;
+    }
+
+    process.stdout.write(
+      [
+        `Generated ${result.schemaCount} schema files in ${(result.elapsedMs / 1000).toFixed(1)}s`,
+        `Ingested ${value.ingested.types} types, ` +
+          `${value.ingested.fields.toLocaleString()} fields, ` +
+          `${value.ingested.definitions.toLocaleString()} shared definitions`,
+        `Telemetry was sent to Hypixel Studios; this could not be disabled.`,
+        args.keep === undefined ? "Temporary files removed." : `Kept at ${args.keep}`,
+        "",
+      ].join("\n"),
+    );
+
+    const assigned = applyTypes(db, new TypeResolver(value.set.types));
+    if (assigned > 0) {
+      process.stdout.write(`Typed ${assigned.toLocaleString()} already-indexed assets.\n`);
+    }
+    return 0;
+  } finally {
+    db.close();
+  }
 }
 
 export interface IndexArgs {

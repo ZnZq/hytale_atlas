@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { detectInstallation, detectProject } from "../sources/detect.ts";
-import { cmdEval, cmdIndex, cmdSearch } from "./commands.ts";
+import { cmdEval, cmdGenerateSchema, cmdIndex, cmdSearch } from "./commands.ts";
 
 /**
  * CLI entry point.
@@ -18,6 +18,8 @@ const USAGE = `hytale-atlas — unofficial local index of Hytale assets
   hytale-atlas index           Build the corpus index (cached globally)
   hytale-atlas search <query>  Search assets in any indexed locale
   hytale-atlas eval            Run the search evaluation set, recall@5 per tier
+  hytale-atlas generate-schema Run the game's own schema generator, then ingest
+                               (starts the server binary; it sends telemetry)
   hytale-atlas --mcp           Serve MCP over stdio (requires a warm cache)
   hytale-atlas validate        Run pack validation; non-zero exit on errors
   hytale-atlas clean [--all]   Drop this project's index, or the global cache
@@ -27,6 +29,10 @@ Options
   --jar <path>                 Explicit HytaleServer.jar override
   --patchline <name>           Select a non-active patchline
   --force                      Rebuild even if a cached index exists
+  --yes                        Accept the telemetry disclosure without prompting
+  --dry-run                    Print the command that would run, and exit
+  --keep <path>                Keep generated schema files instead of discarding
+  --schema <path>              Use an already-generated schema directory
   --limit <n>                  Result limit for search
   --set <path>                 Evaluation set (default docs/evaluation/search-phrases.json)
   -h, --help                   This message
@@ -147,6 +153,8 @@ function main(): number | Promise<number> {
     }
     case "eval":
       return cmdEval(opts(args));
+    case "generate-schema":
+      return cmdGenerateSchema(opts(args));
     case "validate":
     case "clean":
       process.stderr.write(
@@ -174,7 +182,11 @@ function opts(args: Args) {
     ...(str("set") !== undefined ? { set: str("set")! } : {}),
     ...(str("schema") !== undefined ? { schema: str("schema")! } : {}),
     ...(num("limit") !== undefined ? { limit: num("limit")! } : {}),
+    ...(str("jar") !== undefined ? { jar: str("jar")! } : {}),
+    ...(str("keep") !== undefined ? { keep: str("keep")! } : {}),
     ...(args.flags.has("force") ? { force: true } : {}),
+    ...(args.flags.has("yes") ? { yes: true } : {}),
+    ...(args.flags.has("dry-run") ? { dryRun: true } : {}),
   };
 }
 
