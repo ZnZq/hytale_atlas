@@ -35,7 +35,13 @@
     "lexical-description": "Query words appear only in the description. Separates indexing names from indexing descriptions -- only 305 items have descriptions, so this tier is small by nature.",
     "semantic": "No literal overlap with identifier, name or description. Expected to fail configs 1-3. Measures the headroom embeddings would buy; do NOT treat failures here as bugs.",
     "disambiguation": "The phrase is genuinely ambiguous. Correct behaviour is surfacing both senses, not picking one. Scored as: are both senses present in the top 5.",
-    "noise-rejection": "Vanilla ships 180 Prototype_, 28 Debug_, 17 Template_, 13 Filter_ and 6 Test_ items. A real asset must outrank them. Scored as: is the top result a non-noise asset."
+    "noise-rejection": "Vanilla ships 180 Prototype_, 28 Debug_, 17 Template_, 13 Filter_ and 6 Test_ items. A real asset must outrank them. Scored as: is the top result a non-noise asset.",
+
+    "locale-cyrillic": "Nominative-form queries in Ukrainian and Russian. Baseline proof that non-Latin locales are indexed at all. Should pass with plain FTS once every locale is indexed and text is normalised.",
+    "locale-cjk": "Chinese. Two distinct problems: whole-word queries, and INFIX queries where the meaningful noun sits at the END of a compound (蜘蛛 'spider' inside 洞穴蜘蛛 'cave spider'). unicode61 treats an ideograph run as one token, so infix works only because normalizeSearchText() segments ideographs. Prefix indexing alone cannot reach these.",
+    "inflection": "Full inflected Ukrainian and Russian forms, as a user would actually type them. SQLite ships no Cyrillic stemmer, and FTS5 prefix matching needs the QUERY to be a prefix of the INDEXED term -- so 'кірасу' misses 'кіраса', which diverges at the last letter. These pass only via progressive suffix trimming (buildRelaxedMatchExpressions). An English-only eval set cannot see any of this.",
+    "orthography": "Characters users type differently from how the corpus spells them. Ukrainian Ґ (U+0490) is a distinct letter, not a diacritic, so remove_diacritics does not fold it -- yet Ukrainians routinely type plain г.",
+    "cross-locale": "The same asset reached through several languages. A creator working in Ukrainian may still search an English name seen in a tutorial, so search must cover every indexed locale regardless of the display language."
   },
 
   "cases": [
@@ -107,6 +113,46 @@
     { "phrase": "cactus flower", "tier": "noise-rejection",
       "expected_any": [],
       "must_not_rank_first": ["Prototype_Cactus_Flower_Giant_White", "Prototype_Cactus_Flower_Giant_Yellow"],
-      "why": "Every match is a Prototype_. Correct behaviour is to return them while marking them as prototypes -- an empty expected_any means we are scoring the labelling, not the recall." }
+      "why": "Every match is a Prototype_. Correct behaviour is to return them while marking them as prototypes -- an empty expected_any means we are scoring the labelling, not the recall." },
+
+    { "phrase": "Ковальня", "tier": "locale-cyrillic", "locale": "uk-UA", "expected_any": ["Bench_Armory"], "display": "Ковальня" },
+    { "phrase": "Кузница", "tier": "locale-cyrillic", "locale": "ru-RU", "expected_any": ["Bench_Armory"], "display": "Кузница" },
+    { "phrase": "Ковадло зброяра", "tier": "locale-cyrillic", "locale": "uk-UA", "expected_any": ["Bench_Weapon"], "display": "Ковадло зброяра" },
+    { "phrase": "Печерний павук", "tier": "locale-cyrillic", "locale": "uk-UA", "expected_any": ["Spider_Cave"], "display": "Печерний павук" },
+    { "phrase": "Залізне кайло", "tier": "locale-cyrillic", "locale": "uk-UA", "expected_any": ["Tool_Pickaxe_Iron"], "display": "Залізне кайло",
+      "why": "The identifier says Pickaxe; Ukrainian says кайло, which shares nothing with it. The Cyrillic analogue of the forge/Bench_Armory case." },
+    { "phrase": "Гримуча змія", "tier": "locale-cyrillic", "locale": "uk-UA", "expected_any": ["Snake_Rattle"], "display": "Гримуча змія" },
+    { "phrase": "Кухарська плита", "tier": "locale-cyrillic", "locale": "uk-UA", "expected_any": ["Bench_Cooking"], "display": "Кухарська плита" },
+
+    { "phrase": "锻炉", "tier": "locale-cjk", "locale": "zh-CN", "expected_any": ["Bench_Armory"], "display": "锻炉",
+      "why": "Whole-word CJK. Works even without segmentation; the baseline for this tier." },
+    { "phrase": "蜘蛛", "tier": "locale-cjk", "locale": "zh-CN", "expected_any": ["Spider_Cave"], "display": "洞穴蜘蛛",
+      "why": "INFIX. 蜘蛛 ('spider') is the trailing half of 洞穴蜘蛛 ('cave spider'). Prefix indexing cannot reach a trailing substring; only ideograph segmentation can. Measured to return nothing before normalisation was added." },
+    { "phrase": "尾蛇", "tier": "locale-cjk", "locale": "zh-CN", "expected_any": ["Snake_Rattle"], "display": "响尾蛇",
+      "why": "INFIX, and not even aligned to a word boundary -- the query spans characters 2-3 of a three-character name." },
+    { "phrase": "胸甲", "tier": "locale-cjk", "locale": "zh-CN", "expected_any": ["Armor_Adamantite_Chest"], "display": "精金胸甲",
+      "why": "INFIX. 胸甲 is 'cuirass' -- the same semantic case as the English tier, in a script where the technique that makes it work is entirely different." },
+    { "phrase": "铁砧", "tier": "locale-cjk", "locale": "zh-CN", "expected_any": ["Bench_Weapon"], "display": "锻造铁砧" },
+
+    { "phrase": "кірасу", "tier": "inflection", "locale": "uk-UA", "expected_any": ["Armor_Adamantite_Chest"], "display": "Адамантитова кіраса",
+      "why": "Accusative. 'кірасу' is NOT a prefix of 'кіраса' -- they diverge at the final letter -- so prefix matching alone returns nothing. Verified: this is the case that disproved an earlier claim that prefix indexing substitutes for stemming." },
+    { "phrase": "ковальню", "tier": "inflection", "locale": "uk-UA", "expected_any": ["Bench_Armory"], "display": "Ковальня" },
+    { "phrase": "адамантитової", "tier": "inflection", "locale": "uk-UA", "expected_any": ["Armor_Adamantite_Chest"], "display": "Адамантитова кіраса",
+      "why": "Feminine genitive of an adjective: four characters differ from the indexed form. Needs the deepest trim level." },
+    { "phrase": "печерного павука", "tier": "inflection", "locale": "uk-UA", "expected_any": ["Spider_Cave"], "display": "Печерний павук",
+      "why": "Both words inflect at once -- adjective agreement plus animate accusative." },
+    { "phrase": "кузницу", "tier": "inflection", "locale": "ru-RU", "expected_any": ["Bench_Armory"], "display": "Кузница" },
+    { "phrase": "железной кирки", "tier": "inflection", "locale": "ru-RU", "expected_any": ["Tool_Pickaxe_Iron"], "display": "Железная кирка" },
+
+    { "phrase": "гоблінський трон", "tier": "orthography", "locale": "uk-UA", "expected_any": ["Deco_Chair_Scrap"], "display": "Ґоблінський трон",
+      "why": "The corpus spells it with Ґ (U+0490); most users type plain г. These are separate Cyrillic letters, so remove_diacritics does NOT fold them -- normalizeSearchText() does, on both sides. Measured to return nothing without it." },
+
+    { "phrase": "Forge", "tier": "cross-locale", "expected_any": ["Bench_Armory"], "display": "Forge / Ковальня / Кузница / Forja / 锻炉",
+      "why": "Together with the four rows below: one asset must be reachable from every shipped language, whatever the user's display locale. Scored as a group -- all five must resolve to the same asset." },
+    { "phrase": "Forja", "tier": "cross-locale", "locale": "pt-BR", "expected_any": ["Bench_Armory"], "display": "Forja" },
+    { "phrase": "Couraça de Adamantita", "tier": "cross-locale", "locale": "pt-BR", "expected_any": ["Armor_Adamantite_Chest"], "display": "Couraça de Adamantita" },
+    { "phrase": "Aranha das Cavernas", "tier": "cross-locale", "locale": "pt-BR", "expected_any": ["Spider_Cave"], "display": "Aranha das Cavernas" },
+    { "phrase": "Хліб", "tier": "cross-locale", "locale": "uk-UA", "expected_any": ["Food_Bread"], "display": "Хліб",
+      "why": "Four letters, so suffix trimming is refused -- proves relaxation does not fire where it would match everything." }
   ]
 }

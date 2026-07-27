@@ -243,25 +243,60 @@ CREATE INDEX IF NOT EXISTS idx_files_path       ON files (path);
 -- names, and users describe things in prose. items.Armor_Adamantite_Chest.name
 -- resolves to "Adamantite Cuirass" -- a search for "cuirass" matches nothing in
 -- the identifier space. Localized values are therefore indexed alongside IDs.
+--
+-- ALL locales are indexed, one row per (asset, locale). The vanilla corpus ships
+-- five: en-US, pt-BR, ru-RU, uk-UA, zh-CN. A single display_name column would
+-- have quietly made search English-only while lang_keys pretended otherwise.
+-- Cost is trivial -- 3 762 items x 5 locales is under 19 000 rows -- and carrying
+-- the locale lets a result say which language it matched in.
+--
+-- Callers must GROUP BY logical_id: one asset can match in several locales.
+--
+-- Text on BOTH sides -- indexed values and query terms -- goes through
+-- util/text.ts normalizeSearchText(). It segments CJK ideographs into individual
+-- tokens and folds Ukrainian Ґ to Г. Applying it to only one side silently breaks
+-- search for those languages. Never insert into this table directly.
+--
+-- Measured tokenizer behaviour across all five locales:
+--   unicode61 remove_diacritics 2  handles Latin and Cyrillic including case
+--                                  folding (КОВАЛЬНЯ -> Ковальня). Treats a run of
+--                                  ideographs as ONE token, and does not fold
+--                                  Ґ (U+0490) to Г -- both fixed by normalisation.
+--   trigram                        worse: no CJK match at all, because 锻炉 is two
+--                                  characters and a trigram needs three.
+--
+-- prefix='2 3' serves stem queries in inflected languages. It does NOT solve
+-- inflection on its own: FTS5 requires the *query* to be a prefix of the
+-- *indexed* term, so кірасу misses кіраса (they diverge at the last letter).
+-- Full inflected forms are reached by progressive suffix trimming at query time
+-- -- see buildRelaxedMatchExpressions() in util/text.ts.
+--
+-- One-character prefixes are deliberately absent: segmentation already makes each
+-- ideograph its own token, so prefix='1' would only bloat the index.
 -- ---------------------------------------------------------------------------
 
 CREATE VIRTUAL TABLE IF NOT EXISTS assets_fts USING fts5 (
   logical_id,
   type,
+  locale,
   display_name,
   description,
-  tokenize = 'unicode61 remove_diacritics 2'
+  tokenize = 'unicode61 remove_diacritics 2',
+  prefix = '2 3'
 );
 
 -- Searching the schema itself, which answers "where does capability X live, and
 -- does it exist at all" -- the one question corpus search structurally cannot,
 -- because absence is invisible to a search over what exists.
+-- No locale column: the generated schema's prose is English-only, because it comes
+-- from the game's own source rather than from the translation files.
 CREATE VIRTUAL TABLE IF NOT EXISTS schema_fts USING fts5 (
   asset_type,
   json_pointer,
   title,
   description,
   enum_values,
-  tokenize = 'unicode61 remove_diacritics 2'
+  tokenize = 'unicode61 remove_diacritics 2',
+  prefix = '2 3'
 );
 `;

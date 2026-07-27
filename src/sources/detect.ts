@@ -22,6 +22,14 @@ export interface Installation {
   /** The JRE the game bundles. Preferred over any system Java — it is version-matched to the JAR. */
   readonly bundledJava: string | null;
   readonly userData: string | null;
+  /**
+   * Launcher UI language from `settings.json`, e.g. "en".
+   *
+   * Used to pick which locale to *display* results in. Search always runs across
+   * every indexed locale regardless — a Ukrainian user may still search an English
+   * name they saw in a tutorial.
+   */
+  readonly uiLanguage: string | null;
 }
 
 export type ProjectKind =
@@ -75,6 +83,16 @@ function readPatchlineFile(root: string): { patchline?: string; userData?: strin
     return out;
   } catch {
     return {};
+  }
+}
+
+function readUiLanguage(root: string): string | null {
+  try {
+    const raw = readFileSync(join(root, "settings.json"), "utf8");
+    const parsed = JSON.parse(raw) as { language?: string };
+    return parsed.language ?? null;
+  } catch {
+    return null;
   }
 }
 
@@ -139,6 +157,7 @@ export function detectInstallation(patchlineOverride?: string): Installation | n
         root, "install", patchline, "package", "jre", "latest", "bin", javaExe,
       ),
       userData: recorded.userData ?? dirIfExists(root, "UserData"),
+      uiLanguage: readUiLanguage(root),
     };
   }
   return null;

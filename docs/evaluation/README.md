@@ -25,6 +25,8 @@ That claim is testable, and this set is the test.
 
 ### Tiers, and what each one decides
 
+**60 cases in eleven tiers.**
+
 | Tier | Cases | Decides |
 |---|---|---|
 | `lexical-id` | 6 | Control. Config 1 should already pass; failures mean the index is broken, not the design. |
@@ -33,6 +35,40 @@ That claim is testable, and this set is the test.
 | `semantic` | 5 | Headroom embeddings would buy. Failures here are expected, not bugs. |
 | `disambiguation` | 3 | Whether ambiguous queries surface both senses instead of silently picking one. |
 | `noise-rejection` | 3 | Whether real assets outrank the 244 `Prototype_`/`Debug_`/`Template_`/`Filter_`/`Test_` items. |
+| `locale-cyrillic` | 7 | Baseline that Ukrainian and Russian are indexed at all. |
+| `locale-cjk` | 5 | Chinese, including **infix** — the noun is usually at the end of a compound. |
+| `inflection` | 6 | Full inflected Slavic forms, as users actually type them. |
+| `orthography` | 1 | Ukrainian Ґ, which users type as г. |
+| `cross-locale` | 5 | One asset reachable through every shipped language. |
+
+### The non-English tiers are not decoration
+
+Each was added because a measurement failed, not because coverage looked thin:
+
+- **`locale-cjk` infix.** `蜘蛛` ("spider") is the trailing half of `洞穴蜘蛛`
+  ("cave spider"). `unicode61` treats an ideograph run as one token, so prefix
+  indexing reaches leading substrings only — this returned **nothing** until
+  `normalizeSearchText()` began segmenting ideographs. `trigram` was tried as an
+  alternative and is worse: no match at all for two-character words.
+- **`inflection`.** `кірасу` (accusative) is *not* a prefix of `кіраса` — they
+  diverge at the final letter — so FTS5 prefix matching cannot reach it. This case
+  disproved an earlier claim in the design that prefix indexing "substitutes for
+  the stemmer Cyrillic does not have". It does not; progressive suffix trimming
+  does.
+- **`orthography`.** The corpus spells it `Ґоблінський` (U+0490); users type
+  `гоблінський`. These are separate Cyrillic letters, not diacritic variants, so
+  `remove_diacritics` leaves them apart.
+
+An English-only set passes all three of those situations without ever exercising
+them. That is why the multi-locale tiers exist, and why they should be run
+separately rather than folded into an average.
+
+### Coverage note
+
+`en-US` carries 4 320 item and NPC names; the other four locales carry 4 033–4 034.
+**287 names are English-only** — roughly 6.6 % of the corpus is unreachable by a
+non-English query no matter how good search is. Report that as a ceiling rather
+than counting it against the retrieval score.
 
 **Report per tier. Never as a single aggregate** — an aggregate is dominated by
 `lexical-id`, which passes under every configuration, and would mask total failure
@@ -56,9 +92,10 @@ failure `09-EVALUATION.md` warns about, and it survived until the numbers were r
 
 ## Ground truth
 
-Verified 2026-07-27 against `Server/Languages/en-US/server.lang`, release
-patchline. All 53 referenced asset IDs resolve; all quoted display strings match
-exactly.
+Verified 2026-07-27 against `Server/Languages/<locale>/server.lang` for all five
+shipped locales, release patchline. All 77 referenced asset IDs resolve, and every
+quoted display string matches its declared locale exactly — checked
+programmatically, not by eye.
 
 **Re-verify before trusting a run on a new patchline.** Hytale is in Early Access
 and asset IDs may be renamed (`../init/OPEN-QUESTIONS.md` Q13). The check is

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { buildRelaxedMatchExpressions, normalizeSearchText } from "../util/text.ts";
 import { bumpEpoch, currentEpoch, getMeta, migrate, openDatabase, setMeta } from "./open.ts";
 import { SCHEMA_VERSION } from "./schema.ts";
 
@@ -93,28 +94,109 @@ test("deleting a pack cascades to its assets", () => {
   db.close();
 });
 
+/**
+ * Real display names for two assets across the five locales the corpus ships.
+ * Verified against Server/Languages/<locale>/server.lang on the release patchline.
+ */
+const LOCALIZED: readonly [string, string, string][] = [
+  ["item:Bench_Armory", "en-US", "Forge"],
+  ["item:Bench_Armory", "uk-UA", "Ковальня"],
+  ["item:Bench_Armory", "ru-RU", "Кузница"],
+  ["item:Bench_Armory", "pt-BR", "Forja"],
+  ["item:Bench_Armory", "zh-CN", "锻炉"],
+  ["item:Armor_Adamantite_Chest", "en-US", "Adamantite Cuirass"],
+  ["item:Armor_Adamantite_Chest", "uk-UA", "Адамантитова кіраса"],
+  ["item:Armor_Adamantite_Chest", "ru-RU", "Адамантитовая кираса"],
+  ["item:Armor_Adamantite_Chest", "pt-BR", "Couraça de Adamantita"],
+  ["item:Armor_Adamantite_Chest", "zh-CN", "精金胸甲"],
+];
+
+/**
+ * Rows go in through the same normalisation the indexer uses. Inserting raw text
+ * here would make these tests pass while the real pipeline failed.
+ */
+function withLocalized() {
+  const db = fresh();
+  const ins = db.prepare(
+    "INSERT INTO assets_fts (logical_id, type, locale, display_name, description) VALUES (?,'item',?,?,'')",
+  );
+  for (const [id, locale, name] of LOCALIZED) ins.run(id, locale, normalizeSearchText(name));
+  return db;
+}
+
+/** Mirrors the search layer: normalise, relax progressively, take the first hit. */
+function search(db: ReturnType<typeof fresh>, query: string) {
+  for (const expr of buildRelaxedMatchExpressions(query)) {
+    const rows = db
+      .prepare(
+        "SELECT logical_id, locale FROM assets_fts WHERE assets_fts MATCH ? ORDER BY rank",
+      )
+      .all(expr) as { logical_id: string; locale: string }[];
+    if (rows.length > 0) return rows;
+  }
+  return [];
+}
+
 // The reason localization is in the graph at all: the identifier says Chest, the
 // player sees Cuirass, and a search for "cuirass" must still find it.
 test("FTS finds an asset by its localized name, not its identifier", () => {
-  const db = fresh();
-  db.prepare(
-    "INSERT INTO assets_fts (logical_id, type, display_name, description) VALUES (?,?,?,?)",
-  ).run("item:Armor_Adamantite_Chest", "item", "Adamantite Cuirass", "");
-  db.prepare(
-    "INSERT INTO assets_fts (logical_id, type, display_name, description) VALUES (?,?,?,?)",
-  ).run("item:Bench_Armory", "item", "Forge", "");
-
-  const hits = db
-    .prepare("SELECT logical_id FROM assets_fts WHERE assets_fts MATCH ? ORDER BY rank")
-    .all("cuirass") as { logical_id: string }[];
-  assert.equal(hits.length, 1);
-  assert.equal(hits[0]!.logical_id, "item:Armor_Adamantite_Chest");
-
+  const db = withLocalized();
+  assert.equal(search(db, "cuirass")[0]!.logical_id, "item:Armor_Adamantite_Chest");
   // 'forge' appears in no identifier anywhere in the corpus.
-  const forge = db
-    .prepare("SELECT logical_id FROM assets_fts WHERE assets_fts MATCH ? ORDER BY rank")
-    .all("forge") as { logical_id: string }[];
-  assert.equal(forge[0]!.logical_id, "item:Bench_Armory");
+  assert.equal(search(db, "forge")[0]!.logical_id, "item:Bench_Armory");
+  db.close();
+});
+
+test("search works in every shipped locale, not just English", () => {
+  const db = withLocalized();
+  const cases: [string, string, string][] = [
+    ["Ковальня", "item:Bench_Armory", "uk-UA"],
+    ["Кузница", "item:Bench_Armory", "ru-RU"],
+    ["Forja", "item:Bench_Armory", "pt-BR"],
+    ["锻炉", "item:Bench_Armory", "zh-CN"],
+    ["кіраса", "item:Armor_Adamantite_Chest", "uk-UA"],
+    ["Couraça", "item:Armor_Adamantite_Chest", "pt-BR"],
+    ["精金胸甲", "item:Armor_Adamantite_Chest", "zh-CN"],
+  ];
+  for (const [query, expectedId, expectedLocale] of cases) {
+    const hits = search(db, query);
+    assert.ok(hits.length > 0, `no hit for ${query}`);
+    assert.equal(hits[0]!.logical_id, expectedId, `wrong asset for ${query}`);
+    assert.equal(hits[0]!.locale, expectedLocale, `wrong locale for ${query}`);
+  }
+  db.close();
+});
+
+test("Cyrillic case folding works", () => {
+  const db = withLocalized();
+  assert.equal(search(db, "КОВАЛЬНЯ")[0]!.logical_id, "item:Bench_Armory");
+  db.close();
+});
+
+// Semantics of normalisation and relaxation are covered in util/text.test.ts;
+// what matters here is that the schema is wired to them correctly.
+test("the schema supports CJK infix and inflected Cyrillic end to end", () => {
+  const db = withLocalized();
+  // 胸甲 is the trailing half of 精金胸甲 — reachable only because normalisation
+  // segments ideographs into individual tokens.
+  assert.equal(search(db, "胸甲")[0]!.logical_id, "item:Armor_Adamantite_Chest");
+  // Accusative; reachable only via progressive suffix trimming.
+  assert.equal(search(db, "кірасу")[0]!.logical_id, "item:Armor_Adamantite_Chest");
+  db.close();
+});
+
+test("one asset matching in several locales is deduped by GROUP BY", () => {
+  const db = withLocalized();
+  // 'Forge' (en) and 'Forja' (pt) both match a stem query.
+  const rows = db
+    .prepare(
+      `SELECT logical_id, count(*) AS n FROM assets_fts
+       WHERE assets_fts MATCH ? GROUP BY logical_id ORDER BY min(rank)`,
+    )
+    .all('"For"*') as { logical_id: string; n: number }[];
+  assert.equal(rows.length, 1, "should collapse to one asset");
+  assert.equal(rows[0]!.logical_id, "item:Bench_Armory");
+  assert.ok(rows[0]!.n >= 2, "matched in more than one locale");
   db.close();
 });
 

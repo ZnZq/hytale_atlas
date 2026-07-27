@@ -210,6 +210,47 @@ an opaque file blob.
 - Where an asset resolves to a display name, carry that name in every summary
   result, so the agent sees `Sword_Iron ("Iron Sword")` rather than a bare ID
 
+### Index every locale, not just English
+
+**One row per (asset, locale).** The corpus ships five — `en-US`, `pt-BR`,
+`ru-RU`, `uk-UA`, `zh-CN` — and a single `display_name` column would quietly make
+search English-only while `lang_keys` pretended otherwise. Cost is negligible:
+3 762 items × 5 locales is under 19 000 rows. Carrying the locale also lets a
+result say which language it matched in, and callers must `GROUP BY logical_id`
+because one asset can match in several.
+
+Search covers every locale regardless of the user's language — someone working in
+Ukrainian may still search an English name they saw in a tutorial. The launcher's
+`settings.json` (`{"language":"en"}`) selects the **display** locale only.
+
+### Tokenizer — measured across all five locales
+
+`unicode61 remove_diacritics 2` with **`prefix='1 2 3'`**.
+
+| Query | Without prefix | With prefix |
+|---|---|---|
+| `Ковальня`, `Кузница`, `Forja`, `forge` | ✅ | ✅ |
+| `КОВАЛЬНЯ` (case folding) | ✅ | ✅ |
+| `锻炉` (whole CJK word) | ✅ | ✅ |
+| `锻` (one ideograph of two) | ❌ | ✅ via `锻*` |
+| `кірасу` (accusative of `кіраса`) | ❌ | ✅ via `кірас*` |
+
+`trigram` was tested and is **worse**: it returns nothing at all for `锻炉`,
+because a trigram needs three characters and the word is two.
+
+The prefix list starts at **1**, which is unusual and deliberate. Two independent
+reasons, neither obvious:
+
+1. **CJK.** `unicode61` treats a run of ideographs as one token, so a
+   one-character query cannot match a two-character word. One character *is* the
+   meaningful unit in Chinese.
+2. **Inflection.** SQLite ships no stemmer for Cyrillic — `porter` is
+   English-only — and Ukrainian and Russian decline heavily. Prefix matching is a
+   partial substitute for the stemming those languages need and will not get.
+
+The second reason means prefix matching is not a CJK special case but a
+correctness requirement for two of the five shipped locales.
+
 ### Consequences
 
 1. `search_assets("flaming sword")` matches against real prose and works.

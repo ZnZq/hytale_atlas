@@ -92,6 +92,7 @@ function cmdStatus(args: Args): number {
   lines.push(`Assets.zip:  ${install.assetsZip ?? "not found"}`);
   lines.push(`Server JAR:  ${install.serverJar ?? "not found"}`);
   lines.push(`Bundled JVM: ${install.bundledJava ?? "not found"}`);
+  lines.push(`UI language: ${install.uiLanguage ?? "unknown"}  (display only; search covers every indexed locale)`);
 
   // Tiers per docs/init/06-CLI-UX.md. Tier 2 needs the JAR *and* a JVM to run it;
   // the game bundles one, so this is the normal case rather than the lucky one.
