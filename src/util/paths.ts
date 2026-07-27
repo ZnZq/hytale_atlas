@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { SCHEMA_VERSION } from "../db/schema.ts";
+
 /**
  * Cache locations.
  *
@@ -42,6 +44,13 @@ export function frozenKey(path: string, stamp: { size: number; mtimeMs: number }
     .slice(0, 16);
 }
 
+/**
+ * Path to a frozen index.
+ *
+ * The schema version is part of the path so that bumping it orphans old databases
+ * instead of reusing one whose shape no longer matches. There is no migration
+ * path by design — rebuilding a derived artifact is cheaper than migrating it.
+ */
 export function frozenDbPath(key: string): string {
-  return join(cacheRoot(), "frozen", key, "corpus.db");
+  return join(cacheRoot(), "frozen", `v${SCHEMA_VERSION}`, key, "corpus.db");
 }

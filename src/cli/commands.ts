@@ -119,6 +119,10 @@ interface EvalCase {
   readonly locale?: string;
   readonly overlap?: string;
   readonly expected_any: readonly string[];
+  /** Assets that must appear too, for disambiguation cases. */
+  readonly expected_also?: readonly string[];
+  /** Assets that must not be the top result — noise, prototypes, test fixtures. */
+  readonly must_not_rank_first?: readonly string[];
 }
 
 /**
@@ -143,12 +147,27 @@ export async function cmdEval(args: {
     for (const c of cases) {
       if (c.expected_any.length === 0) continue; // labelling-only cases
       const hits = searchAssets(db, c.phrase, { limit: 5 });
-      const found = hits.some((h) => c.expected_any.includes(h.logicalId));
+      const ids = hits.map((h) => h.logicalId);
+
+      // A case passes only if it satisfies every constraint it declares. Checking
+      // recall alone overstated noise-rejection, which exists precisely to catch a
+      // real asset being outranked rather than merely absent.
+      const reasons: string[] = [];
+      if (!ids.some((id) => c.expected_any.includes(id))) {
+        reasons.push(`expected ${c.expected_any[0]}`);
+      }
+      for (const also of c.expected_also ?? []) {
+        if (!ids.includes(also)) reasons.push(`missing second sense ${also}`);
+      }
+      const top = ids[0];
+      if (top !== undefined && (c.must_not_rank_first ?? []).includes(top)) {
+        reasons.push(`noise ranked first: ${top}`);
+      }
 
       const bucket = byTier.get(c.tier) ?? { pass: 0, total: 0, failures: [] };
       bucket.total++;
-      if (found) bucket.pass++;
-      else bucket.failures.push(`${c.phrase}  ->  expected ${c.expected_any[0]}`);
+      if (reasons.length === 0) bucket.pass++;
+      else bucket.failures.push(`${c.phrase}  ->  ${reasons.join("; ")}`);
       byTier.set(c.tier, bucket);
     }
 

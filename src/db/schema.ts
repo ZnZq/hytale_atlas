@@ -13,7 +13,15 @@
  * the union; only hot is ever written during editing.
  */
 
-export const SCHEMA_VERSION = 1;
+/**
+ * Bump on any change to the DDL below.
+ *
+ * There is no in-place migration: the index is a derived artifact, so the cheap
+ * and correct answer is to rebuild. The cache path carries this version, which
+ * makes a bump orphan old databases rather than silently reusing one whose shape
+ * no longer matches.
+ */
+export const SCHEMA_VERSION = 2;
 
 export const SCHEMA_SQL = `
 -- ---------------------------------------------------------------------------
@@ -275,10 +283,13 @@ CREATE INDEX IF NOT EXISTS idx_files_path       ON files (path);
 -- ideograph its own token, so prefix='1' would only bloat the index.
 -- ---------------------------------------------------------------------------
 
+-- locale is UNINDEXED: it is a result attribute, not searchable text. Indexing it
+-- would let a query for "ru" match every Russian row, because unicode61 splits
+-- "ru-RU" into two "ru" tokens. It stays retrievable, which is what ranking needs.
 CREATE VIRTUAL TABLE IF NOT EXISTS assets_fts USING fts5 (
   logical_id,
   type,
-  locale,
+  locale UNINDEXED,
   display_name,
   description,
   tokenize = 'unicode61 remove_diacritics 2',
