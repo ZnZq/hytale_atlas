@@ -102,6 +102,41 @@ the first try, grounded in how the game actually does it.
   cover the plugin-authoring surface. This tool reads the JAR only to recover
   *asset schema*, not to document classes.
 
+## Operating constraint — static sources only
+
+**The tool must never require the game to run.** Everything it knows comes from
+files at rest:
+
+| Source | Supplies |
+|---|---|
+| `HytaleServer.jar` | Schema, enums, validators, asset-type registry, engine behaviour |
+| `Assets.zip` | The vanilla corpus and its localization |
+| Pack directories and archives | Third-party and user content |
+| `patchline.json` | Which installation to read |
+
+No game process. No server instance. No connection to a running server. No
+in-game command output.
+
+This is a hard constraint, not a preference, and it has teeth in three places:
+
+1. **Codec extraction loads classes; it does not boot a server.** Reading metadata
+   out of a JVM that has loaded the JAR is within scope. If some type's static
+   initializer demands a live server environment, that type degrades to
+   corpus-inferred and is reported in `coverage` — we do not start a server to
+   rescue it (`05-CODEC-EXTRACTION.md`).
+2. **Questions answerable only by observing a running game are out of scope as
+   *mechanisms*.** They may remain useful as one-off research, but nothing the tool
+   does at runtime may depend on them. `OPEN-QUESTIONS.md` Q9 (`/assets` command
+   output) falls here and has been demoted accordingly.
+3. **Where a question looked like it needed the game, read the JAR instead.** This
+   is not a workaround; it is usually the better answer, because the JAR is the
+   thing the game itself obeys. Phase 0 resolved Q5 and Q7 exactly this way after
+   both were initially filed as "needs a running game" — see `OPEN-QUESTIONS.md`.
+
+The one place this constraint bites honestly is **evaluation**: "does the generated
+pack load in-game" is the only true ground truth, and it is out of scope for the
+tool. `09-EVALUATION.md` addresses the substitute.
+
 ## Success criteria
 
 The tool is working if:
@@ -133,12 +168,19 @@ Criteria 1–5 are achievable with confidence. Criterion 6 is the bet.
 
 ## Risk register
 
-| Risk | Severity | Note |
+Revised after Phase 0 verification (2026-07-27). Three of the four High risks
+retired; the residual risk in this project is now **product-side and
+engineering-side, not feasibility-side**.
+
+| Risk | Severity | Status after Phase 0 |
 |---|---|---|
-| Pack format changes between EA versions | High | Schema must be inferred/extracted, never hardcoded |
-| **Search fails on natural-language intent** | **High** | Identifiers are machine names. Mitigated by indexing localization strings — but if lang data is sparse or structured unexpectedly (Q14), reconsider embeddings |
-| Codec extraction proves infeasible | High | Degrades to corpus-only inference; tool still useful, criterion 6 lost |
-| Schema-only fields are mostly noise | Medium | `find_undocumented` becomes a curiosity rather than a feature. Test early; fall back to impact analysis as the headline |
-| Community finds docs-MCP sufficient | Medium | Product risk, not technical. Mitigate by leading with impact analysis, which docs cannot provide |
-| Legal exposure from JAR processing | Medium | Local-only extraction, no redistribution, no bundled game data |
-| Node dependency excludes no-code pack authors | Medium | See `06-CLI-UX.md` for the single-binary alternative |
+| Pack format changes between EA versions | High | **Unchanged.** Still the governing constraint: never hardcode schema. Two patchlines already coexist on one machine, so cache by content hash |
+| **Corpus scale** | **High** 🆕 | `Assets.zip` measured at **3.43 GB / 60 148 entries** — an order of magnitude above the original budget. Streaming extraction is mandatory. Mitigating measurement: the central directory reads in ~0.5 s, so pass 1 is free |
+| **Path → asset type mapping** | **High** 🆕 | 39 JAR type subpackages vs 51 archive directories, different case, no clean correspondence; a second-level directory is not a type. **Now the weakest link in Phase 1** |
+| Asset inheritance (`Parent`) | Medium 🆕 | Definitions are not self-contained. Affects `get_asset` and field statistics. Merge semantics still open — `OPEN-QUESTIONS.md` Q18 |
+| ~~Search fails on natural-language intent~~ | ~~High~~ → **Low** | **Retired.** Explicit `TranslationProperties.Name` references, 99.9 % item coverage, 5 locales. Embeddings not needed. Residual risk is parser correctness (ICU MessageFormat, root-prefix rewrite), not data availability |
+| ~~Codec extraction proves infeasible~~ | ~~High~~ → **Low** | **Retired, and inverted.** `Codec<T> extends SchemaConvertable<T>` — schema is a supported API call, delivered with the game's own prose descriptions |
+| ~~Legal exposure from JAR processing~~ | ~~Medium~~ → **Low** | **Retired.** EULA v2.2 §3.1 encourages modding, §4.2 preserves interoperability rights, and `toSchema()` does not engage the §4.1(a) decompilation clause at all. Constraints unchanged: local-only, no redistribution, descriptive naming |
+| ~~Node dependency excludes no-code authors~~ | ~~Medium~~ → **Low** | Unchanged for Node itself, but the *Java* half is gone: the game bundles a Temurin 25 JRE, so tier 2 needs no user-installed JVM |
+| Schema-only fields are mostly noise | Medium | **Still open (Q15)** — but cheaper to test, and extracted `description` text may separate live fields from vestigial ones without an in-game experiment |
+| Community finds docs-MCP sufficient | Medium | **Unchanged, and now the largest remaining risk.** Product, not technical. Lead with impact analysis and validation, which documentation cannot provide |

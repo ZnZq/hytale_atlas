@@ -59,9 +59,25 @@ here spends far fewer turns than one that guesses.
 
 **`get_asset(id, pack?)`**
 
-Full effective JSON definition. Also reports which definitions it overrode and
+Full **effective** JSON definition. Also reports which definitions it overrode and
 which pack won. This is the only high-token tool; document that clearly in its
 description so the agent rations it.
+
+**"Effective" now means two resolutions, not one** (`OPEN-QUESTIONS.md` Q18). Real
+assets declare `"Parent": "<other asset id>"`, so a definition on disk is often
+partial:
+
+1. **Inheritance** — resolve the `Parent` chain within the corpus
+2. **Override** — apply cross-pack priority
+
+Returning the raw file would be actively misleading: the agent would see a partial
+definition and conclude that fields are absent which the game supplies from the
+parent, then "helpfully" re-add them or report them missing.
+
+The response should therefore distinguish, per field, **declared here** from
+**inherited from `<id>`**, and name the parent chain. That distinction is exactly
+what an author needs in order to know what to put in their own file, and it is
+cheap to carry.
 
 ---
 
@@ -77,7 +93,11 @@ The inventory of fields for an asset type. Each field carries **both layers**:
   "declared": {
     "type": "Optional<AssetRef<Model>>",
     "default": null,
-    "source": "codec"
+    "source": "codec",
+    "title": "Model",
+    "description": "…the game's own field documentation…",
+    "enum_values": null,
+    "enum_descriptions": null
   },
   "observed": {
     "used_in": 1183,
@@ -87,6 +107,21 @@ The inventory of fields for an asset type. Each field carries **both layers**:
   }
 }
 ```
+
+**`declared` carries prose, and this was not anticipated.** The codec schema
+supplies `title`, `description`, `markdownDescription` and `enumDescriptions`
+(`05-CODEC-EXTRACTION.md`) — the game documents its own schema for the Asset
+Editor. Pass it through verbatim rather than paraphrasing; it is authoritative, and
+it is the difference between "field `Rarity`, enum, 5 values" and an answer the
+user can act on.
+
+Two caveats worth stating in the tool description:
+
+- `observed.used_in` counts occurrences in **inheritance-resolved** assets. Raw
+  file counts undercount, because an inherited field never appears in the child
+  document (Q18).
+- `observed` is absent for fields the schema permits but the corpus never uses —
+  that is `find_undocumented`'s input, not a bug.
 
 `declared` is absent when codec extraction was unavailable (tier 1 — see
 `06-CLI-UX.md`). `observed` is absent for fields that exist in the schema but
@@ -158,16 +193,57 @@ Steal Unity's three report types wholesale — they are the right three:
 
 Plus Hytale-specific checks:
 
-- `manifest.json` well-formed and complete
+- `manifest.json` well-formed. **Not "complete"** — a real pack manifest carries
+  fields absent from the documented schema (`LoadBefore`, `SubPlugins`) and omits
+  documented ones (`ServerVersion`, `Website`). Validate what is known; preserve
+  and ignore what is not. Reporting unknown manifest keys as errors would fire on
+  valid packs (`02-DOMAIN.md`).
 - **Missing localization** — an asset with no translation entry ships as a raw
   identifier shown to players. One of the most common beginner mistakes in any
   modding ecosystem, and trivially detectable once lang data is in the graph.
+  Vanilla sets the bar here: 99.9 % of items are localized, so an unlocalized asset
+  is genuinely anomalous rather than merely untidy.
+- **Dangling localization key** — `TranslationProperties.Name` pointing at a key no
+  `.lang` file defines. Distinct from the above and equally common. Beware the
+  root-prefix rewrite (`server.` ↔ `Server/`) when implementing this: getting it
+  wrong reports *every* asset as broken.
 - Asset ID naming rules (`A–Z a–z 0–9 _`; first letter and letters after `_`
   uppercase) — see `02-DOMAIN.md`
+- **Broken `Parent` reference** — inheritance targets an asset that does not exist,
+  leaving the definition permanently partial (Q18)
 - Fields not present in the extracted schema — the game will silently ignore them,
   which is the single most frustrating failure mode for a pack author. Requires
   tier 2; without it, degrade to "this field is unusual in the corpus."
 - Declared dependencies present
+
+**Open opportunity — reuse the engine's own validators.** Stronger than it first
+appeared. The JAR contains `com.hypixel.hytale.codec.validation` (40 classes), asset
+config classes expose a static `VALIDATOR_CACHE`, and two pieces are directly on
+point:
+
+```java
+class AssetKeyValidator<K> implements Validator<K> {
+    void accept(K, ValidationResults);          // is this key a real asset?
+    void updateSchema(SchemaContext, Schema);   // and it says so in the schema
+}
+class AssetValidationResults extends ValidationResults {
+    void handleMissingAsset(String, Class<? extends JsonAsset>, Object);
+    void logOrThrowValidatorExceptions(HytaleLogger, String, Path, int);   // file + line
+}
+```
+
+**Broken-reference detection is a first-class engine concept, with file-and-line
+reporting already built in.** If these can be invoked on a candidate asset,
+`validate_pack` stops approximating and reports **exactly what the game will
+reject**. Error messages resolve through `assetEditor.messages.*` keys, so they can
+be rendered as real prose in the user's locale.
+
+The catch: `AssetKeyValidator` holds a `Supplier<AssetStore>` and validates against
+a **populated** store, so this needs the corpus loaded through the engine — heavier
+than schema extraction, though still short of booting a server, which
+`01-VISION.md` §Operating constraint forbids.
+
+See `OPEN-QUESTIONS.md` **Q17**; investigate alongside Phase 2, do not block on it.
 
 Distinguish **error** (will not load) from **warning** (unusual but legal). Do not
 report low-confidence heuristic findings as errors.

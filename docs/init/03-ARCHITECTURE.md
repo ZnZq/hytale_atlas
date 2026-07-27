@@ -11,6 +11,18 @@ schema comes from two places, both derived at index time:
 
 Everything the tool asserts about structure must trace to one of these.
 
+**Second principle: static sources only.** The tool never runs the game, never
+starts a server, and never talks to one. Its whole input surface is
+`HytaleServer.jar`, `Assets.zip`, pack directories, and launcher metadata. See
+`01-VISION.md` §Operating constraint.
+
+This is load-bearing architecturally, not just a scoping preference. It means the
+index is reproducible from files alone, works on a machine where the game has never
+been launched, works in CI, and cannot be blocked by a game that will not start.
+When a design question looks like it needs runtime observation, **read the JAR** —
+that is where the behaviour is defined, and it is authoritative in a way that
+observing one session is not.
+
 ---
 
 ## Two layers
@@ -66,27 +78,58 @@ is amortised across every project on the machine.
 a first-class queryable fact rather than a side effect, which is what lets
 `diff_override` and conflict detection work at all.
 
-### Deriving `logical_id`
+### Deriving `logical_id` — RESOLVED
 
-`logical_id` is the key that groups an asset with the definitions it overrides, so
-its derivation must be exact and consistent. It is **not yet defined**, because it
-depends on `OPEN-QUESTIONS.md` Q4 and Q14: whether IDs are carried inside the file
-or implied by path, and whether they are namespaced.
+**`logical_id = <asset_type>:<basename without extension>`. Identity is
+path-derived; it is not carried in the file.** (`OPEN-QUESTIONS.md` Q16, verified
+2026-07-27.)
 
-Two candidate rules:
+Evidence: `Server/Item/Items/Rock/Magma/Rock_Magma_Cooled_Brick_Decorative.json`
+contains no `Id` field, and its localization key is
+`server.items.Rock_Magma_Cooled_Brick_Decorative.name` — the basename exactly, with
+**no path segments**. Organisational nesting is therefore *not* part of identity.
+`AssetStore<String, Item, …>` independently keys assets by plain `String`, and
+references in real assets are bare basenames (`"Parent": "Rock_Magma_Cooled_Brick"`).
 
-- **Path-derived:** `<asset_type>:<basename without extension>` — e.g.
-  `Server/item/Sword_Iron.json` → `item:Sword_Iron`
-- **Content-derived:** an explicit `Id`/`Name` field inside the JSON, possibly
-  already namespaced (`Hytale:Sword_Iron`)
+Two cautions:
 
-The vanilla pack is known to be addressable as `Hytale:Hytale` in the Asset Editor,
-which suggests namespacing by pack group exists at some level. **Resolve this before
-writing the grouping logic** — getting it wrong makes every override relationship in
-the graph wrong, silently.
+- **`<asset_type>` is the hard half.** It cannot be taken from directory depth: a
+  second-level directory is not a type (`Server/Item` contains 14 unrelated
+  third-level groupings), and the JAR's 39 asset-type subpackages do not map
+  cleanly onto the archive's 51 directories. Resolve type from the codec registry
+  and surface disagreements rather than guessing. See `OPEN-QUESTIONS.md` Q4.
+- Pack namespacing (`Hytale:Hytale`) is `Group:Name` from the manifest and
+  identifies the **pack**, not the asset. No namespaced *asset* reference was
+  observed in vanilla.
+
+Still unverified and worth testing before Phase 4: case sensitivity, and what the
+engine does when two files in one pack share a basename.
 
 Implement it as a single documented function with the rule stated in one place, so
 that changing it later is a one-line change rather than a hunt.
+
+### Inheritance — `Parent`
+
+**Asset definitions are not self-contained.** Real assets declare
+`"Parent": "<other asset id>"`, and the codec layer has `InheritCodec`,
+`RawJsonInheritCodec`, and `Schema.hytaleParent` (`InheritSettings`) to match.
+See `OPEN-QUESTIONS.md` **Q18**, which is still open on merge semantics.
+
+Three parts of this design are affected, and two of them are in Phase 1:
+
+1. **`get_asset` must resolve the parent chain.** `04-MCP-SURFACE.md` specifies it
+   returns the "full effective JSON definition". Returning the raw file would be
+   actively misleading — the agent would see a partial definition and conclude
+   fields are absent that the game will happily supply.
+2. **Pass 3 will undercount** if it aggregates raw files, because inherited fields
+   never appear in the child document. Field statistics must be computed over
+   *resolved* assets, or explicitly labelled as raw-occurrence counts.
+3. **`INHERITS_FROM` is a distinct edge from `OVERRIDES`.** Inheritance is
+   intra-corpus, explicit, and by asset ID. Overriding is cross-pack and by
+   identity. Conflating them produces wrong impact analysis in both directions.
+
+It likely interacts with Q5 (cross-pack priority): if pack override uses the same
+merge machinery, both problems share one implementation.
 
 ### Edges
 
@@ -94,6 +137,7 @@ that changing it later is a one-line change rather than a hunt.
 |---|---|---|
 | `DEFINED_IN` | Asset → Pack | |
 | `OVERRIDES` | Asset → Asset | same logical ID, lower priority |
+| `INHERITS_FROM` | Asset → Asset | from `Parent`; intra-corpus, explicit. **Not** the same as `OVERRIDES` — see §Inheritance |
 | `REFERENCES` | Asset → Asset | `json_pointer`, `confidence` |
 | `REFERENCES_FILE` | Asset → File | `json_pointer`, `confidence` |
 | `LOCALIZED_BY` | Asset → LangKey | `json_pointer`, `role` (name/description/…) |
@@ -117,7 +161,11 @@ as possible false positives (see `07-PRIOR-ART.md`).
 Confidence tiers:
 
 - **High** — the field is covered by extracted codec schema and typed as a
-  reference. Not a heuristic at all.
+  reference. Not a heuristic at all. **The mechanism is confirmed:**
+  `AssetKeyValidator implements Validator<K>` exposes
+  `updateSchema(SchemaContext, Schema)`, so a reference-validated field marks
+  itself in `toSchema()` output along with the `AssetStore` it targets
+  (`OPEN-QUESTIONS.md` Q17). This tier is obtained by construction.
 - **Medium** — a fully qualified, namespaced ID string matching a known asset
 - **Low** — a bare short string that happens to collide with a known ID
   (`Stone`, `Default`, `None` will generate noise)
@@ -166,16 +214,40 @@ an opaque file blob.
    one of the most frequent beginner mistakes in any modding ecosystem.
 4. Reverse lookup becomes possible: "which asset is called *Torch* in game?"
 
-### Unknowns
+### Verified — Q14 RESOLVED
 
-`OPEN-QUESTIONS.md` Q14 covers the format, the file layout, how assets reference
-keys (explicit field vs. convention derived from the ID), and locale handling. If
-the reference is conventional rather than explicit, the `LOCALIZED_BY` edge is
-derived rather than observed, and should be marked with lower confidence.
+Measured 2026-07-27. **This section's premise held, and the mechanics are better
+than assumed. Embeddings are not needed.**
 
-**Do not defer this to a later phase.** It belongs in the first indexing pass,
-because search quality depends on it and search is the entry point to everything
-else.
+- **Format:** `.lang`, `key = value`, `#` comments, `# === section ===` headers.
+  121 files, five shipped locales (`en-US`, `pt-BR`, `ru-RU`, `uk-UA`, `zh-CN`),
+  plus `fallback.lang` mapping ~50 regional variants onto base locales.
+- **The reference is explicit**, via a real field:
+  `"TranslationProperties": { "Name": "server.items.Sword_Iron.name" }`.
+  So `LOCALIZED_BY` is **observed and high-confidence** — the derived,
+  lower-confidence fallback contemplated above is unnecessary.
+- **Coverage is 99.9 %** for items: 3 637 of 3 641 definitions carry
+  `TranslationProperties.Name`. Roles: `name`, `description`, `nameFull`.
+- **The payoff is demonstrable.** `items.Armor_Adamantite_Chest.name` resolves to
+  *"Adamantite Cuirass"*. The identifier says `Chest`; the player sees *Cuirass*.
+  Identifier-only FTS cannot answer a search for "cuirass". This is the design's
+  central claim, confirmed on real data rather than argued.
+
+**Implementation traps, both real:**
+
+1. **Root-prefix rewriting.** The reference reads `server.items.<Id>.name`; the key
+   stored in the file is `items.<Id>.name`. The `server.` prefix corresponds to the
+   `Server/` root the lang file lives under. A literal join returns **zero** matches
+   corpus-wide — the first verification scan made exactly this mistake and briefly
+   concluded item localization did not exist. Derive and strip the root prefix.
+   Assume `Common/Languages/…` behaves symmetrically under `common.`; verify.
+2. **The format is not `key=value` line-splitting.** It supports multi-line
+   continuation via trailing `\`, and **ICU MessageFormat** with nested plural
+   forms (`other {{count, number} blocks}}`). Parse with brace counting, not a
+   regex. 810 of 9 971 en-US values contain interpolation.
+
+**Keep this in the first indexing pass**, as originally specified — search quality
+depends on it and search is the entry point to everything else.
 
 ---
 
@@ -320,16 +392,37 @@ This is where persisting unresolved candidates pays off. Without that table, ste
 4 requires a full corpus walk and there is no incremental path at all. With it,
 step 4 is one indexed lookup.
 
-### Racing the agent
+### Racing the agent — now with evidence
 
 An agent writes a JSON file and calls `validate_pack` in the same turn. The file
-may be half-written, or the editor may use write-temp-then-rename and expose an
-intermediate state.
+may be half-written.
+
+**Q7 is resolved, statically, from the JAR** (`OPEN-QUESTIONS.md` Q7). The Asset
+Editor's `StandardDataSource.updateAsset(Path, byte[], EditorClient)` writes with:
+
+```java
+Files.write(path, bytes, CREATE, WRITE, TRUNCATE_EXISTING)
+```
+
+**In place. No temp-then-rename, no `ATOMIC_MOVE` anywhere in the class.**
+
+Both halves of that matter, and they pull in opposite directions:
+
+- **Good:** no `.tmp` churn, no rename storms, one saved asset produces exactly one
+  changed file. The watcher stays simple.
+- **Bad:** `TRUNCATE_EXISTING` followed by a write means there is a **real window in
+  which the file exists and is empty or partial**. The mitigation below is therefore
+  necessary, not defensive paranoia.
+
+`Files.move` does appear in the class, but only in `moveAsset`/`moveDirectory` —
+renames surface to a watcher as delete + create pairs and should be treated as
+such.
 
 Mitigation:
 
 - On parse failure, do not immediately mark the asset broken. Check mtime/size
-  stability and retry once after ~100 ms.
+  stability and retry once after ~100 ms. **A zero-length JSON file is the expected
+  transient, not a corruption.**
 - Ignore `*.tmp`, `*.swp`, `*~`, and dotfiles by mask.
 - Exclude build output directories (`run/`, `data/`, `build/`, `dist/`,
   `node_modules/`) from the watcher entirely. `run/` in particular is regenerated
