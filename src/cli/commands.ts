@@ -8,8 +8,19 @@ import { AssetArchive, archiveStamp } from "../sources/archive.ts";
 import { detectInstallation } from "../sources/detect.ts";
 import { TELEMETRY_DISCLOSURE, withGeneratedSchemas } from "../sources/schema-gen.ts";
 import { readGeneratedSchemas } from "../sources/schema-doc.ts";
-import { frozenDbPath, frozenKey } from "../util/paths.ts";
+import { formatCount, frozenDbPath, frozenKey } from "../util/paths.ts";
 import { askConsent } from "./consent.ts";
+
+/**
+ * Strips ANSI colour codes.
+ *
+ * The server colours its log output, and the escape sequences survive being piped
+ * into our own output, where they corrupt alignment and leak into log files.
+ */
+function stripAnsi(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/\[[0-9;]*m/g, "");
+}
 
 /** Resolves the archive to index, honouring an explicit override. */
 async function resolveArchive(
@@ -41,7 +52,7 @@ export interface GenerateSchemaArgs {
  * Generates schemas by running the game's own batch mode, then ingests them.
  *
  * Consent is required before anything runs: the generator reports telemetry that
- * cannot be disabled (`docs/init/05-CODEC-EXTRACTION.md` §Hazards).
+ * cannot be disabled (`docs/init/05-CODEC-EXTRACTION.md` Hazards).
  */
 export async function cmdGenerateSchema(args: GenerateSchemaArgs): Promise<number> {
   const install = detectInstallation(args.patchline);
@@ -85,6 +96,7 @@ export async function cmdGenerateSchema(args: GenerateSchemaArgs): Promise<numbe
   const stamp = await archiveStamp(assetsZip);
   const dbPath = frozenDbPath(frozenKey(assetsZip, stamp));
   const db = openDatabase(dbPath);
+  let generatorWarnings = 0;
 
   try {
     const { result, value } = await withGeneratedSchemas(
@@ -94,8 +106,18 @@ export async function cmdGenerateSchema(args: GenerateSchemaArgs): Promise<numbe
         java,
         consent: true,
         ...(args.keep !== undefined ? { keepAt: args.keep } : {}),
+        // The generator emits hundreds of routine warnings -- 437 of 444 lines on
+        // the release corpus -- so echoing anything matching /WARN/ buries the
+        // result it is supposed to surface. Count them, show only what a user
+        // could act on.
         onLine: (line) => {
-          if (/WARN|ERROR|Shutdown/.test(line)) process.stdout.write(`  ${line.trim()}\n`);
+          if (/\bWARN\b/.test(line)) {
+            generatorWarnings++;
+            return;
+          }
+          if (/\bERROR\b|Exception|shutdownReason/.test(line)) {
+            process.stdout.write(`  ${stripAnsi(line).trim()}\n`);
+          }
         },
       },
       (outDir) => {
@@ -116,8 +138,10 @@ export async function cmdGenerateSchema(args: GenerateSchemaArgs): Promise<numbe
       [
         `Generated ${result.schemaCount} schema files in ${(result.elapsedMs / 1000).toFixed(1)}s`,
         `Ingested ${value.ingested.types} types, ` +
-          `${value.ingested.fields.toLocaleString()} fields, ` +
-          `${value.ingested.definitions.toLocaleString()} shared definitions`,
+          `${formatCount(value.ingested.fields)} fields, ` +
+          `${formatCount(value.ingested.definitions)} shared definitions`,
+        `Generator warnings: ${formatCount(generatorWarnings)} (routine; the game reports` +
+          ` duplicate assets and dangling block references in its own corpus)`,
         `Telemetry was sent to Hypixel Studios; this could not be disabled.`,
         args.keep === undefined ? "Temporary files removed." : `Kept at ${args.keep}`,
         "",
@@ -126,7 +150,7 @@ export async function cmdGenerateSchema(args: GenerateSchemaArgs): Promise<numbe
 
     const assigned = applyTypes(db, new TypeResolver(value.set.types));
     if (assigned > 0) {
-      process.stdout.write(`Typed ${assigned.toLocaleString()} already-indexed assets.\n`);
+      process.stdout.write(`Typed ${formatCount(assigned)} already-indexed assets.\n`);
     }
     return 0;
   } finally {
@@ -168,7 +192,7 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
   );
 
   const archive = await AssetArchive.open(archivePath);
-  process.stdout.write(`  ${archive.size.toLocaleString()} entries\n`);
+  process.stdout.write(`  ${formatCount(archive.size)} entries\n`);
 
   const db = openDatabase(dbPath);
   try {
@@ -181,30 +205,30 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
       const ingested = ingestSchemas(db, set);
       resolver = new TypeResolver(set.types);
       process.stdout.write(
-        `  schema: ${ingested.types} types, ${ingested.fields.toLocaleString()} fields, ` +
-          `${ingested.definitions.toLocaleString()} shared definitions\n`,
+        `  schema: ${ingested.types} types, ${formatCount(ingested.fields)} fields, ` +
+          `${formatCount(ingested.definitions)} shared definitions\n`,
       );
       for (const warning of set.warnings) process.stdout.write(`  note: ${warning}\n`);
     } else {
       process.stdout.write(
-        `  schema: not found at ${schemaDir} — assets will be untyped (tier 1)\n`,
+        `  schema: not found at ${schemaDir} -- assets will be untyped (tier 1)\n`,
       );
     }
 
     const result = await buildSearchIndex(archive, db, {
       ...(resolver ? { types: resolver } : {}),
       onProgress: (done, total) => {
-        process.stdout.write(`\r  parsed ${done.toLocaleString()} / ${total.toLocaleString()}`);
+        process.stdout.write(`\r  parsed ${formatCount(done)} / ${formatCount(total)}`);
       },
     });
     process.stdout.write("\r".padEnd(48) + "\r");
     process.stdout.write(
       [
-        `Indexed ${result.assets.toLocaleString()} assets ` +
-          `(${result.typed.toLocaleString()} typed, ${result.localized.toLocaleString()} localized)`,
+        `Indexed ${formatCount(result.assets)} assets ` +
+          `(${formatCount(result.typed)} typed, ${formatCount(result.localized)} localized)`,
         `Localization: ${result.locales.length} locales, ` +
-          `${result.langKeys.toLocaleString()} keys, ` +
-          `${result.ftsRows.toLocaleString()} search rows`,
+          `${formatCount(result.langKeys)} keys, ` +
+          `${formatCount(result.ftsRows)} search rows`,
         `Locales: ${result.locales.join(", ")}`,
         `Elapsed: ${(result.elapsedMs / 1000).toFixed(1)}s`,
         `Cache:   ${dbPath}`,
@@ -264,7 +288,7 @@ interface EvalCase {
   readonly expected_any: readonly string[];
   /** Assets that must appear too, for disambiguation cases. */
   readonly expected_also?: readonly string[];
-  /** Assets that must not be the top result — noise, prototypes, test fixtures. */
+  /** Assets that must not be the top result -- noise, prototypes, test fixtures. */
   readonly must_not_rank_first?: readonly string[];
 }
 
@@ -273,7 +297,7 @@ interface EvalCase {
  *
  * Reports recall@5 **per tier**, never as one number: the aggregate is dominated
  * by `lexical-id`, which passes under every configuration, and would mask total
- * failure on `lexical-name` — the tier the whole localization design rests on.
+ * failure on `lexical-name` -- the tier the whole localization design rests on.
  */
 export async function cmdEval(args: {
   assets?: string;
@@ -301,11 +325,11 @@ export async function cmdEval(args: {
       }
       // `expected_also` means "the other sense must also surface", so ANY of the
       // listed assets satisfies it. Requiring all of them tested something else
-      // entirely — that one family occupies most of the page — which is the
+      // entirely -- that one family occupies most of the page -- which is the
       // opposite of what a disambiguation case is for.
       const also = c.expected_also ?? [];
       if (also.length > 0 && !also.some((id) => ids.includes(id))) {
-        reasons.push(`second sense missing (any of ${also.slice(0, 2).join(", ")}…)`);
+        reasons.push(`second sense missing (any of ${also.slice(0, 2).join(", ")})`);
       }
       const top = ids[0];
       if (top !== undefined && (c.must_not_rank_first ?? []).includes(top)) {
@@ -328,7 +352,7 @@ export async function cmdEval(args: {
       const pct = ((r.pass / r.total) * 100).toFixed(0).padStart(3);
       process.stdout.write(`  ${tier.padEnd(22)} ${String(r.pass).padStart(2)}/${r.total}  ${pct}%\n`);
     }
-    process.stdout.write(`  ${"(all)".padEnd(22)} ${totalPass}/${total}\n`);
+    process.stdout.write(`  ${"(all)".padEnd(22)} ${totalPass}/${formatCount(total)}\n`);
 
     const failed = [...byTier].filter(([, r]) => r.failures.length > 0);
     if (failed.length > 0) {
@@ -342,3 +366,4 @@ export async function cmdEval(args: {
     db.close();
   }
 }
+

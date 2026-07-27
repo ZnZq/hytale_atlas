@@ -12,6 +12,17 @@ import { SCHEMA_VERSION } from "../db/schema.ts";
  * heavy and nobody uses it twice (`docs/init/06-CLI-UX.md` §Cache layout).
  */
 
+/**
+ * Groups digits with a plain comma.
+ *
+ * Not `toLocaleString()`: on a machine with a non-English locale it emits a
+ * narrow no-break space, which Windows consoles render as mojibake — `14 628`
+ * came out as `14Â 628`. Output is for a terminal, so it stays ASCII.
+ */
+export function formatCount(n: number): string {
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
 export function cacheRoot(): string {
   const override = process.env["HYTALE_ATLAS_CACHE"];
   if (override) return override;
