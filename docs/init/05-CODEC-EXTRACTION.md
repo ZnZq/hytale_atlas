@@ -126,9 +126,28 @@ so give it a scratch working directory of its own, not the user's project.
 
 ### 3. `common.json` is not valid JSON
 
-It contains bare `NaN` (and potentially `Infinity`), which `JSON.parse` rejects.
-103 of 104 files parse strictly; `common.json` needs `NaN`/`Infinity` replaced with
-`null` first. Handle it in the reader rather than hoping it is fixed upstream.
+It contains bare `NaN`, which `JSON.parse` rejects. Measured on the release
+patchline: **103 of 104 files parse strictly; `common.json` has exactly three
+occurrences**, all in one place —
+
+```
+/definitions/RailPoint/properties/Normal/default/{X,Y,Z}
+```
+
+— a rail point's normal vector with no meaningful default. `Infinity` does not
+currently appear but is the same class of defect.
+
+**Do not repair this with a regex.** The obvious
+`/(?<=[:\[,\s])(NaN|Infinity)/ → null` happens to work on today's input, but the
+same corpus contains **640 occurrences of these words inside string literals** —
+field descriptions are prose, and one reading *"the value NaN, which means…"* would
+be silently corrupted. The reader must track string state.
+
+Implemented in `src/util/json.ts` (`parseJsonLenient`), which is string-aware and
+**reports** repairs as JSON Pointers rather than applying them silently: a `default`
+that was `NaN` means *unset*, which is a more useful thing to tell a pack author
+than `default: null`. `src/util/json.integration.test.ts` re-checks the whole
+schema set and fails if the shape of the defect changes after a patchline update.
 
 ---
 
