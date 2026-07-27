@@ -38,6 +38,20 @@ export interface SchemaField {
   readonly description: string | null;
   readonly inheritsProperty: boolean;
   readonly mergesProperties: boolean;
+  /**
+   * Asset type this field references, from `hytale.hytaleAssetRef`.
+   *
+   * The declaration that makes a reference edge a fact rather than a guess. 932
+   * fields carry it, naming 70 distinct targets -- `RootInteraction` (252),
+   * `Interaction` (211), `SoundEvent` (81), `Item` (37), `ParticleSystem` (31).
+   *
+   * An earlier revision of this project concluded the generated schema does not
+   * mark reference targets, and recorded that in the design documents. That was
+   * wrong: the marker exists, it was simply not the key being looked for
+   * (`hytale.type` is a JSON-type marker, `uiEditorComponent` is mostly numeric
+   * widget configuration). See `docs/init/OPEN-QUESTIONS.md` Q17.
+   */
+  readonly referenceTarget: string | null;
 }
 
 export interface SchemaDefinition {
@@ -210,6 +224,10 @@ function emit(
     description: asString(node["markdownDescription"]) ?? asString(node["description"]),
     inheritsProperty: meta?.["inheritsProperty"] === true,
     mergesProperties: meta?.["mergesProperties"] === true,
+    // A SIBLING of the `hytale` block, not a member of it. Reading it from inside
+    // `hytale` silently yields null for all 932 fields, which is exactly how this
+    // was first written.
+    referenceTarget: asString(node["hytaleAssetRef"]),
   });
 }
 

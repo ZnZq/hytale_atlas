@@ -216,7 +216,7 @@ export async function buildSearchIndex(
         " ON CONFLICT (pack_id, path) DO NOTHING",
     );
     const insCandidate = db.prepare(
-      "INSERT INTO candidates (asset_id, json_pointer, raw_value) VALUES (?,?,?)",
+      "INSERT INTO candidates (asset_id, json_pointer, schema_pointer, raw_value) VALUES (?,?,?,?)",
     );
     const assetIdOf = db.prepare("SELECT id FROM assets WHERE pack_id = 1 AND path = ?");
     const insFts = db.prepare(
@@ -256,7 +256,7 @@ export async function buildSearchIndex(
         const row = assetIdOf.get(entry.path) as { id: number } | undefined;
         if (row !== undefined) {
           for (const candidate of collectCandidates(doc)) {
-            insCandidate.run(row.id, candidate.pointer, candidate.value);
+            insCandidate.run(row.id, candidate.pointer, candidate.schemaPointer, candidate.value);
             candidates++;
           }
         }

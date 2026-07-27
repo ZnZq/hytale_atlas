@@ -18,7 +18,21 @@ import type { Database } from "../db/open.ts";
 
 export interface Candidate {
   readonly pointer: string;
+  /** `pointer` with array indices collapsed to `*`, matching schema_fields. */
+  readonly schemaPointer: string;
   readonly value: string;
+}
+
+/**
+ * Collapses array indices so a document location can be joined to a schema field.
+ *
+ * `/Recipe/Input/0/ItemId` becomes `/Recipe/Input/*​/ItemId`. Dynamic map keys are
+ * not collapsed here: at extraction time a map key is indistinguishable from a
+ * property name without consulting the schema, so those simply fail to join and
+ * fall back to the heuristic tier.
+ */
+export function toSchemaPointer(pointer: string): string {
+  return pointer.replace(/\/\d+(?=\/|$)/g, "/*");
 }
 
 /** Values too generic to be worth recording as possible references. */
@@ -49,7 +63,7 @@ export function collectCandidates(node: unknown, pointer = "", out: Candidate[] 
       trimmed.length <= MAX_CANDIDATE_LENGTH &&
       !NOISE_VALUES.has(trimmed.toLowerCase())
     ) {
-      out.push({ pointer, value: trimmed });
+      out.push({ pointer, schemaPointer: toSchemaPointer(pointer), value: trimmed });
     }
     return out;
   }
@@ -157,14 +171,27 @@ export function resolveCandidates(db: Database): ResolveResult {
        WHERE c.raw_value LIKE '%.%' AND c.raw_value NOT LIKE '% %'
     `);
 
-    // Asset references. Confidence is assigned from the pointer, since the schema
-    // does not declare which fields are references.
+    // Asset references.
+    //
+    // Confidence comes from the schema where it can. `hytale.hytaleAssetRef` names
+    // the asset type a field points at -- 932 fields across 70 targets -- so a
+    // value landing in such a field is a declared reference, not a string that
+    // happened to collide with an identifier.
+    //
+    //   high    the field declares a target type AND the matched asset is of it
+    //   medium  the field declares a target type but the match is a different
+    //           type, or the field name follows a naming convention
+    //   low     neither: the value merely collides with some identifier
+    //
+    // The medium/type-mismatch case is worth keeping rather than dropping: it is
+    // how a reference pointing at the wrong kind of asset becomes visible.
     db.exec(`
       INSERT INTO edges (src, dst, kind, json_pointer, confidence)
       SELECT c.asset_id, a.id, 'REFERENCES', c.json_pointer,
              CASE
-               WHEN c.json_pointer LIKE '%/Id'
-                 OR c.json_pointer LIKE '%Id'
+               WHEN sf.reference_target IS NOT NULL AND sf.reference_target = a.type THEN 'high'
+               WHEN sf.reference_target IS NOT NULL THEN 'medium'
+               WHEN c.json_pointer LIKE '%Id'
                  OR c.json_pointer LIKE '%/Set'
                  OR c.json_pointer LIKE '%/Model'
                  OR c.json_pointer LIKE '%/BlockType'
@@ -174,6 +201,11 @@ export function resolveCandidates(db: Database): ResolveResult {
              END
         FROM candidates c
         JOIN assets a ON a.logical_id = c.raw_value
+        JOIN assets src ON src.id = c.asset_id
+        LEFT JOIN schema_fields sf
+               ON sf.asset_type = src.type
+              AND sf.json_pointer = c.schema_pointer
+              AND sf.reference_target IS NOT NULL
        WHERE c.json_pointer <> '/Parent' AND a.id <> c.asset_id
     `);
 

@@ -21,7 +21,7 @@
  * makes a bump orphan old databases rather than silently reusing one whose shape
  * no longer matches.
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 export const SCHEMA_SQL = `
 -- ---------------------------------------------------------------------------
@@ -172,7 +172,17 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE TABLE IF NOT EXISTS candidates (
   id               INTEGER PRIMARY KEY,
   asset_id         INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  -- Where the value literally sits, array indices included, so a broken entry can
+  -- be named exactly rather than as "one of Recipe.Input".
   json_pointer     TEXT NOT NULL,
+  -- The same location with array indices collapsed to a star, which is the form
+  -- schema_fields uses. Stored rather than computed in SQL because SQLite has no
+  -- regex replace, and this is the join key that attaches declared reference
+  -- types to observed values.
+  --
+  -- (No backticks in this file: SCHEMA_SQL is a template literal, and one here
+  -- silently terminates it -- the compiler then reads the SQL as arithmetic.)
+  schema_pointer   TEXT NOT NULL DEFAULT '',
   raw_value        TEXT NOT NULL,
   resolved_edge_id INTEGER REFERENCES edges(id) ON DELETE SET NULL,
   dangling         INTEGER NOT NULL DEFAULT 0
@@ -198,6 +208,10 @@ CREATE TABLE IF NOT EXISTS schema_fields (
   enum_values       TEXT,
   title             TEXT,
   description       TEXT,
+  -- Asset type this field points at, from hytale.hytaleAssetRef. 932 fields carry
+  -- it across 70 distinct targets. This is what turns a reference edge from a
+  -- string-collision guess into a declared fact.
+  reference_target  TEXT,
   -- Per-field inheritance semantics from hytale.inheritsProperty /
   -- hytale.mergesProperties. Answers OPEN-QUESTIONS.md Q18 at field granularity.
   inherits_property INTEGER NOT NULL DEFAULT 0,
@@ -237,6 +251,8 @@ CREATE TABLE IF NOT EXISTS field_stats (
 CREATE INDEX IF NOT EXISTS idx_edges_src        ON edges (src, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_dst        ON edges (dst, kind);
 CREATE INDEX IF NOT EXISTS idx_candidates_value ON candidates (raw_value);
+CREATE INDEX IF NOT EXISTS idx_candidates_schema_ptr ON candidates (schema_pointer);
+CREATE INDEX IF NOT EXISTS idx_schema_fields_ref ON schema_fields (reference_target);
 CREATE INDEX IF NOT EXISTS idx_candidates_asset ON candidates (asset_id);
 CREATE INDEX IF NOT EXISTS idx_assets_logical   ON assets (logical_id);
 CREATE INDEX IF NOT EXISTS idx_assets_epoch     ON assets (last_changed_epoch);
