@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { detectInstallation, detectProject } from "../sources/detect.ts";
-import { cmdEval, cmdGenerateSchema, cmdIndex, cmdSearch } from "./commands.ts";
+import { cmdEval, cmdGenerateSchema, cmdGet, cmdIndex, cmdSearch } from "./commands.ts";
 
 /**
  * CLI entry point.
@@ -17,6 +17,8 @@ const USAGE = `hytale-atlas — unofficial local index of Hytale assets
   hytale-atlas status          Sources, patchline, tier, epoch, coverage
   hytale-atlas index           Build the corpus index (cached globally)
   hytale-atlas search <query>  Search assets in any indexed locale
+  hytale-atlas get <id>        Effective definition, with the parent chain resolved
+                               (the only high-token command)
   hytale-atlas eval            Run the search evaluation set, recall@5 per tier
   hytale-atlas generate-schema Run the game's own schema generator, then ingest
                                (starts the server binary; it sends telemetry)
@@ -151,6 +153,14 @@ function main(): number | Promise<number> {
       }
       return cmdSearch(query, opts(args));
     }
+    case "get": {
+      const id = args.rest[0];
+      if (id === undefined) {
+        process.stderr.write("usage: hytale-atlas get <asset-id>\n");
+        return 2;
+      }
+      return cmdGet(id, opts(args));
+    }
     case "eval":
       return cmdEval(opts(args));
     case "generate-schema":
@@ -187,6 +197,7 @@ function opts(args: Args) {
     ...(args.flags.has("force") ? { force: true } : {}),
     ...(args.flags.has("yes") ? { yes: true } : {}),
     ...(args.flags.has("dry-run") ? { dryRun: true } : {}),
+    ...(args.flags.has("raw") ? { raw: true } : {}),
   };
 }
 

@@ -3,6 +3,7 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 import { openDatabase } from "../db/open.ts";
 import { buildSearchIndex } from "../indexer/corpus.ts";
 import { TypeResolver, applyTypes, ingestSchemas } from "../indexer/schema.ts";
+import { type AssetLoader, resolveAsset } from "../query/asset.ts";
 import { searchAssets } from "../query/search.ts";
 import { AssetArchive, archiveStamp } from "../sources/archive.ts";
 import { detectInstallation } from "../sources/detect.ts";
@@ -278,6 +279,75 @@ export async function cmdSearch(
     db.close();
   }
   return 0;
+}
+
+/**
+ * Prints an asset's effective definition, with the parent chain resolved.
+ *
+ * The only high-token command, and the tool description must say so: everything
+ * else returns summaries (`docs/init/04-MCP-SURFACE.md` Context discipline).
+ */
+export async function cmdGet(
+  logicalId: string,
+  args: { assets?: string; patchline?: string; raw?: boolean },
+): Promise<number> {
+  const archivePath = openFrozen(args.assets, args.patchline);
+  const db = await frozenDb(args.assets, args.patchline);
+  const archive = await AssetArchive.open(archivePath);
+
+  try {
+    const byId = db.prepare(
+      "SELECT path, type FROM assets WHERE logical_id = ? ORDER BY is_effective DESC LIMIT 1",
+    );
+
+    const load: AssetLoader = async (id) => {
+      const row = byId.get(id) as { path: string; type: string | null } | undefined;
+      if (row === undefined) return null;
+      try {
+        return { path: row.path, type: row.type, document: JSON.parse(await archive.readText(row.path)) };
+      } catch {
+        return null;
+      }
+    };
+
+    const resolved = await resolveAsset(db, logicalId, load);
+    if (resolved === null) {
+      process.stderr.write(`No asset '${logicalId}'. Try 'hytale-atlas search ${logicalId}'.\n`);
+      return 1;
+    }
+
+    if (args.raw) {
+      process.stdout.write(`${JSON.stringify(resolved.effective, null, 2)}\n`);
+      return 0;
+    }
+
+    const header = [
+      `${resolved.logicalId}   type=${resolved.type ?? "(untyped)"}`,
+      `  ${resolved.path}`,
+    ];
+    if (resolved.parentChain.length > 0) {
+      header.push(`  inherits: ${resolved.parentChain.join(" <- ")}`);
+    }
+    if (resolved.missingParent !== null) {
+      header.push(`  BROKEN: parent '${resolved.missingParent}' does not exist`);
+    }
+    if (resolved.truncated) {
+      header.push("  WARNING: parent chain is cyclic or deeper than the limit");
+    }
+
+    const inherited = resolved.origins.filter((o) => o.via !== "declared");
+    if (inherited.length > 0) {
+      header.push(
+        `  ${inherited.length} field(s) come from ancestors; the file on disk declares fewer`,
+      );
+    }
+    process.stdout.write(`${header.join("\n")}\n\n`);
+    process.stdout.write(`${JSON.stringify(resolved.effective, null, 2)}\n`);
+    return 0;
+  } finally {
+    archive.close();
+    db.close();
+  }
 }
 
 interface EvalCase {
