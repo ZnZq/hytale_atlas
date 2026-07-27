@@ -16,12 +16,21 @@ import {
   looksMangled,
   normalizeFieldPointer,
   pointersLike,
-  searchSchemaDetailed,
 } from "../query/schema.ts";
 import { AssetArchive, archiveStamp } from "../sources/archive.ts";
 import { detectInstallation } from "../sources/detect.ts";
 import { TELEMETRY_DISCLOSURE, withGeneratedSchemas } from "../sources/schema-gen.ts";
 import { readGeneratedSchemas } from "../sources/schema-doc.ts";
+import {
+  benchDeclaredBy,
+  langOp,
+  refsOp,
+  searchAssetsOp,
+  searchSchemaOp,
+  undocumentedOp,
+} from "../api/operations.ts";
+import type { Caveat } from "../api/types.ts";
+import { referenceToKey } from "../sources/lang.ts";
 import { formatCount, frozenDbPath, frozenKey } from "../util/paths.ts";
 import { askConsent } from "./consent.ts";
 
@@ -66,6 +75,22 @@ function clip(text: string, max: number): string {
  * at to firm up a negative. Over-fetching by one is what makes "there is more"
  * knowable without a second query.
  */
+/**
+ * Prints the caveats an operation returned.
+ *
+ * The CLI does not decide what qualifies an answer -- it renders decisions made
+ * in `src/api`. That is the point of the split: an MCP server serialising the
+ * same `Caveat[]` cannot drift from what the CLI says, and nearly every defect
+ * this tool has had was a statement rather than a computation.
+ */
+function renderCaveats(caveats: readonly Caveat[]): void {
+  if (caveats.length === 0) return;
+  process.stdout.write("\n");
+  for (const c of caveats) {
+    process.stdout.write(`${c.code === "truncated" ? "... " : "note: "}${c.message}\n`);
+  }
+}
+
 function noticeTruncated(shown: number, hadMore: boolean, what: string): void {
   if (!hadMore) return;
   process.stdout.write(
@@ -217,6 +242,7 @@ export interface IndexArgs {
   readonly force?: boolean;
   /** Directory produced by `--generate-asset-schema`. */
   readonly schema?: string;
+  readonly dryRun?: boolean;
 }
 
 /**
@@ -233,6 +259,22 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
   const stamp = await archiveStamp(archivePath);
   const key = frozenKey(archivePath, stamp);
   const dbPath = frozenDbPath(key);
+
+  // --dry-run is documented as a global option and was read only by
+  // generate-schema. `index --force --dry-run` therefore ran the real 40-second
+  // pipeline and rewrote the cache, having promised to "print the command that
+  // would run, and exit".
+  if (args.dryRun) {
+    process.stdout.write(
+      `Would ${existsSync(dbPath) && !args.force ? "reuse" : "build"} the index:\n` +
+        `  source: ${archivePath}\n` +
+        `  target: ${dbPath}\n` +
+        `  schema: ${args.schema ?? DEFAULT_SCHEMA_DIR}` +
+        `${existsSync(args.schema ?? DEFAULT_SCHEMA_DIR) ? "" : " (absent -- assets would be untyped)"}\n` +
+        (existsSync(dbPath) && !args.force ? "Already built; --force would rebuild it.\n" : ""),
+    );
+    return 0;
+  }
 
   if (existsSync(dbPath) && !args.force) {
     process.stdout.write(`Index already built: ${dbPath}\nUse --force to rebuild.\n`);
@@ -423,11 +465,25 @@ export async function cmdSearch(
 ): Promise<number> {
   const db = await frozenDb(args.assets, args.patchline);
   try {
-    const limit = args.limit ?? 20;
-    const found = searchAssets(db, query, { limit: limit + 1 });
-    const hits = found.slice(0, limit);
+    const { value: hits, caveats } = searchAssetsOp(db, query, args.limit ?? 20);
     if (hits.length === 0) {
-      process.stdout.write("No matches.\n");
+      // Said "No matches." and stopped, which reads as "this string appears
+      // nowhere". It indexes identifiers and localized names, not field VALUES:
+      // searching a sound-set id returned the set itself and none of the three
+      // items referencing it, and searching a literal interaction value returned
+      // nothing at all. Both agents inferred the limitation from repeated empty
+      // results rather than being told.
+      process.stdout.write(
+        `No asset is named "${query}", in any indexed locale.\n\n` +
+          // Wording comes from the operation layer, so the MCP server states the
+          // same limitation rather than a paraphrase of it.
+          `${caveats.map((c) => c.message).join("\n")}\n\n`.replace(
+            "not field values.",
+            "NOT field values.",
+          ) +
+          `  hytale-atlas refs ${query.split(/\s+/)[0]}    what references that asset\n` +
+          "  hytale-atlas search-schema <words>   where a capability is declared\n",
+      );
       return 1;
     }
     // The asset type is printed, not just the id. Searching "pickaxe" returns
@@ -441,7 +497,7 @@ export async function cmdSearch(
           `[${hit.locale}] ${hit.displayName}${relaxed}\n`,
       );
     }
-    noticeTruncated(hits.length, found.length > limit, "matches");
+    renderCaveats(caveats);
   } finally {
     db.close();
   }
@@ -464,20 +520,24 @@ export async function cmdGet(
 
   try {
     // `--type` picks among same-named assets; without it the first effective one
-    // wins, as before.
+    // wins.
+    //
+    // The ORDER BY must match the disambiguation note's exactly. It did not: the
+    // note ordered by (is_effective, type) and the loader by is_effective alone,
+    // leaving SQLite to break the tie by rowid. So `get Plant_Bush` announced
+    // "Showing the Item one" and then printed the ItemDropList -- handing over the
+    // wrong file while stating the right one.
+    const PICK_ORDER = "ORDER BY is_effective DESC, type";
     const byId = db.prepare(
       "SELECT path, type FROM assets WHERE logical_id = ?1" +
-        " AND (?2 IS NULL OR type = ?2) ORDER BY is_effective DESC LIMIT 1",
+        ` AND (?2 IS NULL OR type = ?2) ${PICK_ORDER} LIMIT 1`,
     );
 
     // Identifiers are not unique across types. `get Pickaxe_Mine` returned a
     // CameraEffect to an agent chasing an Interaction, with nothing to say a
     // choice had been made -- so it concluded the interaction chain was broken.
     const sameName = db
-      .prepare(
-        `SELECT type, path FROM assets WHERE logical_id = ?
-          ORDER BY is_effective DESC, type LIMIT 8`,
-      )
+      .prepare(`SELECT type, path FROM assets WHERE logical_id = ? ${PICK_ORDER} LIMIT 8`)
       .all(logicalId) as unknown as { type: string | null; path: string }[];
     if (sameName.length > 1 && args.type === undefined) {
       process.stderr.write(
@@ -671,6 +731,144 @@ export async function cmdBench(
   }
 }
 
+/**
+ * What references an asset -- the inbound half of the graph.
+ *
+ * The index built 162 899 edges and exposed none of them. `status` reported the
+ * count, so the graph was visibly there and unreachable, and the only substitute
+ * was `search`, which indexes NAMES rather than values: searching for a sound-set
+ * id returned the set itself and none of the three items that reference it, with
+ * no indication anything was missing. A clean single result for a widely-used
+ * value functionally asserts "nothing else uses this", which was false.
+ */
+export async function cmdRefs(
+  logicalId: string,
+  args: { assets?: string; patchline?: string; type?: string; limit?: number },
+): Promise<number> {
+  const db = await frozenDb(args.assets, args.patchline);
+  try {
+    const { value, caveats } = refsOp(db, logicalId, args.type, args.limit ?? 40);
+
+    if (value.targets.length === 0) {
+      // Not every string is an asset. `search-schema` says "use refs <id>" for a
+      // value list, but a bench category or a bench id is a plain string nested in
+      // another asset's field -- so `refs Workbench_Tools` failed and suggested
+      // `search`, which suggested `refs` back. Two commands handing off to each
+      // other, neither able to say the thing is not an asset at all.
+      const asValue = db
+        .prepare(
+          `SELECT c.schema_scope, c.schema_pointer, count(*) AS n
+             FROM candidates c
+            WHERE c.raw_value = ? AND c.schema_scope IS NOT NULL
+            GROUP BY c.schema_scope, c.schema_pointer
+            ORDER BY n DESC LIMIT 3`,
+        )
+        .all(logicalId) as unknown as {
+        schema_scope: string;
+        schema_pointer: string;
+        n: number;
+      }[];
+
+      if (asValue.length > 0) {
+        const total = asValue.reduce((sum, r) => sum + r.n, 0);
+        process.stderr.write(
+          `'${logicalId}' is not an asset. ${formatCount(total)} assets carry it as a VALUE:\n` +
+            asValue
+              .map((r) => `  ${formatCount(r.n)}x  ${r.schema_scope} :: ${r.schema_pointer}\n`)
+              .join("") +
+            "\nReferences track asset ids. For a value like this, describe the field\n" +
+            `that holds it: hytale-atlas describe ${asValue[0]!.schema_scope} ` +
+            `--field ${asValue[0]!.schema_pointer}\n`,
+        );
+        return 1;
+      }
+
+      process.stderr.write(
+        `No asset '${logicalId}'${args.type ? ` of type '${args.type}'` : ""}, ` +
+          "and nothing carries it as a value.\n" +
+          `Try 'hytale-atlas search ${logicalId}'.\n`,
+      );
+      return 1;
+    }
+
+    // A bench is referenced by the id it DECLARES, not by the id of the asset
+    // declaring it, so `refs Bench_WorkBench` returned one unrelated edge while 49
+    // recipes required that bench. Say so rather than let a complete-looking
+    // answer stand.
+    const declares = benchDeclaredBy(db, logicalId);
+    if (declares !== null) {
+      process.stdout.write(
+        `note: this asset declares the bench id '${declares}'. Recipes reference that\n` +
+          `      id rather than this asset, so they are NOT listed below.\n` +
+          `      Use: hytale-atlas bench ${declares}\n\n`,
+      );
+    }
+
+    if (value.total === 0) {
+      process.stdout.write(`Nothing references '${logicalId}'.\n`);
+    } else {
+      process.stdout.write(`${formatCount(value.total)} references to '${logicalId}':\n\n`);
+      for (const r of value.references) {
+        process.stdout.write(
+          `${r.confidence.padEnd(7)} ${r.logicalId.padEnd(34)} ` +
+            `${(r.type ?? "(untyped)").padEnd(20)} ${r.kind} ${r.pointer ?? ""}\n`,
+        );
+      }
+    }
+
+    // Confidence is not decoration. A declared reference is a fact the schema
+    // states; a heuristic one is a name that happens to collide, and 'Stone'
+    // collides with a great many things.
+    process.stdout.write(
+      "\nhigh   = declared by the schema, or inheritance the engine resolves itself\n" +
+        "medium = the field name follows a reference convention\n" +
+        "low    = the value merely collides with an identifier; often coincidence\n",
+    );
+    renderCaveats(caveats);
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+export async function cmdLang(
+  query: string,
+  args: { assets?: string; patchline?: string; limit?: number },
+): Promise<number> {
+  const db = await frozenDb(args.assets, args.patchline);
+  try {
+    const { value: entries, caveats } = langOp(db, query, args.limit ?? 20);
+    if (entries.length === 0) {
+      process.stdout.write(
+        `No localization key or value matches "${query}".\n\n` +
+          "Keys are stored WITHOUT their root: an asset referencing\n" +
+          "'server.items.Foo.name' is stored as 'items.Foo.name'. Both forms are\n" +
+          "accepted here, so this is a real miss rather than a prefix problem.\n",
+      );
+      return 1;
+    }
+    for (const entry of entries) {
+      process.stdout.write(`${entry.key}\n`);
+      for (const t of entry.translations) {
+        process.stdout.write(`    ${t.locale.padEnd(7)} ${t.value}\n`);
+      }
+      for (const u of entry.usedBy) {
+        process.stdout.write(`    used by ${u.logicalId} ${u.pointer ?? ""}\n`);
+      }
+      // Said rather than left blank: a key with no inbound edge is normal (UI
+      // text, or referenced by something the index does not type), and silence
+      // would read as "nothing uses this".
+      if (entry.usedBy.length === 0) {
+        process.stdout.write("    used by nothing indexed (UI text, or referenced dynamically)\n");
+      }
+    }
+    renderCaveats(caveats);
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
 export async function cmdDescribe(
   assetType: string,
   args: { assets?: string; patchline?: string; field?: string; limit?: number },
@@ -684,6 +882,40 @@ export async function cmdDescribe(
           `Reading it as '${field}'.\n` +
           `      Under Git Bash, write --field ${field?.slice(1)} without the leading slash.\n`,
       );
+    }
+
+    // A type that is nothing but a union of branches has no fields of its own, so
+    // describing it printed a wall of `UNDECLARED` observed-only rows -- while
+    // `describe common:ApplyEffectInteraction` showed the same fields fully
+    // declared. Two commands contradicting each other, and the "did you mean"
+    // steered readers toward the worse view. The schema states the branches and
+    // the discriminator; print those instead.
+    const union = db
+      .prepare(
+        `SELECT ref_scope, discriminator_property, discriminator_values
+           FROM schema_fields
+          WHERE asset_type = ? AND json_pointer = '' AND ref_scope IS NOT NULL`,
+      )
+      .get(assetType) as Record<string, unknown> | undefined;
+
+    if (union !== undefined && field === undefined) {
+      const branches = String(union["ref_scope"] ?? "").split(" ").filter(Boolean);
+      const values = String(union["discriminator_values"] ?? "").split(" ").filter(Boolean);
+      const property = (union["discriminator_property"] as string | null) ?? "Type";
+      process.stdout.write(
+        `'${assetType}' is a union of ${branches.length} shapes, chosen by the ` +
+          `'${property}' field.\nIt declares no field of its own -- describe a branch ` +
+          `to see fields.\n\n`,
+      );
+      const width = Math.max(...values.map((v) => v.length), 8);
+      for (const [i, branch] of branches.entries()) {
+        process.stdout.write(`${(values[i] ?? "?").padEnd(width)}  hytale-atlas describe ${branch}\n`);
+      }
+      process.stdout.write(
+        `\nThose ${values.length} values are the complete legal set for '${property}' here: ` +
+          `the schema declares them, they are not inferred from the corpus.\n`,
+      );
+      return 0;
     }
 
     const fields = describeSchema(db, assetType, field);
@@ -794,6 +1026,19 @@ export async function cmdDescribe(
           `    used in ${formatCount(o.assets)} assets` +
             (o.targetTypes ? `, points at ${o.targetTypes.join("/")}` : "") + "\n",
         );
+        // Above the enum threshold the values are not stored, so the line simply
+        // vanished -- no list, no count, no caveat, while a neighbouring field
+        // with 33 values printed all of them. Two agents independently read the
+        // silence as "this field has no values", on the two fields that mattered
+        // most to them: MaterialQuantity/ItemId (1,194 uses) and
+        // ApplyEffectInteraction/EffectId (123 uses).
+        if (o.values === null && o.cardinality > 0 && d?.enumValues == null) {
+          process.stdout.write(
+            `    ${formatCount(o.cardinality)} distinct values -- too many to list. ` +
+              `Use 'refs <id>' to ask the\n    reverse question: which assets name a ` +
+              `particular one.\n`,
+          );
+        }
       } else if (container && args.field !== undefined) {
         // Absence here means nothing, and saying nothing invited the opposite
         // reading: a sibling container that HAD been used as a string reference
@@ -815,6 +1060,17 @@ export async function cmdDescribe(
           `Use --limit ${fields.length} for all, or --field <pointer> for one.\n`,
       );
     }
+    // The observed layer counts what files LITERALLY contain. `get` resolves the
+    // parent chain first. So a field every crop appears to set can show two
+    // occurrences here, because the other crops inherit it -- and an agent
+    // reasonably read that as this command being wrong.
+    if (fields.some((f) => f.observed !== null)) {
+      process.stdout.write(
+        "\n'used in N assets' counts files that declare the field themselves.\n" +
+          "'get' resolves inheritance first, so it can show a value on assets that\n" +
+          "are not counted here.\n",
+      );
+    }
     return 0;
   } finally {
     db.close();
@@ -828,21 +1084,16 @@ export async function cmdSearchSchema(
 ): Promise<number> {
   const db = await frozenDb(args.assets, args.patchline);
   try {
-    const schemaLimit = args.limit ?? 20;
-    const detailed = searchSchemaDetailed(db, query, schemaLimit + 1);
-    const { relaxation, widened } = detailed;
-    const hits = detailed.hits.slice(0, schemaLimit);
+    const { value: hits, caveats } = searchSchemaOp(db, query, args.limit ?? 20);
     if (hits.length === 0) {
-      // Previously: "That is itself an answer: nothing in any asset type declares
-      // this capability." That is a semantic claim drawn from a lexical match, and
-      // one missed query does not rule out the capability existing under other
-      // words. An agent that triangulated anyway found the claim held -- but it
-      // was trusting more than had been checked, which is the same overreach as
-      // 'unused' and the old search_schema behaviour.
+      // "That is itself an answer: nothing declares this capability" was a
+      // semantic claim drawn from a lexical match. The hedge now travels as a
+      // caveat, so an MCP client receives the same qualification rather than a
+      // paraphrase of it.
+      process.stdout.write(`No schema field matches "${query}".\n\n`);
+      renderCaveats(caveats);
       process.stdout.write(
-        `No schema field matches "${query}".\n\n` +
-          "This is evidence, not proof. The index is lexical: a capability spelled\n" +
-          "in other words would not match. Before concluding it does not exist:\n" +
+        "\nBefore concluding it does not exist:\n" +
           "  - try the words the game might use instead (Radius, Shape, Extent)\n" +
           "  - list the types that would own it: describe <Type> --limit 200\n" +
           "  - check for declared-but-unused fields: undocumented <Type>\n",
@@ -850,17 +1101,10 @@ export async function cmdSearchSchema(
       return 1;
     }
     // A loosened match is a different kind of answer and must not look like an
-    // exact one. Searching "quarry" returned CurveType, EasingType and
-    // MoonPhaseWeightModifiers -- suffix-trimming had reduced the term until
-    // something matched, and nothing in the output said so, which is worse than
-    // the honest "no match" the same command gives for other queries.
-    if (relaxation > 0 || widened) {
-      process.stdout.write(
-        `Nothing matched "${query}" as written. ` +
-          (widened ? "Showing fields matching ANY term" : "Showing loosened matches") +
-          `${relaxation > 0 ? ` (word endings trimmed ${relaxation}x)` : ""}` +
-          ` -- these may be unrelated.\n\n`,
-      );
+    // exact one, so the caveat is printed BEFORE the rows rather than after.
+    const relaxed = caveats.filter((c) => c.code === "relaxed");
+    if (relaxed.length > 0) {
+      process.stdout.write(`${relaxed.map((c) => c.message).join("\n")}\n\n`);
     }
     for (const h of hits) {
       process.stdout.write(`${(h.assetType + h.pointer).padEnd(56)} ${h.title ?? ""}\n`);
@@ -868,7 +1112,7 @@ export async function cmdSearchSchema(
         process.stdout.write(`    ${clip(h.description, 130)}\n`);
       }
     }
-    noticeTruncated(hits.length, detailed.hits.length > schemaLimit, "fields");
+    renderCaveats(caveats.filter((c) => c.code !== "relaxed"));
     return 0;
   } finally {
     db.close();
@@ -928,9 +1172,8 @@ export async function cmdUndocumented(args: {
       }
     }
 
-    const undocLimit = args.limit ?? 40;
-    const foundFields = findUndocumented(db, args.type, undocLimit + 1);
-    const fields = foundFields.slice(0, undocLimit);
+    const undocumented = undocumentedOp(db, args.type, args.limit ?? 40);
+    const fields = undocumented.value.fields;
     process.stdout.write(
       `Fields the schema permits that appear in zero vanilla assets` +
         `${args.type ? `, scoped to ${args.type}` : ""}.\n` +
@@ -939,9 +1182,14 @@ export async function cmdUndocumented(args: {
         // Stated because the alternative is a false negative presented as a
         // finding. Under half of declared fields currently join their observed
         // counterpart, so absence here is weaker evidence than it reads as.
-        "AND it may simply have failed to join: fewer than half of declared fields\n" +
-        "currently match observed data, so treat this list as a starting point\n" +
-        "and confirm with 'describe <Type> --field <pointer>'.\n\n",
+        // The join figure comes from the operation layer, measured rather than
+        // written down, so it cannot drift from reality or from what MCP reports.
+        `AND it may simply have failed to join:\n${undocumented.caveats
+          .filter((c) => c.code === "join-incomplete")
+          .map((c) => `  ${c.message}`)
+          .join("\n")}\n` +
+        "Treat this list as a starting point and confirm with\n" +
+        "'describe <Type> --field <pointer>'.\n\n",
     );
     if (fields.length === 0) {
       // Only reachable unscoped now; the scoped case is answered above, where the
@@ -958,7 +1206,7 @@ export async function cmdUndocumented(args: {
         process.stdout.write(`    ${clip(f.description, 130)}\n`);
       }
     }
-    noticeTruncated(fields.length, foundFields.length > undocLimit, "fields");
+    renderCaveats(undocumented.caveats.filter((c) => c.code === "truncated"));
     return 0;
   } finally {
     db.close();

@@ -502,6 +502,11 @@ function flatten(
   if (pointer === "" && !ctx.seenPointers.has("")) {
     const branches = rootUnionScopes(node, currentFile);
     if (branches.length > 1) {
+      // The root carries its own hytaleSchemaTypeField too -- Interaction.json
+      // declares `property: "Type"` and 102 values aligned with its branches.
+      // Omitting it left `describe Interaction` printing "?" for every branch
+      // while the complete legal set sat one field away.
+      const rootDeclared = readDeclaration(node, currentFile);
       ctx.seenPointers.add("");
       ctx.out.push({
         assetType: ctx.assetType,
@@ -516,10 +521,10 @@ function flatten(
         inheritsProperty: false,
         mergesProperties: false,
         referenceTarget: null,
-        refScope: branches.join(" "),
+        refScope: (rootDeclared?.scopes ?? branches).join(" "),
         typeConstant: null,
-        discriminatorProperty: null,
-        discriminatorValues: null,
+        discriminatorProperty: rootDeclared?.property ?? null,
+        discriminatorValues: rootDeclared?.values.join(" ") ?? null,
       });
     }
   }

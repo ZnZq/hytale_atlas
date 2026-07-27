@@ -424,7 +424,7 @@ test("every list command announces its own truncation", opts, () => {
     ["undocumented", "--limit", "2"],
   ]) {
     const { out } = run(...argv);
-    assert.match(out, /showing the first/, `${argv.join(" ")} truncated in silence:\n${out}`);
+    assert.match(out, /showing the first/i, `${argv.join(" ")} truncated in silence:\n${out}`);
   }
 });
 
@@ -432,7 +432,7 @@ test("unscoped undocumented does not hide 99% of its output", opts, () => {
   // Showed 40 rows of 6,324 with no notice -- and search-schema points readers
   // here specifically to firm up a negative.
   const { out } = run("undocumented");
-  assert.match(out, /showing the first/);
+  assert.match(out, /showing the first/i);
 });
 
 test("--mcp refuses instead of silently running the indexer", opts, () => {
@@ -492,6 +492,206 @@ test("every documented option is accepted by the parser", opts, () => {
     const { out } = run("status", flag, "1");
     assert.ok(!/Unknown option/.test(out), `${flag} is documented but rejected:\n${out}`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Round 9: three new scenarios -- a plant with drops and growth stages, impact
+// analysis on a heavily-used block, and a sword applying a status effect. Each
+// was chosen to load machinery the pickaxe never touched.
+// ---------------------------------------------------------------------------
+
+test("get shows the asset its own note says it will", opts, () => {
+  // The note ordered candidates by (is_effective, type) and the loader by
+  // is_effective alone, so SQLite broke the tie by rowid: `get Plant_Bush`
+  // announced "Showing the Item one" and printed the ItemDropList. Handing over
+  // the wrong file while naming the right one.
+  const { out } = run("get", "Plant_Bush");
+  const note = /Showing the (\S+) one/.exec(out);
+  const shown = /type=(\S+)/.exec(out);
+  assert.ok(note !== null && shown !== null, `no note or type header:\n${out}`);
+  assert.equal(shown[1], note[1]);
+});
+
+test("refs answers what points at an asset", opts, () => {
+  // 162,899 edges were built and none were reachable. The only substitute was
+  // `search`, which indexes names rather than values.
+  const { out, code } = run("refs", "Poison", "--type", "EntityEffect");
+  assert.equal(code, 0);
+  assert.match(out, /references to 'Poison'/);
+  assert.match(out, /Poison_T1/);
+  assert.match(out, /high\s+=/);
+  // The blind spot is stated, because a complete-looking answer that is not
+  // complete is the failure this whole surface keeps making. The wording now
+  // comes from the shared operation layer, so MCP will state it identically.
+  assert.match(out, /untyped assets/);
+  assert.match(out, /contribute no references/);
+});
+
+test("refs is documented", opts, () => {
+  // It existed and was reachable only by accident -- an agent found it because a
+  // crash happened to print its usage string.
+  assert.match(run("--help").out, /hytale-atlas refs <id>/);
+});
+
+test("a union type lists its branches and the value that selects each", opts, () => {
+  // `describe Interaction` printed a wall of UNDECLARED rows while
+  // `describe common:ApplyEffectInteraction` showed the same fields fully
+  // declared -- two commands contradicting each other, with the "did you mean"
+  // steering toward the worse view. There was also no way to ask what the legal
+  // interaction shapes are.
+  const { out, code } = run("describe", "Interaction");
+  assert.equal(code, 0);
+  assert.match(out, /union of \d+ shapes, chosen by the 'Type' field/);
+  assert.match(out, /ApplyEffect\s+hytale-atlas describe common:ApplyEffectInteraction/);
+  assert.match(out, /complete legal set/);
+  assert.ok(!/UNDECLARED/.test(out), `still printing undeclared soup:\n${out}`);
+});
+
+test("a high-cardinality field reports its count instead of going quiet", opts, () => {
+  // Above the enum threshold the values are not stored, so the line vanished --
+  // no list, no count, no caveat, while a neighbouring field printed 33 values.
+  // Two agents independently read the silence as "this field has no values".
+  const { out } = run("describe", "common:MaterialQuantity", "--field", "ItemId");
+  assert.match(out, /distinct values -- too many to list/);
+  assert.match(out, /refs <id>/);
+});
+
+test("a search miss explains that search indexes names, not values", opts, () => {
+  // "No matches." reads as "this string appears nowhere". Searching a sound-set
+  // id returned the set itself and none of the items referencing it.
+  const { out, code } = run("search", "ApplyEntityEffect");
+  assert.equal(code, 1);
+  assert.match(out, /NOT field values/);
+  assert.match(out, /refs /);
+});
+
+test("describe states that its counts predate inheritance", opts, () => {
+  // `describe common:FarmingData --field StartingStageSet` says 2 assets; `get`
+  // shows the value on many more, because it resolves the parent chain. Both are
+  // right, and nothing said they answered different questions.
+  const { out } = run("describe", "common:FarmingData", "--field", "StartingStageSet");
+  assert.match(out, /counts files that declare the field themselves/);
+  assert.match(out, /'get' resolves inheritance first/);
+});
+
+test("search-lang finds a key written the way an asset references it", opts, () => {
+  // Assets say `server.items.X.name`; the table stores `items.X.name`, the root
+  // corresponding to the pack directory the .lang file sits under. So the one
+  // string a modder has in hand was the one string that could not be looked up.
+  const { out, code } = run("search-lang", "server.items.Plant_Crop_Wheat_StageFinal.name");
+  assert.equal(code, 0);
+  assert.match(out, /items\.Plant_Crop_Wheat_StageFinal\.name/);
+  assert.match(out, /uk-UA/);
+  assert.match(out, /used by Plant_Crop_Wheat_Block/);
+});
+
+test("search-lang finds a key by its translation in any locale", opts, () => {
+  const { out, code } = run("search-lang", "Адамантитова кіраса", "--limit", "1");
+  assert.equal(code, 0);
+  assert.match(out, /Armor_Adamantite_Chest/);
+  assert.match(out, /Adamantite Cuirass/);
+});
+
+test("search-lang explains the root-prefix rule when it finds nothing", opts, () => {
+  const { out, code } = run("search-lang", "zzz.no.such.key");
+  assert.equal(code, 1);
+  assert.match(out, /stored WITHOUT their root/);
+});
+
+// ---------------------------------------------------------------------------
+// Round 10: four scenarios re-run against the fixed tool. All four reached the
+// same verdicts as before; these pin what they found on the way.
+// ---------------------------------------------------------------------------
+
+test("refs --type actually narrows to that type", opts, () => {
+  // Four assets are named Stone. `refs Stone --type PhysicalMaterial` returned
+  // output byte-identical to `--type BlockSoundSet`, because inheritance edges
+  // were built by identifier alone: a BlockSoundSet with Parent "Stone" got an
+  // edge to all four, all labelled `high` -- the tier meaning "not a heuristic".
+  const material = run("refs", "Stone", "--type", "PhysicalMaterial", "--limit", "5");
+  const sound = run("refs", "Stone", "--type", "BlockSoundSet", "--limit", "5");
+  assert.notEqual(material.out, sound.out, "refs --type still ignores the type");
+  assert.match(material.out, /PhysicalMaterialId/);
+  assert.match(sound.out, /BlockSoundSetId/);
+});
+
+test("inheritance never crosses asset types", opts, () => {
+  // Parent resolves within a type. 845 of 4,575 inheritance edges pointed at the
+  // wrong type before this was constrained.
+  const { out } = run("refs", "Stone", "--type", "PhysicalMaterial", "--limit", "200");
+  const wrong = out
+    .split("\n")
+    .filter((l) => l.includes("INHERITS_FROM") && !l.includes("PhysicalMaterial"));
+  assert.equal(wrong.length, 0, `inheritance crossed types:\n${wrong.join("\n")}`);
+});
+
+test("a schema-declared reference is reported as high confidence", opts, () => {
+  // `describe BlockType --field PhysicalMaterialId` shows it declared
+  // `-> PhysicalMaterial`, while refs called every such edge `medium` -- two
+  // commands giving contradictory trust signals for the same field. Confidence
+  // was decided before pointers were rebased across `$ref`, so a declared
+  // reference reached through one could never qualify.
+  const { out } = run("refs", "Stone", "--type", "PhysicalMaterial", "--limit", "5");
+  const line = out.split("\n").find((l) => l.includes("PhysicalMaterialId"));
+  assert.ok(line !== undefined, `no PhysicalMaterialId edge:\n${out}`);
+  assert.match(line, /^high/);
+});
+
+test("refs explains that a value is not an asset instead of looping", opts, () => {
+  // `search-schema` said "use refs <id>"; `refs Workbench_Tools` said "no such
+  // asset, try search"; `search` said "try refs". Two commands handing off to
+  // each other, neither able to say the thing is a value nested in a field.
+  const { out, code } = run("refs", "Workbench_Tools");
+  assert.equal(code, 1);
+  assert.match(out, /is not an asset/);
+  assert.match(out, /as a VALUE/);
+  assert.match(out, /describe .*--field/);
+  assert.ok(!/Try 'hytale-atlas search Workbench_Tools'/.test(out), "still loops back to search");
+});
+
+test("refs on a bench asset says recipes reference the declared id instead", opts, () => {
+  // `refs Bench_WorkBench` returned one unrelated edge while 49 recipes required
+  // that bench -- they point at the id it declares, not at the asset.
+  const { out } = run("refs", "Bench_WorkBench");
+  assert.match(out, /declares the bench id 'Workbench'/);
+  assert.match(out, /hytale-atlas bench Workbench/);
+});
+
+test("index --dry-run prints instead of running", opts, () => {
+  // Documented as a global option and read only by generate-schema, so
+  // `index --force --dry-run` ran the real 40-second pipeline and rewrote the
+  // cache after promising to print and exit.
+  const before = Date.now();
+  const { out, code } = run("index", "--force", "--dry-run");
+  assert.equal(code, 0);
+  assert.ok(Date.now() - before < 15_000, "dry run took long enough to have indexed");
+  assert.match(out, /Would build the index/);
+  assert.match(out, /target:/);
+  assert.ok(!/Indexed [\d,]+ assets/.test(out), "it actually indexed");
+});
+
+test("a generic value is still observed even though it never becomes an edge", opts, () => {
+  // 'Default' sat in the noise list, so it was dropped at EXTRACTION -- removing
+  // it from the observed layer too. Every crop starts in the 'Default' stage set
+  // and describe reported `seen: Starting, used in 2 assets`, true only of the
+  // two Tomato assets that spell it differently.
+  const { out } = run("describe", "common:FarmingData", "--field", "StartingStageSet");
+  assert.match(out, /Default/);
+  const used = /used in ([\d,]+) assets/.exec(out);
+  assert.ok(used !== null, `no usage count:\n${out}`);
+  assert.ok(
+    Number(used[1]!.replace(/,/g, "")) > 50,
+    `still only ${used[1]} assets -- generic values dropped again`,
+  );
+});
+
+test("generic values do not become references", opts, () => {
+  // The other half of the same change: they are collected, but must never be
+  // matched against the symbol table, or every 'Default' in the corpus becomes
+  // an edge. Thousands of 'Default' candidates now exist and none is an edge --
+  // which is what this asserts.
+  const { out } = run("refs", "Default");
+  assert.match(out, /Nothing references 'Default'/);
 });
 
 // ---------------------------------------------------------------------------

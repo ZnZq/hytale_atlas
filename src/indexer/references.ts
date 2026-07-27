@@ -37,8 +37,27 @@ export function toSchemaPointer(pointer: string): string {
   return pointer.replace(/\/\d+(?=\/|$)/g, "/*");
 }
 
-/** Values too generic to be worth recording as possible references. */
+/**
+ * Values too generic to be worth testing against the symbol table.
+ *
+ * They are still COLLECTED -- they are real data. Dropping them at extraction
+ * removed them from the observed layer as well, and several are meaningful
+ * values in their own right: `Default` is the stage set every crop starts in,
+ * and `All` is a bench category declared by both Farmingbench and Loombench.
+ * `describe common:FarmingData --field StartingStageSet` consequently reported
+ * `seen: Starting, used in 2 assets` -- true of the two Tomato assets that spell
+ * it differently, and silent about every other crop, which an agent reasonably
+ * read as the command being wrong.
+ *
+ * Filtered at edge-resolution time instead, the same way numbers are.
+ */
 const NOISE_VALUES = new Set(["", "none", "default", "null", "true", "false", "any", "all"]);
+
+/** SQL fragment excluding generic values from reference matching. */
+const NOT_NOISE = `lower(c.raw_value) NOT IN (${[...NOISE_VALUES]
+  .filter((v) => v.length > 0)
+  .map((v) => `'${v}'`)
+  .join(",")})`;
 
 /**
  * Longest plausible asset identifier. Anything longer is prose, a path, or a
@@ -72,11 +91,7 @@ function escapeSegment(segment: string): string {
 export function collectCandidates(node: unknown, pointer = "", out: Candidate[] = []): Candidate[] {
   if (typeof node === "string") {
     const trimmed = node.trim();
-    if (
-      trimmed.length > 0 &&
-      trimmed.length <= MAX_CANDIDATE_LENGTH &&
-      !NOISE_VALUES.has(trimmed.toLowerCase())
-    ) {
+    if (trimmed.length > 0 && trimmed.length <= MAX_CANDIDATE_LENGTH) {
       out.push({ pointer, schemaPointer: toSchemaPointer(pointer), value: trimmed, kind: "string" });
     }
     return out;
@@ -174,12 +189,23 @@ export function resolveCandidates(db: Database): ResolveResult {
     db.exec("UPDATE candidates SET resolved_edge_id = NULL, dangling = 0");
 
     // Inheritance: an explicit, engine-resolved relationship, not a guess.
+    //
+    // **Within a type.** A BlockSoundSet with Parent "Stone" inherits from the
+    // BlockSoundSet named Stone, never from the PhysicalMaterial, BlockSet or
+    // BlockParticleSet that happen to share the name. Matching on the identifier
+    // alone produced an edge to every one of them: 845 of 4 575 inheritance edges
+    // pointed at the wrong type, all labelled `high` -- the tier that means "not a
+    // heuristic at all". `refs Stone --type PhysicalMaterial` therefore returned
+    // the identical rows as `--type BlockSoundSet`, and the count was exactly 4x
+    // the truth.
     db.exec(`
       INSERT INTO edges (src, dst, dst_kind, kind, json_pointer, confidence)
       SELECT c.asset_id, a.id, 'asset', 'INHERITS_FROM', c.json_pointer, 'high'
         FROM candidates c
-        JOIN assets a ON a.logical_id = c.raw_value
-       WHERE c.value_kind = 'string' AND c.json_pointer = '/Parent' AND a.id <> c.asset_id
+        JOIN assets src ON src.id = c.asset_id
+        JOIN assets a ON a.logical_id = c.raw_value AND a.type IS src.type
+       WHERE c.value_kind = 'string' AND ${NOT_NOISE}
+         AND c.json_pointer = '/Parent' AND a.id <> c.asset_id
     `);
 
     // Localization: the reference is an explicit field naming a real key, so this
@@ -196,7 +222,8 @@ export function resolveCandidates(db: Database): ResolveResult {
                WHEN c.raw_value LIKE 'server.%' THEN substr(c.raw_value, 8)
                WHEN c.raw_value LIKE 'common.%' THEN substr(c.raw_value, 8)
                ELSE c.raw_value END
-       WHERE c.value_kind = 'string' AND c.raw_value LIKE '%.%.%' AND l.locale = 'en-US'
+       WHERE c.value_kind = 'string' AND ${NOT_NOISE}
+         AND c.raw_value LIKE '%.%.%' AND l.locale = 'en-US'
     `);
 
     // Files: Common/-relative paths carrying an extension.
@@ -205,7 +232,8 @@ export function resolveCandidates(db: Database): ResolveResult {
       SELECT c.asset_id, f.id, 'file', 'REFERENCES_FILE', c.json_pointer, 'high'
         FROM candidates c
         JOIN files f ON f.path = 'Common/' || c.raw_value
-       WHERE c.value_kind = 'string' AND c.raw_value LIKE '%.%' AND c.raw_value NOT LIKE '% %'
+       WHERE c.value_kind = 'string' AND ${NOT_NOISE}
+         AND c.raw_value LIKE '%.%' AND c.raw_value NOT LIKE '% %'
     `);
 
     // Asset references, in two steps.
@@ -232,7 +260,8 @@ export function resolveCandidates(db: Database): ResolveResult {
         JOIN assets a
                ON a.logical_id = c.raw_value
               AND a.type = sf.reference_target
-       WHERE c.value_kind = 'string' AND c.json_pointer <> '/Parent' AND a.id <> c.asset_id
+       WHERE c.value_kind = 'string' AND ${NOT_NOISE}
+         AND c.json_pointer <> '/Parent' AND a.id <> c.asset_id
     `);
 
     // Everything else: no declared target, or a declared target that nothing of
@@ -254,7 +283,7 @@ export function resolveCandidates(db: Database): ResolveResult {
         FROM candidates c
         JOIN assets src ON src.id = c.asset_id
         JOIN assets a ON a.logical_id = c.raw_value
-       WHERE c.value_kind = 'string'
+       WHERE c.value_kind = 'string' AND ${NOT_NOISE}
          AND c.json_pointer <> '/Parent'
          AND a.id <> c.asset_id
          AND NOT EXISTS (
@@ -269,7 +298,7 @@ export function resolveCandidates(db: Database): ResolveResult {
     // ordinary dangling string, because the schema makes this one unambiguous.
     db.exec(`
       UPDATE candidates SET dangling = 2
-       WHERE value_kind = 'string' AND EXISTS (
+       WHERE value_kind = 'string' AND lower(raw_value) NOT IN ('none','default','null','true','false','any','all') AND EXISTS (
              SELECT 1 FROM assets src
                JOIN schema_fields sf
                  ON sf.asset_type = src.type
@@ -285,7 +314,7 @@ export function resolveCandidates(db: Database): ResolveResult {
     // Mark candidates that named something identifier-shaped but matched nothing.
     db.exec(`
       UPDATE candidates SET dangling = 1
-       WHERE value_kind = 'string' AND raw_value GLOB '[A-Za-z]*[_A-Za-z0-9]*'
+       WHERE value_kind = 'string' AND lower(raw_value) NOT IN ('none','default','null','true','false','any','all') AND raw_value GLOB '[A-Za-z]*[_A-Za-z0-9]*'
          AND raw_value NOT LIKE '% %'
          AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.logical_id = candidates.raw_value)
          AND NOT EXISTS (SELECT 1 FROM lang_keys l WHERE l.key = candidates.raw_value)

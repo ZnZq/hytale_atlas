@@ -3,6 +3,8 @@ import { detectInstallation, detectProject } from "../sources/detect.ts";
 import {
   cmdBench,
   cmdDescribe,
+  cmdLang,
+  cmdRefs,
   cmdEval,
   cmdGenerateSchema,
   cmdGet,
@@ -53,6 +55,10 @@ const USAGE = `hytale-atlas — unofficial local index of Hytale assets
   hytale-atlas search-schema <q>  Where a capability lives. A miss is reported as
                                evidence, not proof: the index is lexical.
   hytale-atlas bench [id]      Crafting benches; with an id, what it crafts
+  hytale-atlas search-lang <q>  Localization: find a key or a translated string
+                               in any locale, and what references it
+  hytale-atlas refs <id>       What references this asset, with confidence. The
+                               inverse of 'get', which shows what it points AT.
   hytale-atlas undocumented [Type]  Fields the schema permits that vanilla never
                                uses; with a type, scoped to it
   hytale-atlas eval            Run the search evaluation set, recall@5 per tier
@@ -342,6 +348,22 @@ function main(): number | Promise<number> {
     }
     case "bench":
       return cmdBench(args.rest[0], opts(args));
+    case "search-lang": {
+      const query = args.rest.join(" ");
+      if (query.length === 0) {
+        process.stderr.write("usage: hytale-atlas search-lang <key-or-text>\n");
+        return 2;
+      }
+      return cmdLang(query, opts(args));
+    }
+    case "refs": {
+      const id = args.rest[0];
+      if (id === undefined) {
+        process.stderr.write("usage: hytale-atlas refs <asset-id> [--type <Type>]\n");
+        return 2;
+      }
+      return cmdRefs(id, opts(args));
+    }
     case "undocumented":
       // The positional was accepted and then dropped, so `undocumented ItemToolSpec`
       // returned the whole unscoped corpus and looked like an answer.

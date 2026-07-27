@@ -46,13 +46,28 @@ test("non-finite numbers are skipped: they mean unset, not observed", () => {
   assert.deepEqual(collectCandidates({ A: Number.NaN, B: Number.POSITIVE_INFINITY }), []);
 });
 
-test("noise filtering stays string-only", () => {
-  // 'false' the STRING is placeholder junk; false the BOOLEAN is an ordinary
-  // value, and dropping it would put the field back to looking unused.
-  const asString = collectCandidates({ Flag: "false" });
-  const asBoolean = collectCandidates({ Flag: false });
-  assert.equal(asString.length, 0);
-  assert.deepEqual(asBoolean.map((c) => [c.value, c.kind]), [["false", "boolean"]]);
+test("generic values are collected, not dropped at extraction", () => {
+  // They used to be filtered here, which removed them from the OBSERVED layer as
+  // well as from reference matching. 'Default' is the stage set every crop starts
+  // in and 'All' is a real bench category, so `describe` reported a field used by
+  // 103 assets as used by 2. Filtering now happens where it belongs: when
+  // matching a value against the symbol table.
+  for (const value of ["Default", "All", "None", "false"]) {
+    const out = collectCandidates({ Flag: value });
+    assert.equal(out.length, 1, `'${value}' was dropped at extraction`);
+    assert.equal(out[0]!.kind, "string");
+  }
+});
+
+test("a boolean is still distinguished from the string spelling it", () => {
+  assert.deepEqual(
+    collectCandidates({ Flag: false }).map((c) => [c.value, c.kind]),
+    [["false", "boolean"]],
+  );
+  assert.deepEqual(
+    collectCandidates({ Flag: "false" }).map((c) => [c.value, c.kind]),
+    [["false", "string"]],
+  );
 });
 
 test("zero is collected rather than treated as empty", () => {

@@ -467,6 +467,32 @@ export function computeFieldStats(db: Database): StatsResult {
                   AND fs.count >= ${ENUM_MIN_OCCURRENCES})
     `);
 
+    // Promote references the schema declares, now that pointers are rebased.
+    //
+    // Confidence is decided in pass 2, before this pass rewrites pointers across
+    // `$ref` boundaries -- so a declared reference reached through one could never
+    // qualify. `Item./BlockType/PhysicalMaterialId` is declared
+    // `-> PhysicalMaterial` and used by 1 547 assets, yet every edge from it was
+    // labelled `medium` ("the field name follows a convention"), contradicting
+    // what `describe` said about the very same field.
+    //
+    // The condition is the same one pass 2 uses; only the pointer it joins on has
+    // improved.
+    db.exec(`
+      UPDATE edges SET confidence = 'high'
+       WHERE kind = 'REFERENCES' AND confidence <> 'high'
+         AND EXISTS (
+               SELECT 1
+                 FROM candidates c
+                 JOIN schema_fields sf
+                       ON sf.asset_type = c.schema_scope
+                      AND sf.json_pointer = c.schema_pointer
+                      AND sf.reference_target IS NOT NULL
+                 JOIN assets d ON d.id = edges.dst AND d.type = sf.reference_target
+                WHERE c.asset_id = edges.src
+                  AND c.json_pointer = edges.json_pointer)
+    `);
+
     const one = (sql: string): number =>
       (db.prepare(sql).get() as { n: number } | undefined)?.n ?? 0;
 
