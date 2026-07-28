@@ -115,21 +115,37 @@ function escapePointer(segment: string): string {
  * measured across 1 729 asset files, keys arrive under at least eight different
  * fields, `Value` being the second most common after `Name`.
  */
-export function collectReferences(node: unknown, pointer = "", out: Reference[] = []): Reference[] {
+export function collectReferences(
+  node: unknown,
+  pointer = "",
+  out: Reference[] = [],
+  /**
+   * Whether a string is a translation reference.
+   *
+   * Defaults to the shape test, but the indexer passes one that also accepts a
+   * value the catalog actually holds a key for. Two rules described the same
+   * thing and disagreed: `LOCALIZED_BY` joins any value with two dots after
+   * stripping a `server.`/`common.` root, while this test demanded the root be
+   * present. Nine assets -- the `npcRoles.Test_Motion_*` roles, whose keys carry
+   * no root -- got a localization edge and an identifier-only search row, so the
+   * index knew their names and search could not find them by one.
+   */
+  isReference: (value: string) => boolean = isTranslationReference,
+): Reference[] {
   if (typeof node === "string") {
-    if (isTranslationReference(node)) {
+    if (isReference(node)) {
       const segments = pointer.split("/");
       out.push({ pointer, reference: node, role: segments[segments.length - 1] ?? "" });
     }
     return out;
   }
   if (Array.isArray(node)) {
-    node.forEach((v, i) => collectReferences(v, `${pointer}/${i}`, out));
+    node.forEach((v, i) => collectReferences(v, `${pointer}/${i}`, out, isReference));
     return out;
   }
   if (node !== null && typeof node === "object") {
     for (const [k, v] of Object.entries(node)) {
-      collectReferences(v, `${pointer}/${escapePointer(k)}`, out);
+      collectReferences(v, `${pointer}/${escapePointer(k)}`, out, isReference);
     }
   }
   return out;
@@ -193,8 +209,25 @@ export async function buildSearchIndex(
 
   const { catalog, files: langFiles } = await loadLangCatalog(archive);
 
+  /**
+   * The same question `LOCALIZED_BY` asks, so the two cannot disagree: either the
+   * value carries a known root, or the catalog holds a key by that name. The
+   * two-dot floor matches the SQL join and keeps ordinary prose out.
+   */
+  const isReference = (value: string): boolean =>
+    isTranslationReference(value) ||
+    (value.split(".").length > 2 && catalog.resolveAll(value).length > 0);
+
   db.exec("BEGIN");
   try {
+    // Rebuilt, not appended to. `assets` and `files` carry ON CONFLICT guards and
+    // `schema_fts` is cleared by schema ingestion, but `candidates` and
+    // `assets_fts` had neither, so a second run over one database silently
+    // doubled both. Nothing does that today -- `index --force` deletes the file
+    // first -- which is exactly why the hazard was invisible.
+    db.exec("DELETE FROM candidates");
+    db.exec("DELETE FROM assets_fts");
+
     db.prepare(
       "INSERT INTO packs (id, group_name, name, path, kind, priority) VALUES (1,'Hytale','Hytale',?,'vanilla',3)" +
         " ON CONFLICT (path) DO NOTHING",
@@ -286,7 +319,7 @@ export async function buildSearchIndex(
         }
       }
 
-      const refs = collectReferences(doc);
+      const refs = collectReferences(doc, "", [], isReference);
       if (refs.length === 0) {
         // No display name anywhere. Index the identifier alone so the asset is at
         // least reachable -- this is the population validate_pack will flag.

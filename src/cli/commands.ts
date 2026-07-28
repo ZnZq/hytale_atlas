@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
 
-import { openDatabase } from "../db/open.ts";
+import { type Database, openDatabase } from "../db/open.ts";
 import { buildSearchIndex } from "../indexer/corpus.ts";
 import { craftableAt, indexBenches } from "../indexer/benches.ts";
 import { VALUE_LINKS, indexValueLinks } from "../indexer/value-links.ts";
@@ -30,6 +30,7 @@ import {
   brokenRefsFor,
   declaredCount,
   fileRefsOp,
+  identify,
   undeclaredObserved,
   langOp,
   refsOp,
@@ -71,6 +72,64 @@ function stripAnsi(text: string): string {
 function clip(text: string, max: number): string {
   const flat = text.replace(/\s+/g, " ").trim();
   return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
+}
+
+/**
+ * The next commands worth running, chosen from what the token actually is.
+ *
+ * One suggester for every miss, reading one classification (`identify`). Each
+ * command used to decide this for itself from a single fact, and the results
+ * contradicted both each other and the prose they sat under: `search` withheld
+ * `refs` from the value case its own sentence was about, `refs` and `search`
+ * pointed at each other with no exit, and neither ever named `search-lang` for a
+ * localization key or `bench` for a bench id.
+ *
+ * Ordered by how likely the token is to be that thing, and every line is a
+ * command that returns something for this exact token -- a suggestion that
+ * misses is worse than none, because it reads as a verdict.
+ */
+function nextCommands(
+  db: Database,
+  token: string,
+  exclude: "refs" | "search" | null = null,
+  extra: readonly (readonly [string, string])[] = [],
+): string {
+  const id = identify(db, token);
+  // Keyed by command, so a token that is several things at once -- a bench
+  // category IS also a field value -- is offered one line per command with the
+  // strongest reason, not the same command twice.
+  const lines = new Map<string, string>();
+  const add = (command: string, why: string): void => {
+    if (!lines.has(command)) lines.set(command, why);
+  };
+  const refs = `hytale-atlas refs ${token}`;
+
+  if (id.assets > 0 && exclude !== "refs") add(refs, "what references that asset");
+  if (id.benchCategory && !id.benchId && exclude !== "refs") {
+    add(refs, "it is a bench CATEGORY, not a bench id -- this shows what uses it");
+  }
+  if (id.valueOccurrences > 0 && exclude !== "refs") {
+    add(
+      refs,
+      `where this VALUE is used (${formatCount(id.valueOccurrences)}x in ` +
+        `${formatCount(id.valueAssets)} assets)`,
+    );
+  }
+  if (id.files > 0 && exclude !== "refs") add(refs, "what references that file");
+  if (id.langKey !== null) {
+    add(`hytale-atlas search-lang ${token}`, "the localization key and its translations");
+  }
+  if (id.benchId) add(`hytale-atlas bench ${token}`, "what is crafted at that bench");
+  if (id.assets > 0 && exclude !== "search") {
+    add(`hytale-atlas get ${token}`, "its effective definition");
+  }
+  // Always last, and always available: it is the one command whose miss is
+  // itself an answer about the schema.
+  add("hytale-atlas search-schema <words>", "where a capability is declared");
+  for (const [command, why] of extra) add(command, why);
+
+  const width = Math.max(...[...lines.keys()].map((c) => c.length));
+  return [...lines].map(([c, why]) => `  ${c.padEnd(width)}  ${why}\n`).join("");
 }
 
 /**
@@ -161,6 +220,20 @@ export async function cmdGenerateSchema(args: GenerateSchemaArgs): Promise<numbe
         `    --assets ${assetsZip} \\`,
         "    --generate-asset-schema <fresh temp directory>",
         "",
+        // --keep changes what happens after the run, and the dry run said
+        // nothing about it while printing a disclosure that ends "deleted
+        // afterwards" -- the very outcome --keep exists to prevent. The command
+        // line is identical either way (the generator WIPES its output directory
+        // before writing, so it is never pointed at a caller's path), and that
+        // is exactly why the copy step has to be stated here.
+        ...(args.keep !== undefined
+          ? [
+              `Then: copy the generated Schema/ out to ${args.keep}`,
+              "(the generator wipes its own output directory before writing, so it is",
+              " never pointed at that path -- the files are copied there afterwards)",
+              "",
+            ]
+          : []),
         TELEMETRY_DISCLOSURE,
         "",
       ].join("\n"),
@@ -287,7 +360,14 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
     process.stdout.write(`Index already built: ${dbPath}\nUse --force to rebuild.\n`);
     return 0;
   }
-  if (args.force && existsSync(dbPath)) rmSync(dbPath, { force: true });
+  // The write-ahead log and shared-memory file are part of the database, not
+  // scratch beside it: deleting only the main file leaves SQLite to reconcile a
+  // fresh database against a stale WAL. Removed together, in that order.
+  if (args.force && existsSync(dbPath)) {
+    for (const suffix of ["-wal", "-shm", ""]) {
+      rmSync(`${dbPath}${suffix}`, { force: true });
+    }
+  }
 
   process.stdout.write(
     `Indexing vanilla assets (one-time, cached globally)\n  ${archivePath}\n`,
@@ -532,13 +612,14 @@ export async function cmdSearch(
             "not field values.",
             "NOT field values.",
           ) +
-          // Only when it IS an asset. Suggesting `refs` on a miss produced a
-          // closed loop -- `search X` said try `refs X`, `refs X` said try
-          // `search X` -- which three blind trials walked into and none escaped.
-          (sameNamed(db, query.split(/\s+/)[0] ?? query).length > 0
-            ? `  hytale-atlas refs ${query.split(/\s+/)[0]}    what references that asset\n`
-            : "") +
-          "  hytale-atlas search-schema <words>   where a capability is declared\n",
+          // Built from what the token IS, not from one fact about it. Gating
+          // `refs` on "is it an asset" was the inverse of the sentence printed
+          // just above -- which is about VALUES -- so the one command that
+          // answers the value case was withheld exactly when it applied. The
+          // closed loop the old comment describes (`search` -> `refs` ->
+          // `search`) came from neither command being able to say what the token
+          // was; asking once removes it without withholding anything.
+          nextCommands(db, query.split(/\s+/)[0] ?? query),
       );
       return 1;
     }
@@ -641,8 +722,13 @@ export async function cmdGet(
       );
     }
 
-    const load: AssetLoader = async (id) => {
-      const row = byId.get(id, args.type ?? null) as
+    // `forType` is the child's type when resolving a parent, and the caller's
+    // --type (or nothing) for the asset itself. Passing `args.type` for every
+    // lookup meant that without --type a parent was chosen by identifier alone:
+    // `get Eggsac` merged the BlockBoundingBoxes named Cocoon into a
+    // BlockSoundSet and printed `Boxes` in place of `SoundEvents`.
+    const load: AssetLoader = async (id, forType) => {
+      const row = byId.get(id, forType ?? args.type ?? null) as
         | { path: string; type: string | null }
         | undefined;
       if (row === undefined) return null;
@@ -679,7 +765,7 @@ export async function cmdGet(
         );
       } else {
         process.stderr.write(
-          `No asset '${logicalId}'. Try 'hytale-atlas search ${logicalId}'.\n`,
+          `No asset '${logicalId}'.\n` + nextCommands(db, logicalId, "search"),
         );
       }
       return 1;
@@ -704,10 +790,24 @@ export async function cmdGet(
       header.push("  WARNING: parent chain is cyclic or deeper than the limit");
     }
 
-    const inherited = resolved.origins.filter((o) => o.via !== "declared");
-    if (inherited.length > 0) {
+    // Both numbers, because the one-sided version was false. `origins` already
+    // records declared/inherited/merged per pointer and nothing read it, so the
+    // line was derived from the inherited count alone and asserted the rest:
+    // `Plant_Crop_Tomato_Block` printed "40 field(s) come from ancestors; the
+    // file on disk declares fewer" over an effective definition of 148 leaves,
+    // more than half of them the file's own. That sentence answers exactly the
+    // question a modder asks -- what must I write myself -- with the wrong side.
+    const byOrigin = new Map<string, string>();
+    for (const o of resolved.origins) {
+      if (o.via === "merged" && byOrigin.has(o.pointer)) continue;
+      byOrigin.set(o.pointer, o.via);
+    }
+    const inherited = [...byOrigin.values()].filter((v) => v !== "declared").length;
+    const declared = [...byOrigin.values()].filter((v) => v === "declared").length;
+    if (inherited > 0 || declared > 0) {
       header.push(
-        `  ${inherited.length} field(s) come from ancestors; the file on disk declares fewer`,
+        `  ${declared} field(s) declared in this file, ${inherited} from ancestors ` +
+          `(${resolved.parentChain[0] ?? "none"})`,
       );
     }
     process.stdout.write(`${header.join("\n")}\n\n`);
@@ -815,7 +915,13 @@ export async function cmdBench(
           ? `'${benchId}' is the asset that declares a bench, not the bench id.\n` +
               `Use: hytale-atlas bench ${viaAsset["bench_id"]}\n` +
               `(that same id is what a recipe's BenchRequirement.Id must carry)\n`
-          : `No bench '${benchId}'. Run 'hytale-atlas bench' to list them.\n`,
+          : // A bench CATEGORY is the mistake this command exists to catch -- it is
+          // the id sitting one field away, in `Bench.Categories[].Id`, and the
+          // listing itself annotates the case elsewhere ("it IS a declared bench
+          // category"). Sending the reader to a list that by construction cannot
+          // contain what they typed is the one dead end left in this family.
+          `No bench '${benchId}'.\n` +
+          nextCommands(db, benchId, null, [["hytale-atlas bench", "list every bench id"]]),
       );
       return 1;
     }
@@ -897,10 +1003,18 @@ export async function cmdRefs(
             fields
               .map((r) => `  ${formatCount(r.count)}x  ${r.scope} :: ${r.pointer}\n`)
               .join("") +
+            // "a declared field" was the wrong term and made the arithmetic
+            // unreconcilable: the rows above are grouped by the RESOLVED field
+            // position, declared or not -- `Interaction :: /DamageCalculator/
+            // BaseDamage/Physical` is listed there and `describe` marks it
+            // UNDECLARED. What the remainder actually is: occurrences whose
+            // pointer never resolved to a field position at all, because the
+            // owning type declares no fields to resolve against (44 938 of them
+            // are NPCRole).
             (usage.unattributed > 0
-              ? `  ${formatCount(usage.unattributed)} occurrence(s) could not be ` +
-                `attributed to a declared field, so the breakdown above does not ` +
-                `sum to the total.\n`
+              ? `  ${formatCount(usage.unattributed)} occurrence(s) sit in assets whose ` +
+                `type declares no fields, so their position could not be resolved ` +
+                `and the breakdown above does not sum to the total.\n`
               : "") +
             (usage.fields > fields.length
               ? `  ... and ${formatCount(usage.fields - fields.length)} more field(s). ` +
@@ -944,10 +1058,16 @@ export async function cmdRefs(
         return 0;
       }
 
+      // "no file by that name" was asserted about anything the file-reference
+      // index did not hold -- including `Tool_Pickaxe_Iron.json`, a path this
+      // very tool prints in the header of `get`. Only asset documents are absent
+      // from `files`, so say which index was consulted rather than making a
+      // claim about the archive.
       process.stderr.write(
         `No asset '${logicalId}'${args.type ? ` of type '${args.type}'` : ""}, ` +
-          "no file by that name, and nothing carries it as a value.\n" +
-          `Try 'hytale-atlas search ${logicalId}'.\n`,
+          "and nothing carries it as a value. No file of that name is REFERENCED by\n" +
+          "any asset (asset documents themselves are not in the file index).\n" +
+          nextCommands(db, logicalId),
       );
       return 1;
     }
@@ -975,6 +1095,21 @@ export async function cmdRefs(
             `${(r.type ?? "(untyped)").padEnd(20)} ${r.kind} ${r.pointer ?? ""}\n`,
         );
       }
+    }
+
+    // The asset branch is chosen silently when the token is BOTH an asset and a
+    // field value, and the value report is then unreachable. Every Quality value
+    // in the game (1-6) is also the name of a BlockMigration asset, so `refs 5`
+    // answered with four NPCRole rows and no hint that 'which blocks require
+    // Quality 5' -- the question a tool author actually has -- was sitting
+    // behind the branch not taken.
+    const alsoValue = identify(db, logicalId);
+    if (alsoValue.valueOccurrences > 0) {
+      process.stdout.write(
+        `\n'${logicalId}' is ALSO a field value: ${formatCount(alsoValue.valueOccurrences)} ` +
+          `occurrence(s) in ${formatCount(alsoValue.valueAssets)} asset(s), not listed above.\n` +
+          `Those are shown when the name is not an asset; this one is.\n`,
+      );
     }
 
     // Confidence is not decoration. A declared reference is a fact the schema
@@ -1045,9 +1180,17 @@ export async function cmdLang(
     if (entries.length === 0) {
       process.stdout.write(
         `No localization key or value matches "${query}".\n\n` +
+          // "Any root is accepted" was false, and false in the one direction
+          // that misleads: `server.` and `common.` are stripped, and any other
+          // first segment is only tried as a literal root against `lang_keys.root`.
+          // `emotes.general.deathCause.burn` missed while `server.general.deathCause.burn`
+          // resolved -- the root WAS the problem, under a sentence saying it could
+          // not be. A reader who types the root their own .lang file uses is told
+          // to look elsewhere.
           "Keys are stored WITHOUT their root: an asset referencing\n" +
-          "'server.items.Foo.name' is stored as 'items.Foo.name'. Any root is\n" +
-          "accepted here, so this is unlikely to be a prefix problem.\n\n" +
+          "'server.items.Foo.name' is stored as 'items.Foo.name'. 'server.' and\n" +
+          "'common.' are stripped automatically; any other first segment is tried\n" +
+          "as a literal root, so try the key without its root as well.\n\n" +
           // The one command that had no coverage hedge, while its siblings all
           // carry one -- and the command a reader uses to ask whether a language
           // exists at all. "This is a real miss" was a claim about the game that
@@ -1216,6 +1359,7 @@ export async function cmdDescribe(
       return 1;
     }
     const limit = args.limit ?? 60;
+    const markers = new Set<string>();
     for (const f of fields.slice(0, limit)) {
       const d = f.declared;
       const o = f.observed;
@@ -1235,6 +1379,19 @@ export async function cmdDescribe(
         d === null ? "UNDECLARED" : null,
         o === null ? (container ? "(container)" : "unused") : null,
       ].filter(Boolean);
+
+      // Every marker printed is recorded, so the legend below can explain
+      // exactly the ones this answer used. They were bare words with no
+      // explanation anywhere in the tool: a blind trial went through all nine
+      // commands looking for prose defining `unused` and found none, and read it
+      // -- reasonably -- as "the engine ignores this field" rather than "no
+      // vanilla asset sets it, and the declared/observed join is partial".
+      for (const flag of flags) {
+        if (typeof flag === "string" && !flag.startsWith("->") && !flag.startsWith("default")) {
+          markers.add(flag);
+        }
+      }
+      if (d?.type == null) markers.add("?");
 
       process.stdout.write(
         `${f.pointer.padEnd(46)} ${String(d?.type ?? "?").padEnd(16)} ${flags.join(" ")}\n`,
@@ -1257,10 +1414,21 @@ export async function cmdDescribe(
       // read the column: `describe BlockType --field HitboxType` printed
       // '-> BlockBoundingBoxes' and 214 distinct values without mentioning that
       // one of them names nothing, 256 times.
-      for (const broken of brokenRefsFor(db, assetType, f.pointer)) {
+      const broken = brokenRefsFor(db, assetType, f.pointer);
+      for (const one of broken.shown) {
         process.stdout.write(
-          `    BROKEN: '${broken.value}' names no ${d?.referenceTarget ?? "asset"} ` +
-            `(${formatCount(broken.occurrences)} occurrence(s))\n`,
+          `    BROKEN: '${one.value}' names no ${d?.referenceTarget ?? "asset"} ` +
+            `(${formatCount(one.occurrences)} occurrence(s))\n`,
+        );
+      }
+      // The list is capped at eight and said so nowhere:
+      // `common:BlockTypeFarmingStageData --field /Block` names 63 BlockTypes
+      // that do not exist and printed the first eight alphabetically.
+      if (broken.distinct > broken.shown.length) {
+        process.stdout.write(
+          `    BROKEN: ${formatCount(broken.shown.length)} of ` +
+            `${formatCount(broken.distinct)} unresolved value(s) shown, ` +
+            `${formatCount(broken.occurrences)} occurrence(s) in total\n`,
         );
       }
       const link = valueLinkFor(db, assetType, f.pointer);
@@ -1306,7 +1474,13 @@ export async function cmdDescribe(
       if (o) {
         process.stdout.write(
           `    used in ${formatCount(o.assets)} assets` +
-            (o.targetTypes ? `, points at ${o.targetTypes.join("/")}` : "") + "\n",
+            (o.targetTypes ? `, points at ${o.targetTypes.join("/")}` : "") +
+            // The JSON type, for a field the schema does not declare. Without a
+            // declared row there is no type on the line at all, so 418 observed
+            // fields printed a count and left the reader to infer from the
+            // sample values whether the field takes a number or a string.
+            (d === null && o.valueTypes ? `, holds ${o.valueTypes.join("/")}` : "") +
+            "\n",
         );
         // An UNDECLARED field is named to its sources, because a few of them are
         // not evidence of a capability at all.
@@ -1419,6 +1593,51 @@ export async function cmdDescribe(
           "'get' resolves inheritance first, so it can show a value on assets that\n" +
           "are not counted here.\n",
       );
+    }
+
+    // A marker is explained where it is printed, and only the ones that appeared
+    // are listed. `unused` is the load-bearing one: it is a statement about this
+    // INDEX, and `undocumented` has always carried the join-rate hedge for the
+    // identical fact while this command printed the bare word.
+    if (markers.size > 0) {
+      // The same pair `undocumented` quotes, measured on the DECLARED side --
+      // the honest denominator when the question is "does vanilla use this".
+      const one = (sql: string): number =>
+        Number((db.prepare(sql).get() as { n: number } | undefined)?.n ?? 0);
+      const joined = markers.has("unused")
+        ? one(`SELECT count(*) AS n FROM field_stats fs JOIN schema_fields sf
+                 ON sf.asset_type = fs.asset_type AND sf.json_pointer = fs.json_pointer`)
+        : 0;
+      const declaredTotal = markers.has("unused")
+        ? one("SELECT count(*) AS n FROM schema_fields WHERE json_pointer <> ''")
+        : 0;
+      const legend: Record<string, string> = {
+        required: "the schema marks this field required",
+        inherits: "declared with hytale.inheritsProperty: a child takes it from its parent",
+        merges:
+          "values of this type combine field by field instead of replacing wholesale",
+        UNDECLARED:
+          "the corpus uses this field and the schema never declares it -- so there is\n" +
+          "               no type, default or legal set to show",
+        "(container)":
+          "holds other fields, never a value of its own, so it CANNOT appear in the\n" +
+          "               observed layer -- absence here says nothing about use",
+        unused:
+          "no vanilla asset sets it. A statement about this index, not the engine:\n" +
+          "               only " +
+          formatCount(joined) +
+          " of " +
+          formatCount(declaredTotal) +
+          " declared fields are matched by the observed\n" +
+          "               layer, so a field may be in use and simply unmatched",
+        "?": "no declared type, because the schema does not describe this field",
+      };
+      process.stdout.write("\nmarkers in this answer:\n");
+      for (const m of ["required", "inherits", "merges", "?", "UNDECLARED", "(container)", "unused"]) {
+        if (markers.has(m) && legend[m] !== undefined) {
+          process.stdout.write(`  ${m.padEnd(12)} ${legend[m]}\n`);
+        }
+      }
     }
     return 0;
   } finally {

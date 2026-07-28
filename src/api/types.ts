@@ -115,11 +115,22 @@ export const caveat = {
   }),
   // `total` is separate from `types` because the type list is a SAMPLE. Using
   // its length said "8 assets are named Entry.node" where 461 are.
-  ambiguousIdentifier: (id: string, types: readonly string[], total = types.length): Caveat => ({
+  //
+  // `types` must be DISTINCT type names, and `distinctTypes` how many exist.
+  // Given one entry per asset, the parenthesis rendered the word "untyped" 461
+  // times in a single sentence; and comparing `total` -- a count of assets --
+  // against the length of a list of types put ", and more" after a complete
+  // list whenever several assets shared one type.
+  ambiguousIdentifier: (
+    id: string,
+    types: readonly string[],
+    total = types.length,
+    distinctTypes = types.length,
+  ): Caveat => ({
     code: "ambiguous-identifier",
     message:
       `${total} assets are named '${id}' (${types.join(", ")}` +
-      (total > types.length ? ", and more" : "") +
+      (distinctTypes > types.length ? ", and more" : "") +
       ").",
   }),
   /**

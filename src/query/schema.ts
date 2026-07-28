@@ -130,6 +130,15 @@ export interface ObservedLayer {
   readonly values: readonly string[] | null;
   /** Asset types this field was seen to resolve to. */
   readonly targetTypes: readonly string[] | null;
+  /**
+   * JSON types seen at this pointer: `string`, `number`, `boolean`.
+   *
+   * Carries its weight on the 418 fields the schema does not declare, where
+   * there is no `declared.type` to read and this is the only statement of what
+   * the field holds. `field_stats.value_types` was written by the indexer and
+   * read by nothing, so `describe` showed those fields with a count and no type.
+   */
+  readonly valueTypes: readonly string[] | null;
 }
 
 export interface FieldDescription {
@@ -161,6 +170,7 @@ interface FieldRow {
   of_total: number | null;
   cardinality: number | null;
   target_types: string | null;
+  value_types: string | null;
 }
 
 function toDescription(row: FieldRow): FieldDescription {
@@ -195,6 +205,7 @@ function toDescription(row: FieldRow): FieldDescription {
           cardinality: row.cardinality ?? 0,
           values: splitList(row.observed_values),
           targetTypes: splitList(row.target_types),
+          valueTypes: splitList(row.value_types),
         };
 
   return { assetType: row.asset_type, pointer: row.json_pointer, declared, observed };
@@ -237,7 +248,7 @@ export function describeSchema(
               sf.enum_values, sf.type_constant, coalesce(sf.observed_values, fs.observed_values) AS observed_values,
               sf.title, sf.description,
               sf.reference_target, sf.inherits_property, sf.merges_properties,
-              fs.count, fs.of_total, fs.cardinality, fs.target_types
+              fs.count, fs.of_total, fs.cardinality, fs.target_types, fs.value_types
          FROM p
          LEFT JOIN schema_fields sf
                 ON sf.asset_type = ?1 AND sf.json_pointer = p.json_pointer
@@ -342,6 +353,29 @@ export interface UndocumentedField {
 }
 
 /**
+ * What "declared but never observed" means, in one place.
+ *
+ * Containers are excluded, not deprioritised: an object, array or `$ref` pointer
+ * holds no scalar of its own, so it can never reach `field_stats` however heavily
+ * the corpus uses it. Listing them makes a limit of extraction look like a
+ * discovery.
+ *
+ * Exported because the indexer counts the same population for the line `index`
+ * prints, and the two filters had drifted: the indexer omitted the `$ref` clause,
+ * so it reported **8 439 declared-but-unused** while `undocumented` -- reading the
+ * same table for the same question -- answered **7 405**. 1 035 `$ref` rows, one
+ * predicate, two numbers a reader has no way to reconcile.
+ */
+export const DECLARED_UNOBSERVED_SQL = `
+  ifnull(sf.declared_type,'') NOT LIKE '%object%'
+  AND ifnull(sf.declared_type,'') NOT LIKE '%array%'
+  AND ifnull(sf.declared_type,'') NOT LIKE '$ref%'
+  AND ifnull(sf.declared_type,'') NOT IN ('anyOf','oneOf')
+  AND NOT EXISTS (SELECT 1 FROM field_stats fs
+                   WHERE fs.asset_type = sf.asset_type
+                     AND fs.json_pointer = sf.json_pointer)`;
+
+/**
  * Fields the schema permits that appear in **zero** vanilla assets.
  *
  * Framing matters and the tool description must carry it: these are *fields the
@@ -362,21 +396,10 @@ export function findUndocumented(
 
   const rows = db
     .prepare(
-      // Containers are excluded, not merely deprioritised. An object or array
-      // pointer holds no scalar of its own, so it can never reach field_stats
-      // however heavily the corpus uses it -- listing them here made a limit of
-      // extraction look like a discovery, which is the exact failure this tool
-      // exists to avoid.
       `SELECT sf.asset_type, sf.json_pointer, sf.declared_type, sf.title,
               sf.description, sf.reference_target
          FROM schema_fields sf
-        WHERE ifnull(sf.declared_type,'') NOT LIKE '%object%'
-          AND ifnull(sf.declared_type,'') NOT LIKE '%array%'
-          AND ifnull(sf.declared_type,'') NOT LIKE '$ref%'
-          AND ifnull(sf.declared_type,'') NOT IN ('anyOf','oneOf')
-          AND NOT EXISTS (SELECT 1 FROM field_stats fs
-                           WHERE fs.asset_type = sf.asset_type
-                             AND fs.json_pointer = sf.json_pointer)${filter}
+        WHERE ${DECLARED_UNOBSERVED_SQL}${filter}
         ORDER BY sf.asset_type, sf.json_pointer
         LIMIT ?`,
     )

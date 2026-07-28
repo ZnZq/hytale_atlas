@@ -53,17 +53,56 @@ export function toSchemaPointer(pointer: string): string {
  */
 const NOISE_VALUES = new Set(["", "none", "default", "null", "true", "false", "any", "all"]);
 
-/** SQL fragment excluding generic values from reference matching. */
-const NOT_NOISE = `lower(c.raw_value) NOT IN (${[...NOISE_VALUES]
-  .filter((v) => v.length > 0)
-  .map((v) => `'${v}'`)
-  .join(",")})`;
+/**
+ * SQL fragment excluding generic values, for whichever column holds the value.
+ *
+ * Every site derives its list from {@link NOISE_VALUES} rather than spelling one
+ * out: the dangling passes here and in `stats.ts` each carried a hand-written
+ * copy, so the set was declared once and written three times. They agreed only
+ * by inspection, and nothing would have failed had they stopped agreeing.
+ */
+export function notNoise(column: string): string {
+  return `lower(${column}) NOT IN (${[...NOISE_VALUES]
+    .filter((v) => v.length > 0)
+    .map((v) => `'${v}'`)
+    .join(",")})`;
+}
+
+const NOT_NOISE = notNoise("c.raw_value");
 
 /**
  * Longest plausible asset identifier. Anything longer is prose, a path, or a
  * serialised blob, and matching it against the symbol table only wastes rows.
  */
 const MAX_CANDIDATE_LENGTH = 96;
+
+/**
+ * The same ceiling for a value that names a **file** rather than an asset.
+ *
+ * The identifier limit was applied to every string, and a file path is not an
+ * identifier: measured on the release corpus, 1 144 scalar strings exceed 96
+ * characters and **959 of them name a path that is already in `files`**. Every
+ * one was an edge the file rule below would have made and never saw -- audio
+ * above all, since `Sounds/Environments/Zone1/.../Emit_Bird_Wings_Stereo_01.ogg`
+ * is 97 characters before anyone has done anything unusual. 403 of 4 243 `.ogg`
+ * files had no inbound reference as a result, and `refs <sound>` answered
+ * "nothing points at this" about a file three assets point at.
+ *
+ * Longest `Common/`-relative path in the archive is 137, so this leaves room for
+ * a patch to add deeper trees without silently truncating the graph again.
+ */
+const MAX_PATH_CANDIDATE_LENGTH = 192;
+
+/**
+ * Whether a value is shaped like the `Common/`-relative path the file rule joins on.
+ *
+ * Deliberately the same shape that rule tests for -- a dot, no spaces -- plus a
+ * slash. Nothing in the archive sits directly in `Common/`, so requiring the
+ * slash costs no edge and keeps long prose out of the exemption.
+ */
+function isPathLike(value: string): boolean {
+  return value.includes("/") && value.includes(".") && !value.includes(" ");
+}
 
 function escapeSegment(segment: string): string {
   return segment.replace(/~/g, "~0").replace(/\//g, "~1");
@@ -91,7 +130,8 @@ function escapeSegment(segment: string): string {
 export function collectCandidates(node: unknown, pointer = "", out: Candidate[] = []): Candidate[] {
   if (typeof node === "string") {
     const trimmed = node.trim();
-    if (trimmed.length > 0 && trimmed.length <= MAX_CANDIDATE_LENGTH) {
+    const limit = isPathLike(trimmed) ? MAX_PATH_CANDIDATE_LENGTH : MAX_CANDIDATE_LENGTH;
+    if (trimmed.length > 0 && trimmed.length <= limit) {
       out.push({ pointer, schemaPointer: toSchemaPointer(pointer), value: trimmed, kind: "string" });
     }
     return out;
@@ -190,6 +230,15 @@ export function resolveCandidates(db: Database): ResolveResult {
 
     // Inheritance: an explicit, engine-resolved relationship, not a guess.
     //
+    // `=`, not `IS`. SQLite's `IS` treats NULL as comparable, so two UNTYPED
+    // assets sharing a logical_id satisfied "the same type" and inherited from
+    // each other -- at `high`, the tier that means "not a heuristic at all",
+    // while nothing is known about either one's type. It produces no edge on the
+    // release corpus only because the untyped population is voxel data excluded
+    // from candidate extraction; 243 untyped assets live outside those roots and
+    // one `/Parent` among them is enough. `=` yields NULL for an unknown type,
+    // so the row is simply not claimed.
+    //
     // **Within a type.** A BlockSoundSet with Parent "Stone" inherits from the
     // BlockSoundSet named Stone, never from the PhysicalMaterial, BlockSet or
     // BlockParticleSet that happen to share the name. Matching on the identifier
@@ -203,7 +252,7 @@ export function resolveCandidates(db: Database): ResolveResult {
       SELECT c.asset_id, a.id, 'asset', 'INHERITS_FROM', c.json_pointer, 'high'
         FROM candidates c
         JOIN assets src ON src.id = c.asset_id
-        JOIN assets a ON a.logical_id = c.raw_value AND a.type IS src.type
+        JOIN assets a ON a.logical_id = c.raw_value AND a.type = src.type
        WHERE c.value_kind = 'string' AND ${NOT_NOISE}
          AND c.json_pointer = '/Parent' AND a.id <> c.asset_id
     `);
@@ -304,7 +353,7 @@ export function resolveCandidates(db: Database): ResolveResult {
     // ordinary dangling string, because the schema makes this one unambiguous.
     db.exec(`
       UPDATE candidates SET dangling = 2
-       WHERE value_kind = 'string' AND lower(raw_value) NOT IN ('none','default','null','true','false','any','all') AND EXISTS (
+       WHERE value_kind = 'string' AND ${notNoise("raw_value")} AND EXISTS (
              SELECT 1 FROM assets src
                JOIN schema_fields sf
                  ON sf.asset_type = src.type
@@ -323,11 +372,31 @@ export function resolveCandidates(db: Database): ResolveResult {
       -- overwrote every dangling = 2 row set moments earlier and the count of
       -- 'the schema says this points at an X named N, and no X is named N'
       -- came out as 1.
+      --
+      -- 'Matched nothing' means no edge, not 'no asset and no lang key'. Testing
+      -- only those two tables marked every resolved FILE reference dangling --
+      -- all 33 782 of them -- because a file is neither, and every localization
+      -- reference carrying a 'server.' root, because the LOCALIZED_BY join strips
+      -- that prefix and this test did not. 39 320 of the 119 723 rows reported as
+      -- 'identifier-shaped string matching nothing' had a visible edge saying
+      -- what they matched. Asking the edges directly covers every edge kind,
+      -- including any added later.
       UPDATE candidates SET dangling = 1
-       WHERE dangling = 0 AND value_kind = 'string' AND lower(raw_value) NOT IN ('none','default','null','true','false','any','all') AND raw_value GLOB '[A-Za-z]*[_A-Za-z0-9]*'
+       WHERE dangling = 0 AND value_kind = 'string' AND ${notNoise("raw_value")}
+         -- Two characters minimum, and that is deliberate rather than incidental:
+         -- the GLOB reads as "a letter, then anything, then an identifier
+         -- character", which cannot match a single character. 1 030 one-letter
+         -- values name no asset -- Seed 'A' on four noise assets, Axis 'Y' on
+         -- the scanners -- and they are scalar values, not identifiers that
+         -- failed to resolve. Calling them dangling would report 1 030 broken
+         -- references that are nothing of the kind.
+         AND raw_value GLOB '[A-Za-z]*[_A-Za-z0-9]*'
          AND raw_value NOT LIKE '% %'
          AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.logical_id = candidates.raw_value)
          AND NOT EXISTS (SELECT 1 FROM lang_keys l WHERE l.key = candidates.raw_value)
+         AND NOT EXISTS (SELECT 1 FROM edges e
+                          WHERE e.src = candidates.asset_id
+                            AND e.json_pointer = candidates.json_pointer)
     `);
 
     const count = (sql: string): number =>

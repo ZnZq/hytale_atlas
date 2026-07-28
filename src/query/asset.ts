@@ -83,9 +83,20 @@ interface RuleBook {
   mergesType(scope: string): boolean;
 }
 
-/** Loads a raw asset document by logical id. */
+/**
+ * Loads a raw asset document by logical id.
+ *
+ * `type` narrows the lookup and is passed when resolving a PARENT: inheritance
+ * is within a type, so a parent must be the asset of that name **of the child's
+ * type**. Without it the loader fell back to whatever the identifier ordering
+ * put first, and `get Eggsac` -- a BlockSoundSet -- merged in the
+ * BlockBoundingBoxes named `Cocoon`, answering with `Boxes` where `SoundEvents`
+ * belong. The same rule is enforced on the index side (`a.type = src.type` in
+ * `resolveCandidates`); this was the second half of it, unwritten.
+ */
 export type AssetLoader = (
   logicalId: string,
+  type?: string | null,
 ) => Promise<{ path: string; type: string | null; document: Json } | null>;
 
 /**
@@ -219,44 +230,54 @@ function mergeInto(
   const out: Record<string, unknown> = {};
 
   for (const [key, parentValue] of Object.entries(parent)) {
-    const schemaPointer = `${pointer}/${escapeSegment(key)}`;
-    const docPointer = `${outPointer}/${escapeSegment(key)}`;
-    const rule = ruleAt(rules, schemaPointer);
     if (key in child) continue;
-    // Unmarked means not inherited. Copying it anyway is how every child item
-    // came to claim its parent's Recipe.
-
+    // Everything the child does not restate is carried down; `inheritsProperty`
+    // is deliberately not a gate here, for the reasons above this function. The
+    // rule lookup that used to sit on this line was dead, and the comment beside
+    // it ("unmarked means not inherited") described a check that no longer runs.
     out[key] = parentValue;
-    origins.push({ pointer: docPointer, from: parentId, via: "inherited" });
+    origins.push({
+      pointer: `${outPointer}/${escapeSegment(key)}`,
+      from: parentId,
+      via: "inherited",
+    });
   }
 
   for (const [key, childValue] of Object.entries(child)) {
     const schemaPointer = `${pointer}/${escapeSegment(key)}`;
     const docPointer = `${outPointer}/${escapeSegment(key)}`;
-    const rule = ruleAt(rules, schemaPointer);
     const parentValue = parent[key];
-    const nested = rule?.scope ?? null;
+    const nested = ruleAt(rules, schemaPointer)?.scope ?? null;
 
-    // A map is a plain object with no `$ref` of its own whose ENTRIES cross into
-    // a merging type: `common:StateData./Definitions` has no scope, but
-    // `/Definitions/*` continues into BlockType. Descending into it keeps the
-    // current scope and extends the pointer, so the next step matches the `/*`
-    // rule. Without this a crop's `State` replaced the template's wholesale and
-    // `StageFinal.InteractionHint` -- the string that makes the last stage
-    // harvestable -- vanished from every plant.
-    const entryScope = nested === null ? (ruleAt(rules, `${schemaPointer}/*`)?.scope ?? null) : null;
-    const mapMerges = entryScope !== null && book.mergesType(entryScope);
+    // A map is a plain object the schema describes with an `additionalProperties`
+    // entry rule, i.e. one that has a `/*` pointer: `common:StateData./Definitions`
+    // has no scope of its own, but `/Definitions/*` continues into BlockType.
+    // Descending into it keeps the current scope and extends the pointer, so the
+    // next step matches the `/*` rule. Without this a crop's `State` replaced the
+    // template's wholesale and `StageFinal.InteractionHint` -- the string that
+    // makes the last stage harvestable -- vanished from every plant.
+    //
+    // Being a map is decided by the ENTRY RULE EXISTING, not by where the entries
+    // point. Keyed on `entryScope` -- the type the entries cross into -- a map
+    // whose values are arrays or inline objects has no scope, failed the test,
+    // and was replaced wholesale: `Farming.Stages` is `{Default, Harvested}` on
+    // Template_Crop_Block and `{Starting, Harvested}` on every tomato, so
+    // `Default` disappeared from the effective definition with nothing said,
+    // while the identically-declared `State.Definitions` merged correctly in the
+    // same command. Whether the ENTRIES combine is a separate question, answered
+    // one level down by this same function.
+    const isMap = nested === null && ruleAt(rules, `${schemaPointer}/*`) !== undefined;
 
     if (
       isPlainObject(parentValue) &&
       isPlainObject(childValue) &&
-      ((nested !== null && book.mergesType(nested)) || mapMerges)
+      ((nested !== null && book.mergesType(nested)) || isMap)
     ) {
       out[key] = mergeInto(
         parentValue,
         childValue,
-        mapMerges ? schemaPointer : "",
-        mapMerges ? scope : nested!,
+        isMap ? schemaPointer : "",
+        isMap ? scope : nested!,
         book,
         parentId,
         origins,
@@ -343,7 +364,8 @@ export async function resolveAsset(
       truncated = true; // cyclic Parent chain
       break;
     }
-    const loaded = await load(next);
+    // Within the root's type. See AssetLoader.
+    const loaded = await load(next, root.type);
     if (loaded === null) {
       missingParent = next;
       break;

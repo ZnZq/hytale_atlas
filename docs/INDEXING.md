@@ -43,7 +43,11 @@ Written to `schema_fields`, one row per (type, JSON pointer):
 - `declared_type`, `optional`, `default_value`, `enum_values`, `title`,
   `description`
 - `reference_target` — from `hytaleAssetRef`, a **sibling** of the `hytale`
-  block, not a member of it
+  block, not a member of it, and read on the property node **and inside its
+  `anyOf` branches**: an optional reference is spelled
+  `anyOf: [{$ref, hytaleAssetRef}, {null}]`, so 363 of the 802 markers sit on a
+  branch. Reading only the property node found 545 and graded the other 363 as
+  name collisions (`assetRefOf`, `src/sources/schema-doc.ts`)
 - `ref_scope` — the type a `$ref` crosses into; space-joined when the crossing is
   a union
 - `discriminator_property` / `discriminator_values` — from
@@ -93,7 +97,11 @@ tests do not tile: a `.json` outside the asset roots is neither. 29 files under
 **Candidates.** `collectCandidates` (`src/indexer/references.ts:91`) walks each
 parsed document and records every scalar leaf:
 
-- strings, trimmed, `1..96` characters (`MAX_CANDIDATE_LENGTH`)
+- strings, trimmed, `1..96` characters (`MAX_CANDIDATE_LENGTH`) — raised to 192
+  for a value shaped like a path (a slash, a dot, no spaces), because the ceiling
+  is a rule about *identifiers* and a file path is not one: 959 of the 1 144
+  over-long strings named a path already sitting in `files`, and every one was a
+  file edge that was never made
 - numbers and booleans, with `value_kind` — collecting strings only had left
   1 963 numeric and boolean fields absent from the observed layer *by
   construction*, so 16 770 of 17 400 fields read as "unused"
@@ -110,7 +118,14 @@ Each candidate stores both `json_pointer` (with real indices) and
 indexed and searchable but **contribute no edges** — voxel data whose strings are
 coordinates and palette indices. `refs` states this in every answer.
 
-**Localization.** `.lang` files are parsed by `parseLang` (`src/sources/lang.ts:71`)
+**Localization.** A string is a translation reference when it carries a known
+root (`server.`/`common.`) **or** the catalog holds a key by that name and it has
+at least two dots — the same question `LOCALIZED_BY` asks in SQL. Demanding the
+root here while the SQL join stripped it left the nine `npcRoles.Test_Motion_*`
+roles with a localization edge and an identifier-only search row: the index knew
+their names and search could not find them by one.
+
+`.lang` files are parsed by `parseLang` (`src/sources/lang.ts:71`)
 and stored in `lang_keys` with a `root` column — the file's own stem, which is
 the prefix an asset must write (`server.items.X.name` for a key stored as
 `items.X.name`). Without it the tool printed keys that do not resolve.
@@ -132,7 +147,7 @@ The in-code comment calling these "still indexed by id, just not localized" is
 true of the first half and misleading about the second: they are not
 searchable, and they contribute no edges.
 
-Result: **35 074 assets (14 872 typed), 24 923 files, 479 117 candidates,
+Result: **35 074 assets (14 872 typed), 24 923 files, 480 074 candidates,
 45 449 FTS rows, 50 645 lang keys.**
 
 ---
@@ -145,7 +160,7 @@ archive.
 
 | Kind | Rule | Confidence |
 |---|---|---|
-| `INHERITS_FROM` | `json_pointer = '/Parent'`, target of the **same type** | `high` |
+| `INHERITS_FROM` | `json_pointer = '/Parent'`, target of the **same known type** (`=`, not `IS`: `IS` made two untyped assets "the same type") | `high` |
 | `LOCALIZED_BY` | value has ≥ 2 dots and, after stripping a `server.`/`common.` root, matches a key — joined **against `en-US` only**, so one edge per key rather than per locale | `high` |
 | `REFERENCES_FILE` | `'Common/' \|\| value` matches a `files.path` — resolved **only against the `Common/` root** | `high` |
 | `REFERENCES` (declared) | the field declares `reference_target` and the target is of that type | `high` |
@@ -160,20 +175,27 @@ The same-type constraint on inheritance matters: matching on identifier alone
 pointed 845 of 4 575 inheritance edges at the wrong type, all labelled `high`.
 
 The `Common/` prefix on the file rule is load-bearing and undocumented in the
-code: all 33 782 file edges point into `Common/`, and **zero** reach the 109
-files under `Server/` or the 9 under `Cosmetics/`. 5 426 files have no inbound
+code: all 34 739 file edges point into `Common/`, and **zero** reach the 109
+files under `Server/` or the 9 under `Cosmetics/`. 4 819 files have no inbound
 edge at all. A stored value is a `Common/`-relative path, which is why `refs`
 matches on the basename as well.
 
 **Skipped:** `NOISE_VALUES` — `""`, `none`, `default`, `null`, `true`, `false`,
 `any`, `all` (`references.ts:54`) — filtered at **edge time, not extraction
 time**. Filtering earlier destroyed real values: `Default` is every crop's
-starting stage set and `All` is a real bench category.
+starting stage set and `All` is a real bench category. Every site builds its
+exclusion list from that one set through `notNoise(column)`; the two dangling
+passes each carried a hand-written copy that agreed only by inspection.
 
 `candidates.dangling` is also set here: `1` for an identifier-shaped string
-matching nothing (119 723).
+matching nothing (80 340). **Matching nothing means producing no edge**, not
+"naming no asset and no lang key": testing only those two tables marked all
+33 782 resolved file references dangling, plus every localization reference
+spelled with its `server.` root, since the `LOCALIZED_BY` join strips that prefix
+and the dangling test did not. 39 320 of the 119 723 rows once reported here had
+a visible edge saying what they matched.
 
-Result: **162 054 edges** — 118 993 `REFERENCES`, 33 782 `REFERENCES_FILE`,
+Result: **163 011 edges** — 118 993 `REFERENCES`, 34 739 `REFERENCES_FILE`,
 5 546 `LOCALIZED_BY`, 3 733 `INHERITS_FROM`.
 
 ---
@@ -186,12 +208,22 @@ possible, and the only one whose job is a *join*.
 Aggregates candidates into `field_stats`, grouped by the **aligned**
 `(schema_scope, schema_pointer)` and skipping every candidate whose scope is
 still `NULL` (`stats.ts:438-451`). That exclusion is large and worth stating:
-45 319 of 479 117 candidates never align, 44 938 of them `NPCRole` — a type
+45 319 of 480 074 candidates never align, 44 938 of them `NPCRole` — a type
 with 975 assets and no declared fields. Nothing about them reaches `describe`.
 
 Columns: `count` (occurrences), `of_total` (distinct assets), `cardinality`
-(distinct values), `target_types` (filled from the edges pass 2 built).
-`value_types` is inserted as `NULL` and never written.
+(distinct values), `target_types` (filled from the edges pass 2 built) and
+`value_types` — the JSON types seen at the pointer, `string` / `number` /
+`boolean`. On the release corpus every field is single-typed (1 499 string,
+1 016 number, 360 boolean); the column earns its place on the 418 fields the
+schema does not describe, where it is the only statement of what they hold.
+
+`target_types` is keyed on `candidates.schema_scope` — the scope **this pass**
+assigns — not on the source asset's own type. The two agree only for a field
+declared at the top level of its type, so joining on `assets.type` left the
+column empty by construction for 159 of the 224 fields that declare a
+`reference_target`, the most used ones among them (`BlockType./HitboxType`,
+`common:ItemDrop./ItemId`). Same trap as the two rules below.
 
 **Alignment** is the hard part: a corpus pointer such as
 `Item + /BlockType/Gathering/Breaking/GatherType` must be rebased onto
@@ -221,10 +253,11 @@ Then, still in this pass:
   destination; `low → medium` when the field declares any target
 - **nested `/Parent` → `INHERITS_FROM/high`** — an inline object can declare a
   parent too, and only the top-level one was recognised
-- **broken declared references** — `dangling = 2`, 2 674 occurrences: the field
+- **broken declared references** — `dangling = 2`, 2 773 occurrences: the field
   declares a target type and the value names no asset of it. `Item./Categories/*`
   names 38 ids that do not exist, 2 175 times; `BlockType./HitboxType`'s own
-  **default**, `"Full"`, names no `BlockBoundingBoxes`, 256 times.
+  **default**, `"Full"`, names no `BlockBoundingBoxes`, 256 times. 2 548 of the
+  2 773 name no asset at all; the other 225 name one of the wrong type.
 
 Both of the last two must run **here, not in stage 2** — they join on
 `schema_scope`, which this pass assigns. Placed in stage 2 they match nothing, in
@@ -291,21 +324,30 @@ vanilla. Reported as "no bench declares this id", not interpreted.
 | `.blockyanim`, `.blockymodel`, `.ui`, textures | recorded as `files` rows and reference targets; contents unparsed |
 | `$`-prefixed keys | node-editor scratch, on both schema and corpus sides |
 | Field values above 40 distinct | count only, so `--limit` cannot lift it |
-| Strings over 96 characters | not candidates |
+| Strings over 96 characters, or over 192 when path-shaped | not candidates |
 | `CommonAssetsIndex.hashes` | unused |
 
 ---
 
 ## Known gaps
 
-- **`Q22`** — 1 116 `anyOf` fields carry a `ref_scope` and no `reference_target`.
-  `Item./BlockType` declares `hytaleAssetRef` on the property node and the row
-  records `NULL`, so a declared reference is graded as a name collision. Fourth
-  marker in this project found one level away from where it was read.
 - **`NPCRole`** — 975 assets, zero declared fields; all 44 938 of its candidates
   are unaligned. Commands say so rather than calling the type nonexistent.
 - **No outbound view** — `refs` answers "what points at X"; nothing yet answers
-  "what does X point at, and does it resolve", which is where the 2 674 broken
+  "what does X point at, and does it resolve", which is where the 2 773 broken
   references belong alongside `validate`.
+- **`MAX_POINTER_DEPTH = 8`** — the schema walk stops there, so 62 observed
+  pointers deeper than eight segments have no declared counterpart and appear
+  in `describe` with an observed layer only. Raising it is not free: the comment
+  on the constant records that at 20 the flatten did not finish in ten minutes.
+- **A `dangling = 2` candidate may also carry a `REFERENCES` edge** — 169 do.
+  The field declares type X, no X has that name, and a same-named asset of
+  another type produced a heuristic edge. Both statements are true; `validate`
+  needs to present them together rather than let them read as a contradiction.
+- **1 309 values begin with `*`** — 37 of them flagged broken. Only 49 name an
+  asset once the prefix is dropped, so the `*` is not a plain decoration.
+  Reported as-is; the tool does not know what the game means by it.
 
-Both are recorded with measurements in `docs/init/OPEN-QUESTIONS.md`.
+Both are recorded with measurements in `docs/init/OPEN-QUESTIONS.md`. `Q22` is
+closed: the marker was being read on the property node only, and 363 of 802
+`hytaleAssetRef` declarations sit inside an `anyOf` branch.

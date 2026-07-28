@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { collectCandidates, toSchemaPointer } from "./references.ts";
+import { openDatabase } from "../db/open.ts";
+import { collectCandidates, resolveCandidates, toSchemaPointer } from "./references.ts";
 
 /**
  * Candidate collection decides what the observed layer can ever see.
@@ -95,4 +96,126 @@ test("node-editor scratch keys are still skipped, whatever their value type", ()
 
 test("schema pointers collapse every array index, not just the first", () => {
   assert.equal(toSchemaPointer("/A/0/B/12/C"), "/A/*/B/*/C");
+});
+
+/**
+ * The 96-character ceiling is a rule about IDENTIFIERS, and it was applied to
+ * every string. 959 of the 1 144 over-long values in the release corpus name a
+ * path that is already in `files`, audio above all -- so the file rule never saw
+ * them and 403 `.ogg` files ended up with no inbound reference at all.
+ */
+test("a file path longer than the identifier ceiling is still collected", () => {
+  const path =
+    "Sounds/Environments/Zone1/Environments/Forest/Day/Autumn/Emitters/Birds/Emit_Bird_Wings_Stereo_01.ogg";
+  assert.ok(path.length > 96, "fixture must exceed the identifier ceiling");
+  assert.deepEqual(
+    collectCandidates({ Track: path }).map((c) => c.value),
+    [path],
+  );
+});
+
+test("the exemption is for paths, not for length: prose and bare words stay out", () => {
+  const prose = `${"A sentence about the asset. ".repeat(4)}It ends here.`;
+  const noSlash = `${"Very_Long_Identifier_".repeat(6)}End.json`;
+  assert.ok(prose.length > 96 && noSlash.length > 96);
+  // prose has spaces; noSlash has no directory separator -- nothing in the
+  // archive sits directly in Common/, so neither can name a file.
+  assert.deepEqual(collectCandidates({ Description: prose }), []);
+  assert.deepEqual(collectCandidates({ Name: noSlash }), []);
+});
+
+test("a path is not collected without limit either", () => {
+  const absurd = `Sounds/${"Nested/".repeat(40)}Thing.ogg`;
+  assert.ok(absurd.length > 192);
+  assert.deepEqual(collectCandidates({ Track: absurd }), []);
+});
+
+/**
+ * `dangling = 1` is the population `validate` reports as "named something and
+ * matched nothing". Testing only `assets` and `lang_keys` marked every resolved
+ * FILE reference dangling -- all 33 782 -- and every localization reference
+ * spelled with its `server.` root, because the LOCALIZED_BY join strips that
+ * prefix and this test did not.
+ */
+test("a candidate that resolved to a file is not reported as dangling", () => {
+  const db = openDatabase(":memory:");
+  db.prepare("INSERT INTO packs (id, name, path, kind) VALUES (1,'Hytale','Assets.zip','vanilla')").run();
+  db.prepare(
+    "INSERT INTO assets (id, pack_id, logical_id, path) VALUES (1,1,'Ambience_Savannah','Server/Audio/AmbienceFX/Ambience_Savannah.json')",
+  ).run();
+  db.prepare("INSERT INTO files (id, pack_id, path, kind) VALUES (1,1,'Common/Sounds/Savannah_LOOP.ogg','audio')").run();
+  const candidate = db.prepare(
+    "INSERT INTO candidates (asset_id, json_pointer, schema_pointer, raw_value, value_kind) VALUES (1,?,?,?,'string')",
+  );
+  candidate.run("/Track", "/Track", "Sounds/Savannah_LOOP.ogg");
+  candidate.run("/Nowhere", "/Nowhere", "Sounds/Absent_LOOP.ogg");
+
+  const result = resolveCandidates(db);
+  assert.equal(result.fileReferences, 1);
+
+  const rows = db
+    .prepare("SELECT json_pointer, dangling FROM candidates ORDER BY json_pointer")
+    .all() as unknown as { json_pointer: string; dangling: number }[];
+  assert.deepEqual(
+    rows.map((r) => [r.json_pointer, r.dangling]),
+    [
+      ["/Nowhere", 1], // names no file: genuinely dangling
+      ["/Track", 0], // has a REFERENCES_FILE edge saying what it matched
+    ],
+  );
+  assert.equal(result.dangling, 1);
+  db.close();
+});
+
+/**
+ * `IS` treats NULL as comparable, so two assets of unknown type satisfied "the
+ * same type" and inherited from each other at `high` -- the tier that means the
+ * relationship was read, not guessed.
+ */
+test("two untyped assets do not inherit from each other", () => {
+  const db = openDatabase(":memory:");
+  db.prepare("INSERT INTO packs (id, name, path, kind) VALUES (1,'Hytale','Assets.zip','vanilla')").run();
+  // Same logical_id, no type on either: nothing is known about their kinds.
+  db.prepare("INSERT INTO assets (id, pack_id, logical_id, path) VALUES (1,1,'Entry.node','Server/A/Entry.node.json')").run();
+  db.prepare("INSERT INTO assets (id, pack_id, logical_id, path) VALUES (2,1,'Entry.node','Server/B/Entry.node.json')").run();
+  db.prepare(
+    "INSERT INTO candidates (asset_id, json_pointer, schema_pointer, raw_value, value_kind) VALUES (1,'/Parent','/Parent','Entry.node','string')",
+  ).run();
+
+  const result = resolveCandidates(db);
+  assert.equal(result.inherits, 0);
+  db.close();
+});
+
+test("two assets of the same known type still inherit", () => {
+  const db = openDatabase(":memory:");
+  db.prepare("INSERT INTO packs (id, name, path, kind) VALUES (1,'Hytale','Assets.zip','vanilla')").run();
+  db.prepare("INSERT INTO asset_types (id, source) VALUES ('BlockSoundSet','codec')").run();
+  db.prepare("INSERT INTO assets (id, pack_id, logical_id, path, type) VALUES (1,1,'Stone_Cobble','Server/S/Stone_Cobble.json','BlockSoundSet')").run();
+  db.prepare("INSERT INTO assets (id, pack_id, logical_id, path, type) VALUES (2,1,'Stone','Server/S/Stone.json','BlockSoundSet')").run();
+  db.prepare(
+    "INSERT INTO candidates (asset_id, json_pointer, schema_pointer, raw_value, value_kind) VALUES (1,'/Parent','/Parent','Stone','string')",
+  ).run();
+
+  assert.equal(resolveCandidates(db).inherits, 1);
+  db.close();
+});
+
+test("a localization reference carrying its server. root is not dangling either", () => {
+  const db = openDatabase(":memory:");
+  db.prepare("INSERT INTO packs (id, name, path, kind) VALUES (1,'Hytale','Assets.zip','vanilla')").run();
+  db.prepare(
+    "INSERT INTO assets (id, pack_id, logical_id, path) VALUES (1,1,'Item_Apple','Server/Item/Items/Item_Apple.json')",
+  ).run();
+  db.prepare(
+    "INSERT INTO lang_keys (pack_id, key, locale, value, root) VALUES (1,'items.apple.name','en-US','Apple','items')",
+  ).run();
+  db.prepare(
+    "INSERT INTO candidates (asset_id, json_pointer, schema_pointer, raw_value, value_kind) VALUES (1,'/Name','/Name','server.items.apple.name','string')",
+  ).run();
+
+  const result = resolveCandidates(db);
+  assert.equal(result.localizedBy, 1);
+  assert.equal(result.dangling, 0);
+  db.close();
 });

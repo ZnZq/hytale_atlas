@@ -1,6 +1,8 @@
 import type { Database } from "../db/open.ts";
 import { VALUE_SEP_SQL } from "../db/values.ts";
+import { DECLARED_UNOBSERVED_SQL } from "../query/schema.ts";
 import { scopes } from "../sources/schema-doc.ts";
+import { notNoise } from "./references.ts";
 
 /**
  * Pass 3 -- field statistics.
@@ -442,7 +444,15 @@ export function computeFieldStats(db: Database): StatsResult {
         c.schema_pointer,
         count(*)                                   AS count,
         count(DISTINCT c.asset_id)                 AS of_total,
-        NULL,
+        -- The JSON types actually seen here. Inserted as NULL and never written
+        -- until now, which left the 418 observed-but-undeclared fields with no
+        -- way to say even whether they hold a number or a string -- the one
+        -- question the observed layer exists to answer when the schema is silent.
+        (SELECT group_concat(k, ${VALUE_SEP_SQL}) FROM (
+           SELECT DISTINCT v.value_kind AS k FROM candidates v
+            WHERE v.schema_scope = c.schema_scope
+              AND v.schema_pointer = c.schema_pointer
+            ORDER BY v.value_kind))         AS value_types,
         NULL,
         count(DISTINCT c.raw_value)                AS cardinality
       FROM candidates c
@@ -455,6 +465,20 @@ export function computeFieldStats(db: Database): StatsResult {
     // built. This is the observed counterpart of schema_fields.reference_target:
     // where both exist they should agree, and where they disagree that is a
     // finding rather than a bug.
+    //
+    // Keyed on `candidates.schema_scope`, the scope the alignment above assigns
+    // -- NOT on the source asset's own type. The two are the same only for a
+    // field declared at the top level of its type; anything reached through a
+    // `$ref` lands in another namespace, and no asset carries that as its type.
+    // Joined on `assets.type` the subquery was empty by construction for 1 987 of
+    // 2 875 rows, so 159 of the 224 fields that declare a reference_target -- the
+    // most used ones, BlockType./HitboxType at 3 528 observations,
+    // common:ItemDrop./ItemId at 2 732 -- reported no observed target at all.
+    // The same trap the nested-Parent and dangling rules below fell into.
+    //
+    // No `LIMIT` on the inner select. It was 8, which truncated 12 of the 275
+    // fields silently -- the widest resolves to 17 types -- and a list a reader
+    // cannot tell is partial is the failure mode this project keeps finding.
     db.exec(`
       UPDATE field_stats SET target_types = (
         -- The shared encoding, like the other two value columns. This one was
@@ -465,15 +489,13 @@ export function computeFieldStats(db: Database): StatsResult {
         SELECT group_concat(t, ${VALUE_SEP_SQL}) FROM (
           SELECT DISTINCT d.type AS t
             FROM candidates c
-            JOIN assets s ON s.id = c.asset_id
             JOIN edges e ON e.src = c.asset_id
                         AND e.json_pointer = c.json_pointer
                         AND e.dst_kind = 'asset'
             JOIN assets d ON d.id = e.dst
-           WHERE s.type = field_stats.asset_type
+           WHERE c.schema_scope = field_stats.asset_type
              AND c.schema_pointer = field_stats.json_pointer
-             AND d.type IS NOT NULL
-           LIMIT 8))
+             AND d.type IS NOT NULL))
       WHERE EXISTS (
         SELECT 1 FROM schema_fields sf
          WHERE sf.asset_type = field_stats.asset_type
@@ -639,7 +661,7 @@ export function computeFieldStats(db: Database): StatsResult {
       UPDATE candidates SET dangling = 2
        WHERE value_kind = 'string'
          AND schema_scope IS NOT NULL
-         AND lower(raw_value) NOT IN ('none','default','null','true','false','any','all')
+         AND ${notNoise("raw_value")}
          AND EXISTS (SELECT 1 FROM schema_fields sf
                       WHERE sf.asset_type = candidates.schema_scope
                         AND sf.json_pointer = candidates.schema_pointer
@@ -656,20 +678,13 @@ export function computeFieldStats(db: Database): StatsResult {
       rows: one("SELECT count(*) AS n FROM field_stats"),
       typesCovered: one("SELECT count(DISTINCT asset_type) AS n FROM field_stats"),
       enumCandidates: one("SELECT count(*) AS n FROM schema_fields WHERE observed_values IS NOT NULL"),
-      // Declared but never used: the input to find_undocumented.
-      //
-      // Containers are excluded. Candidates are string scalars only, so an object
-      // or array pointer can never appear in field_stats however heavily it is
-      // used -- counting them made 95% of the schema look unused when the real
-      // figure is far smaller.
-      schemaOnlyFields: one(`
-        SELECT count(*) AS n FROM schema_fields sf
-         WHERE ifnull(sf.declared_type,'') NOT IN ('object','array','anyOf','oneOf')
-           AND ifnull(sf.declared_type,'') NOT LIKE '%object%'
-           AND ifnull(sf.declared_type,'') NOT LIKE '%array%'
-           AND NOT EXISTS (SELECT 1 FROM field_stats fs
-                            WHERE fs.asset_type = sf.asset_type
-                              AND fs.json_pointer = sf.json_pointer)`),
+      // Declared but never used: the input to find_undocumented, counted with
+      // that command's own predicate so the two cannot disagree. This copy had
+      // dropped the `$ref` clause and reported 8 439 where `undocumented` said
+      // 7 405 -- the same question, the same table, two numbers.
+      schemaOnlyFields: one(
+        `SELECT count(*) AS n FROM schema_fields sf WHERE ${DECLARED_UNOBSERVED_SQL}`,
+      ),
       // Used but never declared: either our pointer normalisation is wrong, or the
       // corpus carries fields the schema does not describe. Both are worth seeing.
       undeclaredFields: one(`

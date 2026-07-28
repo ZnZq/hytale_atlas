@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { existsSync } from "node:fs";
+
 import { looksMangled, normalizeFieldPointer } from "../query/schema.ts";
 import { detectInstallation, detectProject } from "../sources/detect.ts";
 import {
@@ -96,10 +98,11 @@ Options
                                and 'refs'; identifiers are not unique across types
   --raw                        'get' prints the effective JSON and nothing else
   --limit <n>                  Result cap. Defaults: search 20, search-schema 20,
-                               describe 60, refs 40, undocumented 40, bench 200.
-                               Every one says so when it truncates. It does NOT
-                               lift the ceiling on a field's observed values --
-                               those are not stored above it.
+                               search-lang 20, describe 60, refs 40, types 200,
+                               undocumented 40, bench 200. Every one says so when
+                               it truncates. It does NOT lift the ceiling on a
+                               field's observed values -- those are not stored
+                               above it.
   --set <path>                 Evaluation set (default docs/evaluation/search-phrases.json)
   -h, --help                   This message
 `;
@@ -233,10 +236,25 @@ function parseArgs(argv: readonly string[]): Args {
  */
 async function cmdStatus(args: Args): Promise<number> {
   const patchlineFlag = args.flags.get("patchline");
-  const install = detectInstallation(
+  const detected = detectInstallation(
     typeof patchlineFlag === "string" ? patchlineFlag : undefined,
   );
   const project = detectProject();
+
+  // `status` is documented as "where the game is", and it read only --patchline:
+  // `--assets C:/nope/Assets.zip status` printed the DETECTED archive path while
+  // every other command used the override, then asserted "Tier: 1 + 2" two lines
+  // above "no Assets.zip, nothing to index". The one command whose job is to say
+  // which files are in play was the one command that did not apply the flags
+  // choosing them.
+  const assetsFlag = args.flags.get("assets");
+  const jarFlag = args.flags.get("jar");
+  const overrides = {
+    ...(typeof assetsFlag === "string" ? { assetsZip: assetsFlag } : {}),
+    ...(typeof jarFlag === "string" ? { serverJar: jarFlag } : {}),
+  };
+  const install = detected === null ? null : { ...detected, ...overrides };
+  const overridden = Object.keys(overrides);
 
   const lines: string[] = [];
   lines.push(`Project:     ${project.kind}  (${project.root})`);
@@ -258,15 +276,22 @@ async function cmdStatus(args: Args): Promise<number> {
             .join(", ")})`
         : ""),
   );
-  lines.push(`Assets.zip:  ${install.assetsZip ?? "not found"}`);
-  lines.push(`Server JAR:  ${install.serverJar ?? "not found"}`);
+  const mark = (name: string): string => (overridden.includes(name) ? "  (from --" + (name === "assetsZip" ? "assets" : "jar") + ")" : "");
+  lines.push(`Assets.zip:  ${install.assetsZip ?? "not found"}${mark("assetsZip")}`);
+  lines.push(`Server JAR:  ${install.serverJar ?? "not found"}${mark("serverJar")}`);
   lines.push(`Bundled JVM: ${install.bundledJava ?? "not found"}`);
   lines.push(`UI language: ${install.uiLanguage ?? "unknown"}  (display only; search covers every indexed locale)`);
 
   // Tiers per docs/init/06-CLI-UX.md. Tier 2 needs the JAR *and* a JVM to run it;
   // the game bundles one, so this is the normal case rather than the lucky one.
-  const tier1 = install.assetsZip !== null;
-  const tier2 = tier1 && install.serverJar !== null && install.bundledJava !== null;
+  //
+  // A source counts only if it is actually there. Detection returns a path it
+  // expects, and an overridden one is whatever the caller typed, so a tier was
+  // asserted from a path alone: `--assets C:/nope/Assets.zip status` claimed
+  // "Tier: 1 + 2" two lines above "no Assets.zip, nothing to index".
+  const present = (path: string | null): boolean => path !== null && existsSync(path);
+  const tier1 = present(install.assetsZip);
+  const tier2 = tier1 && present(install.serverJar) && present(install.bundledJava);
   const tier3 = project.kind !== "none";
 
   const tiers = [tier1 && "1", tier2 && "2", tier3 && "3"].filter(Boolean).join(" + ");
@@ -286,7 +311,6 @@ async function cmdStatus(args: Args): Promise<number> {
   // Reported from the cache itself rather than from a constant. This line read
   // "not built (indexing is not implemented yet)" long after indexing worked, so
   // status contradicted every other command and made the tool look broken.
-  const assetsFlag = args.flags.get("assets");
   lines.push(
     `Index:       ${await indexSummary(
       typeof assetsFlag === "string" ? assetsFlag : undefined,

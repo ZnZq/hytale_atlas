@@ -574,15 +574,27 @@ test("a search miss explains that search indexes names, not values", opts, () =>
   // "No matches." reads as "this string appears nowhere". Searching a sound-set
   // id returned the set itself and none of the items referencing it.
   //
-  // Round 16: the `refs <query>` suggestion this used to assert was half of a
-  // closed loop -- `search X` said try `refs X`, `refs X` said try `search X` --
-  // which three blind trials walked into and none escaped. It is now offered
-  // only when the string really is an asset, so the two commands cannot hand a
-  // reader back and forth over a name that exists nowhere.
+  // Round 16 suppressed the `refs` suggestion entirely to break a closed loop
+  // (`search X` -> `refs X` -> `search X`). That fixed the loop and broke the
+  // case the sentence above the suggestion is actually about: `ApplyEntityEffect`
+  // is a field VALUE, five occurrences across four assets, so `refs` answers it.
+  // Round 18 had three agents follow "ask for references to it instead" into a
+  // dead end because the only command offered was `search-schema`.
+  //
+  // The invariant is not "never suggest refs" -- it is "suggest a command only
+  // when it answers for this token". Both halves are asserted here.
   const { out, code } = run("search", "ApplyEntityEffect");
   assert.equal(code, 1);
   assert.match(out, /NOT field values/);
-  assert.doesNotMatch(out, /hytale-atlas refs ApplyEntityEffect/, "still loops back to refs");
+  assert.match(out, /hytale-atlas refs ApplyEntityEffect/, "the value case lost its one route");
+
+  // ...and running it does answer, rather than pointing back here.
+  const followed = run("refs", "ApplyEntityEffect");
+  assert.match(followed.out, /appears as a VALUE/, "the suggested command is a dead end");
+
+  // A token that is nothing at all gets no `refs`, so the loop cannot re-form.
+  const nothing = run("search", "zzqqxx-nothing");
+  assert.doesNotMatch(nothing.out, /hytale-atlas refs zzqqxx-nothing/, "the loop is back");
 
   // And a real asset that simply has no localized name still gets the pointer.
   const real = run("search", "Rock_Stone", "--type", "ItemToolSpec");
@@ -1632,7 +1644,15 @@ test("refs resolves a file, not just an asset", opts, () => {
 test("a name that is neither asset, file nor value says all three", opts, () => {
   const { out, code } = run("refs", "zzqqxx-nothing");
   assert.equal(code, 1);
-  assert.match(out, /no file by that name/);
+  // All three branches named, and the file one scoped to the index that was
+  // actually consulted. The blanket "no file by that name" was asserted about
+  // anything absent from the file-reference index -- including
+  // `Tool_Pickaxe_Iron.json`, a path `get` prints in its own header. Asset
+  // documents are never in that index, so the sentence was false by
+  // construction for every asset the reader had just been shown.
+  assert.match(out, /No asset/);
+  assert.match(out, /nothing carries it as a value/);
+  assert.match(out, /No file of that name is REFERENCED/);
 });
 
 // ---------------------------------------------------------------------------
@@ -1737,6 +1757,218 @@ test("the api layer agrees with the CLI on ambiguous identifiers", async () => {
     const note = r.caveats.find((c) => c.code === "ambiguous-identifier");
     assert.ok(note !== undefined, "no ambiguity caveat");
     assert.match(note.message, new RegExp("^" + String(total) + " assets are named"));
+  } finally {
+    db.close();
+  }
+});
+
+/**
+ * INVARIANT: a suggested command answers for the token it was suggested with.
+ *
+ * Every command decided this from one fact of its own, and the results
+ * contradicted the prose above them: `search <value>` printed "to find what uses
+ * a value, ask for references to it instead" and then withheld `refs` unless the
+ * token was an ASSET — the inverse of the case. Three of five blind trials
+ * followed the printed advice into a dead end; one nearly filed a capability gap
+ * because the value's only vanilla use sat behind the `refs` never offered.
+ *
+ * Testing the rule rather than the three reported tokens: whatever a miss
+ * suggests, running it must produce something.
+ */
+test("every command a miss suggests actually answers for that token", async () => {
+  const ops = await import("../../dist/api/operations.js");
+  let db;
+  try {
+    db = await ops.openIndex();
+  } catch {
+    return;
+  }
+  try {
+    // A field value, a localization key, a bench category, a bench id, an asset.
+    const tokens = [
+      "Workbench_Tools",
+      "items.Weapon_Sword_Adamantite.name",
+      "Workbench",
+      "Tool_Pickaxe_Iron",
+      "RunOnBlockTypes",
+    ];
+    for (const token of tokens) {
+      const id = ops.identify(db, token);
+      const claims =
+        id.assets + id.valueOccurrences + id.files + (id.langKey ? 1 : 0) +
+        (id.benchId ? 1 : 0) + (id.benchCategory ? 1 : 0);
+      assert.ok(claims > 0, `identify() knows nothing about ${token}`);
+
+      // Whatever it claims the token is, the corresponding command must answer.
+      if (id.langKey !== null) {
+        const r = ops.langOp(db, token, 5);
+        assert.ok(r.value.length > 0, `search-lang would be suggested for ${token} and misses`);
+      }
+      if (id.benchId) {
+        assert.ok(
+          ops.benchRecipeCount(db, token) >= 0 && ops.benchIdExists(db, token),
+          `bench would be suggested for ${token} and misses`,
+        );
+      }
+      if (id.assets === 0 && id.valueOccurrences > 0) {
+        const usage = ops.valueUsage(db, token, 5);
+        assert.ok(
+          usage.occurrences > 0,
+          `refs would be suggested as a VALUE lookup for ${token} and misses`,
+        );
+      }
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test("a token that is both an asset and a value discloses the branch not taken", async () => {
+  // `refs` picks the asset branch silently. Every Quality value in the game is
+  // also the name of a BlockMigration asset, so `refs 5` answered with four
+  // NPCRole rows and no hint that the value report existed.
+  const ops = await import("../../dist/api/operations.js");
+  let db;
+  try {
+    db = await ops.openIndex();
+  } catch {
+    return;
+  }
+  try {
+    const id = ops.identify(db, "5");
+    if (id.assets === 0 || id.valueOccurrences === 0) return; // patchline moved
+    assert.ok(
+      id.assets > 0 && id.valueOccurrences > 0,
+      "fixture must be both an asset and a value",
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("the ambiguity note lists distinct types, not one entry per asset", async () => {
+  // `refsOp` passed every matching row, so 461 untyped Entry.node assets
+  // rendered the word "untyped" 461 times inside one sentence.
+  const ops = await import("../../dist/api/operations.js");
+  let db;
+  try {
+    db = await ops.openIndex();
+  } catch {
+    return;
+  }
+  try {
+    const r = ops.refsOp(db, "Entry.node", undefined, 2);
+    const note = r.caveats.find((c) => c.code === "ambiguous-identifier");
+    assert.ok(note !== undefined, "no ambiguity caveat");
+    const untyped = note.message.match(/untyped/g) ?? [];
+    assert.equal(untyped.length, 1, `type repeated ${untyped.length} times: ${note.message}`);
+    assert.ok(note.message.length < 200, `note is ${note.message.length} chars long`);
+  } finally {
+    db.close();
+  }
+});
+
+test("a capped list of broken references says how many exist", async () => {
+  // Eight of 63 unresolved BlockTypes were printed alphabetically, with nothing
+  // to say the list ended early.
+  const ops = await import("../../dist/api/operations.js");
+  let db;
+  try {
+    db = await ops.openIndex();
+  } catch {
+    return;
+  }
+  try {
+    const broken = ops.brokenRefsFor(db, "common:BlockTypeFarmingStageData", "/Block");
+    if (broken.distinct === 0) return; // patchline moved; nothing to assert
+    assert.ok(broken.shown.length <= 8);
+    assert.ok(
+      broken.distinct >= broken.shown.length,
+      "distinct must count the whole population",
+    );
+    assert.ok(broken.occurrences >= broken.distinct);
+  } finally {
+    db.close();
+  }
+});
+
+test("a basename shared by many files reports how many were withheld", async () => {
+  // 291 basenames name more than five files; Model.blockymodel names 173, and
+  // five groups were shown with the other 168 unmentioned.
+  const ops = await import("../../dist/api/operations.js");
+  let db;
+  try {
+    db = await ops.openIndex();
+  } catch {
+    return;
+  }
+  try {
+    const r = ops.fileRefsOp(db, "Model.blockymodel", 5);
+    if (r.value.length < 5) return;
+    const note = r.caveats.find(
+      (c) => c.code === "truncated" && c.message.includes("files named"),
+    );
+    assert.ok(note !== undefined, "no notice that files were withheld");
+    assert.match(note.message, /of \d[\d,]* files named/);
+  } finally {
+    db.close();
+  }
+});
+
+test("an undeclared observed field still reports the type it holds", async () => {
+  // `field_stats.value_types` was written by the indexer and read by nobody, so
+  // a field the schema does not declare showed a count and no type at all.
+  const schema = await import("../../dist/query/schema.js");
+  const ops = await import("../../dist/api/operations.js");
+  let db;
+  try {
+    db = await ops.openIndex();
+  } catch {
+    return;
+  }
+  try {
+    const fields = schema.describeSchema(db, "common:AssetIconProperties");
+    const undeclared = fields.filter((f) => f.declared === null && f.observed !== null);
+    if (undeclared.length === 0) return;
+    for (const f of undeclared) {
+      assert.ok(
+        f.observed.valueTypes !== null && f.observed.valueTypes.length > 0,
+        `${f.pointer} carries observations but no value types`,
+      );
+      for (const t of f.observed.valueTypes) {
+        assert.ok(["string", "number", "boolean"].includes(t), `odd value type ${t}`);
+      }
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test("undocumented excludes $ref rows, and the indexer counts the same set", async () => {
+  // The indexer's copy of the predicate omitted the $ref clause and printed
+  // 8 439 declared-but-unused where this command answered 7 405.
+  const schema = await import("../../dist/query/schema.js");
+  const ops = await import("../../dist/api/operations.js");
+  let db;
+  try {
+    db = await ops.openIndex();
+  } catch {
+    return;
+  }
+  try {
+    const all = schema.findUndocumented(db, undefined, Number.MAX_SAFE_INTEGER);
+    for (const f of all) {
+      assert.ok(
+        !(f.declaredType ?? "").startsWith("$ref"),
+        `${f.assetType}${f.pointer} is a $ref crossing, not a scalar field`,
+      );
+    }
+    const viaIndexerPredicate = db
+      .prepare(
+        `SELECT count(*) AS n FROM schema_fields sf WHERE ${schema.DECLARED_UNOBSERVED_SQL}`,
+      )
+      .get();
+    assert.equal(Number(viaIndexerPredicate.n), all.length);
   } finally {
     db.close();
   }

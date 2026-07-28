@@ -426,7 +426,7 @@ function emit(
     // A SIBLING of the `hytale` block, not a member of it. Reading it from inside
     // `hytale` silently yields null for all 932 fields, which is exactly how this
     // was first written.
-    referenceTarget: asString(node["hytaleAssetRef"]),
+    referenceTarget: assetRefOf(node),
     refScope,
     typeConstant: declaredConstant(asString(node["description"])),
     discriminatorProperty: null,
@@ -457,6 +457,39 @@ function inheritsFlag(node: Node): boolean {
     const branch = asNode(b);
     return branch !== null && hytale(branch)?.["inheritsProperty"] === true;
   });
+}
+
+/**
+ * The asset type a property references, from `hytaleAssetRef`.
+ *
+ * Read on the property node **and inside its `anyOf` branches**, exactly like
+ * `inheritsFlag` above -- and for the same reason. An optional reference is
+ * spelled `anyOf: [{$ref: X, hytaleAssetRef: "Interaction"}, {type: "null"}]`,
+ * so the marker sits on the branch, not on the property. Measured on the release
+ * schema: 439 properties carry it directly, **363 carry it only inside a branch**,
+ * and none carry two different targets, so the first branch to name one decides.
+ *
+ * Reading only the property node found 545 of them. The 363 it missed were graded
+ * as name collisions rather than declared references: no `high` confidence, no
+ * broken-reference detection (`dangling = 2`), no observed `target_types`. The
+ * targets lost this way are the most referenced types in the corpus --
+ * `Interaction` (205 properties), `RootInteraction` (26), `ItemDropList` (19),
+ * `BlockSet` (19).
+ *
+ * This is the fourth marker in this schema found one level away from where it was
+ * read, and the third time the fix has been "check the branches"
+ * (`docs/init/OPEN-QUESTIONS.md` Q22).
+ */
+function assetRefOf(node: Node): string | null {
+  const direct = asString(node["hytaleAssetRef"]);
+  if (direct !== null) return direct;
+  const branches = node["anyOf"] ?? node["oneOf"];
+  if (!Array.isArray(branches)) return null;
+  for (const branch of branches) {
+    const found = asString(asNode(branch)?.["hytaleAssetRef"]);
+    if (found !== null) return found;
+  }
+  return null;
 }
 
 /**

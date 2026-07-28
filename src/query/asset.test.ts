@@ -51,6 +51,107 @@ function loader(assets: Record<string, unknown>): AssetLoader {
       : null;
 }
 
+/**
+ * INVARIANT: a parent is the asset of that name **of the child's type**.
+ *
+ * Inheritance is within a type — the index enforces it on the edge side with
+ * `a.type = src.type`, and the resolver did not, because the loader was handed
+ * the caller's `--type` rather than the type of the asset whose parent it was
+ * looking for. `get Eggsac` (a BlockSoundSet) merged in the BlockBoundingBoxes
+ * named `Cocoon` and answered with `Boxes` where `SoundEvents` belong; nothing
+ * on stderr, because the ambiguity note fires for the queried id, never for an
+ * ambiguous parent.
+ */
+test("a parent is resolved within the child's own type", async () => {
+  const database = db();
+  const seen: (string | null | undefined)[] = [];
+  // Two assets share the name `Shared`; only one is an Item.
+  const byType: Record<string, Record<string, unknown>> = {
+    Item: { Shared: { Icon: "right.png" } },
+    Other: { Shared: { Icon: "wrong.png" } },
+  };
+  const load: AssetLoader = async (id, type) => {
+    seen.push(type);
+    if (id === "Child") {
+      return { path: "p", type: "Item", document: { Parent: "Shared", MaxDurability: 1 } };
+    }
+    // With no type the wrong one sorts first, exactly as PICK_ORDER did.
+    const table = type === null || type === undefined ? byType["Other"]! : byType[type]!;
+    return id in table ? { path: "p", type: type ?? "Other", document: table[id]! } : null;
+  };
+
+  const r = await resolveAsset(database, "Child", load);
+  assert.equal(seen[1], "Item", "the parent lookup was not told the child's type");
+  assert.equal((r!.effective as Record<string, unknown>)["Icon"], "right.png");
+  database.close();
+});
+
+/**
+ * INVARIANT: a map unions its keys with the parent's, whatever its values are.
+ *
+ * Whether the map's ENTRIES combine is a separate question — decided one level
+ * down by the entry type's own `mergesProperties`. Keying "is this a map" on the
+ * entries' `ref_scope` conflated the two: a map whose values are arrays has no
+ * scope, so it was replaced wholesale and every parent-only key vanished.
+ * `Farming.Stages` is `{Default, Harvested}` on the crop template and
+ * `{Starting, Harvested}` on every tomato, so `Default` disappeared — while the
+ * identically-declared `State.Definitions` merged correctly in the same command.
+ */
+test("a map keeps parent-only keys even when its values do not merge", async () => {
+  const database = db();
+  // `/Stages` is a map: the schema gives it an entry rule at `/Stages/*`.
+  // The entries are arrays, so they cross into no type and cannot merge.
+  database
+    .prepare(
+      "INSERT INTO schema_fields (asset_type, json_pointer, inherits_property, merges_properties, ref_scope) VALUES (?,?,?,?,?)",
+    )
+    .run("Item", "/Stages", 1, 0, null);
+  database
+    .prepare(
+      "INSERT INTO schema_fields (asset_type, json_pointer, inherits_property, merges_properties, ref_scope) VALUES (?,?,?,?,?)",
+    )
+    .run("Item", "/Stages/*", 1, 0, null);
+
+  const r = await resolveAsset(
+    database,
+    "Child",
+    loader({
+      Child: { Parent: "Base", Stages: { Starting: [1], Harvested: [2] } },
+      Base: { Stages: { Default: [9], Harvested: [8] } },
+    }),
+  );
+
+  const stages = (r!.effective as Record<string, Record<string, unknown>>)["Stages"]!;
+  assert.deepEqual(
+    Object.keys(stages).sort(),
+    ["Default", "Harvested", "Starting"],
+    "a parent-only map key was dropped",
+  );
+  // The child still wins on a shared key: only the KEYS union, not the values.
+  assert.deepEqual(stages["Harvested"], [2]);
+  assert.deepEqual(stages["Default"], [9]);
+  database.close();
+});
+
+test("a non-map object with no merging type is still replaced wholesale", async () => {
+  // The counterweight to the test above: `/Interactions` has no `/*` entry rule
+  // and its type does not merge, so the child replaces it entirely. Widening the
+  // map rule must not turn every object into a union.
+  const database = db();
+  const r = await resolveAsset(
+    database,
+    "Child",
+    loader({
+      Child: { Parent: "Base", Interactions: { Primary: "child" } },
+      Base: { Interactions: { Primary: "base", Secondary: "base2" } },
+    }),
+  );
+  assert.deepEqual((r!.effective as Record<string, unknown>)["Interactions"], {
+    Primary: "child",
+  });
+  database.close();
+});
+
 test("an asset with no parent resolves to itself", async () => {
   const database = db();
   const r = await resolveAsset(database, "A", loader({ A: { Icon: "a.png" } }));

@@ -84,18 +84,34 @@ export function searchAssetsOp(
     // Honours --type. The first version of this fallback did not, so
     // `search Bench --type Nonexistent` started returning rows for a type that
     // does not exist -- turning a fixed defect back into a worse one.
-    const literal = db
+    // Over-fetched by one, like the indexed path above. It was not, so this
+    // branch could never tell that it had capped: `search brush --type
+    // ScriptedBrushAsset` printed 20 rows and "these 20 row(s) come from a
+    // literal identifier lookup", while --limit 45 returned 21. The withheld row
+    // was a brush -- i.e. a mechanism -- and --help promises "every one says so
+    // when it truncates". A rule kept by repeating it at each site is a rule
+    // that holds until someone adds a site.
+    const fetched = db
       .prepare(
         `SELECT DISTINCT logical_id, type FROM assets
           WHERE (logical_id = ?1 COLLATE NOCASE OR logical_id LIKE '%' || ?1 || '%')
             AND (?3 IS NULL OR type = ?3)
           ORDER BY length(logical_id), logical_id LIMIT ?2`,
       )
-      .all(query, limit, type ?? null) as unknown as {
+      .all(query, limit + 1, type ?? null) as unknown as {
       logical_id: string;
       type: string | null;
     }[];
+    const literal = fetched.slice(0, limit);
     if (literal.length > 0) {
+      const total = count(
+        db,
+        `SELECT count(*) AS n FROM (SELECT DISTINCT logical_id FROM assets
+           WHERE (logical_id = ?1 COLLATE NOCASE OR logical_id LIKE '%' || ?1 || '%')
+             AND (?2 IS NULL OR type = ?2))`,
+        query,
+        type ?? null,
+      );
       return ok(
         literal.map((r) => ({
           logicalId: r.logical_id,
@@ -113,6 +129,9 @@ export function searchAssetsOp(
                  WHERE logical_id NOT IN (SELECT logical_id FROM assets_fts))`,
             ),
           ),
+          ...(fetched.length > limit
+            ? [caveat.truncated(literal.length, "matches", total)]
+            : []),
         ],
       );
     }
@@ -154,6 +173,21 @@ export function sameNamedCount(db: Database, logicalId: string): number {
   return count(db, "SELECT count(*) AS n FROM assets WHERE logical_id = ?", logicalId);
 }
 
+/**
+ * The distinct types carrying an identifier.
+ *
+ * The ambiguity note wants types, not assets: built from the 8-row sample it
+ * listed whatever that sample happened to hold, so 461 untyped `Entry.node`
+ * rows produced eight repetitions of one word and no information.
+ */
+export function sameNamedTypes(db: Database, logicalId: string): string[] {
+  return (
+    db
+      .prepare("SELECT DISTINCT type FROM assets WHERE logical_id = ? ORDER BY type")
+      .all(logicalId) as unknown as { type: string | null }[]
+  ).map((r) => r.type ?? "untyped");
+}
+
 export async function getAssetOp(
   db: Database,
   logicalId: string,
@@ -161,16 +195,19 @@ export async function getAssetOp(
   type?: string,
 ): Promise<Result<ResolvedAsset | null>> {
   const candidates = sameNamed(db, logicalId);
+  // The count comes from an unlimited query; `candidates` is the 8-row sample.
+  // Deriving it here said '8 assets are named Entry.node' where 461 are -- the
+  // CLI had already been fixed and this copy had not. The type list is likewise
+  // the distinct set, not one entry per sampled row.
+  const kinds = candidates.length > 1 ? sameNamedTypes(db, logicalId) : [];
   const caveats: Caveat[] =
     candidates.length > 1 && type === undefined
-      // The count comes from an unlimited query; `candidates` is the 8-row
-      // sample. Deriving it here said '8 assets are named Entry.node' where 461
-      // are -- the CLI had already been fixed and this copy had not.
       ? [
           caveat.ambiguousIdentifier(
             logicalId,
-            candidates.map((c) => c.type ?? "untyped"),
+            kinds.slice(0, 8),
             sameNamedCount(db, logicalId),
+            kinds.length,
           ),
         ]
       : [];
@@ -332,6 +369,14 @@ export interface BrokenRef {
   readonly occurrences: number;
 }
 
+export interface BrokenRefs {
+  readonly shown: readonly BrokenRef[];
+  /** Distinct broken values, before the display cap. */
+  readonly distinct: number;
+  /** Occurrences across all of them, shown or not. */
+  readonly occurrences: number;
+}
+
 /**
  * Values on a field that declares a reference target and resolve to nothing.
  *
@@ -345,15 +390,39 @@ export function brokenRefsFor(
   db: Database,
   assetType: string,
   pointer: string,
-): BrokenRef[] {
-  return db
+  limit = 8,
+): BrokenRefs {
+  const shown = db
     .prepare(
       `SELECT raw_value AS value, count(*) AS occurrences
          FROM candidates
         WHERE dangling = 2 AND schema_scope = ? AND schema_pointer = ?
-        GROUP BY raw_value ORDER BY occurrences DESC, raw_value LIMIT 8`,
+        GROUP BY raw_value ORDER BY occurrences DESC, raw_value LIMIT ?`,
     )
-    .all(assetType, pointer) as unknown as BrokenRef[];
+    .all(assetType, pointer, limit) as unknown as BrokenRef[];
+
+  // The cap announces itself, like every other one in this file.
+  // `common:BlockTypeFarmingStageData./Block` names 63 BlockTypes that do not
+  // exist and printed the first eight, in alphabetical order, with nothing to
+  // say the list ended early -- the shape of finding this project keeps
+  // rediscovering as "a truncated list that does not say so reads as complete".
+  return {
+    shown,
+    distinct: count(
+      db,
+      `SELECT count(*) AS n FROM (SELECT 1 FROM candidates
+         WHERE dangling = 2 AND schema_scope = ? AND schema_pointer = ? GROUP BY raw_value)`,
+      assetType,
+      pointer,
+    ),
+    occurrences: count(
+      db,
+      `SELECT count(*) AS n FROM candidates
+        WHERE dangling = 2 AND schema_scope = ? AND schema_pointer = ?`,
+      assetType,
+      pointer,
+    ),
+  };
 }
 
 export function typeExists(db: Database, assetType: string): boolean {
@@ -563,11 +632,25 @@ export function refsOp(
 
   const caveats: Caveat[] = [
     caveat.untypedBlindSpot(count(db, "SELECT count(*) AS n FROM assets WHERE type IS NULL")),
+    // Edges are built from files as written, so an asset that INHERITS a
+    // reference is not among them: `refs Drops_Plant_Crop_Carrot_Stage1` lists
+    // the two files that name it and not `Plant_Crop_Apple_Block`, whose
+    // effective definition -- printed by `get` -- also points there. Both
+    // answers are right about different questions, and `--help` calls this one
+    // "the inverse of get", which is the reading that makes the pair look like
+    // a missing edge. `describe` has carried this caveat all along.
+    caveat.preInheritance(),
   ];
   if (rows.length > limit) caveats.push(caveat.truncated(references.length, "references"));
   if (targets.length > 1 && type === undefined) {
+    // Distinct types, capped -- not one entry per asset. `targets` is every row
+    // sharing the identifier, so `refs Entry.node` rendered the word "untyped"
+    // 461 times inside a single sentence. `getAssetOp` already passes a sample
+    // plus a separate total; this site passed the whole list as if it were the
+    // sample.
+    const kinds = [...new Set(targets.map((t) => t.type ?? "untyped"))];
     caveats.push(
-      caveat.ambiguousIdentifier(logicalId, targets.map((t) => t.type ?? "untyped")),
+      caveat.ambiguousIdentifier(logicalId, kinds.slice(0, 8), targets.length, kinds.length),
     );
   } else if (type !== undefined) {
     // Naming what was excluded. Scoping to one type legitimately changes the edge
@@ -628,6 +711,77 @@ export function refsOp(
     },
     caveats,
   );
+}
+
+/**
+ * Everything a bare string turns out to be, asked once.
+ *
+ * Every command grew its own answer to "what did the user just type", each from
+ * a different single fact, and the disagreements were the most-reported class in
+ * the blind trials:
+ *
+ * - `search <miss>` prints "to find what uses a value, ask for references to it
+ *   instead" and then offers `refs` **only when the string IS an asset** -- the
+ *   exact inverse of the sentence above it. Three agents followed the printed
+ *   advice into `search-schema`, which answers a different question, and one
+ *   nearly filed a capability gap because the value's sole vanilla use was
+ *   sitting behind the `refs` it was never offered.
+ * - `refs <langKey>` -> `search` -> `search-schema`, three misses in a row, while
+ *   `search-lang` answers instantly and is suggested by neither.
+ * - `bench <categoryId>` says "no bench" and sends the reader to a list that
+ *   cannot contain a category, though `refs` will happily say it is one.
+ *
+ * The loop those comments describe -- `search` pointing at `refs`, `refs`
+ * pointing back -- exists because neither command could say what the token was.
+ * Asking that question in one place is the fix; suppressing one arm of the loop
+ * was the symptom's fix and cost the value case.
+ */
+export interface TokenIdentity {
+  readonly assets: number;
+  readonly assetTypes: readonly string[];
+  /** Occurrences as a field value, whatever else it may also be. */
+  readonly valueOccurrences: number;
+  readonly valueAssets: number;
+  readonly files: number;
+  /** The stored key spelling, when the token names a localization key. */
+  readonly langKey: string | null;
+  readonly benchId: boolean;
+  readonly benchCategory: boolean;
+}
+
+export function identify(db: Database, token: string): TokenIdentity {
+  const stored = referenceToKey(token);
+  const langRow = db
+    .prepare("SELECT key FROM lang_keys WHERE key = ?1 OR key = ?2 LIMIT 1")
+    .get(token, stored) as { key: string } | undefined;
+
+  return {
+    assets: count(db, "SELECT count(*) AS n FROM assets WHERE logical_id = ?", token),
+    assetTypes: (
+      db
+        .prepare("SELECT DISTINCT type FROM assets WHERE logical_id = ? ORDER BY type")
+        .all(token) as unknown as { type: string | null }[]
+    ).map((r) => r.type ?? "untyped"),
+    valueOccurrences: count(
+      db,
+      "SELECT count(*) AS n FROM candidates WHERE raw_value = ?",
+      token,
+    ),
+    valueAssets: count(
+      db,
+      "SELECT count(DISTINCT asset_id) AS n FROM candidates WHERE raw_value = ?",
+      token,
+    ),
+    files: count(
+      db,
+      "SELECT count(*) AS n FROM files WHERE path = ?1 OR path LIKE '%/' || ?1",
+      token,
+    ),
+    langKey: langRow?.key ?? null,
+    benchId: count(db, "SELECT count(*) AS n FROM benches WHERE id = ?", token) > 0,
+    benchCategory:
+      count(db, "SELECT count(*) AS n FROM bench_categories WHERE category_id = ?", token) > 0,
+  };
 }
 
 export interface ValueUsage {
@@ -750,14 +904,28 @@ export interface FileUsage {
  * is a pack-relative path the reader has no reason to know.
  */
 export function fileRefsOp(db: Database, needle: string, limit = 40): Result<FileUsage[]> {
+  // Bounded by --limit like every other list here. It was a hard 5, and the
+  // truncation notice this function now emits ends "Use --limit <n> for more" --
+  // a remedy the caller could not honour, which is the defect `valueUsage`
+  // records having fixed one screen above.
   const files = db
     .prepare(
       `SELECT id, path FROM files
         WHERE path = ?1 OR path LIKE '%/' || ?1
-        ORDER BY length(path), path LIMIT 5`,
+        ORDER BY length(path), path LIMIT ?2`,
     )
-    .all(needle) as unknown as { id: number; path: string }[];
+    .all(needle, limit) as unknown as { id: number; path: string }[];
   if (files.length === 0) return ok([]);
+
+  // A basename is rarely unique: 291 of them name more than five files, and
+  // `Model.blockymodel` names 173. Five groups were printed and the other 168
+  // went unmentioned, so the answer read as "these are the files with this
+  // name".
+  const matching = count(
+    db,
+    "SELECT count(*) AS n FROM files WHERE path = ?1 OR path LIKE '%/' || ?1",
+    needle,
+  );
 
   const rows = db.prepare(
     `SELECT a.logical_id AS logicalId, a.type, e.json_pointer AS pointer
@@ -792,6 +960,9 @@ export function fileRefsOp(db: Database, needle: string, limit = 40): Result<Fil
   const shown = usage.reduce((n, u) => n + u.references.length, 0);
   const all = usage.reduce((n, u) => n + u.total, 0);
   if (all > shown) caveats.push(caveat.truncated(shown, "references", all));
+  if (matching > files.length) {
+    caveats.push(caveat.truncated(files.length, `files named '${needle}'`, matching));
+  }
   return ok(usage, caveats);
 }
 
