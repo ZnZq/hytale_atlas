@@ -342,13 +342,16 @@ export async function buildSearchIndex(
       }
 
       for (const [locale, { name, description }] of perLocale) {
-        insFts.run(
-          id,
-          assetType ?? "",
-          locale,
-          normalizeSearchText(`${id.replace(/_/g, " ")} ${name}`),
-          normalizeSearchText(description),
-        );
+        // The TRANSLATION alone. The identifier used to be folded in here so a
+        // query could match either -- but `logical_id` is an indexed FTS column
+        // in its own right and `unicode61` splits it on underscores, so the fold
+        // bought nothing for search and cost the display: this column is printed
+        // verbatim under a heading that says `name`, and it read as
+        // `Burn You burned to death!` (identifier + the DeathMessageKey
+        // translation) and `Weapon Sword Adamantite Adamantite Sword`. One
+        // column cannot be both the search text and the label; the search half
+        // was already covered elsewhere.
+        insFts.run(id, assetType ?? "", locale, normalizeSearchText(name), normalizeSearchText(description));
         ftsRows++;
       }
 

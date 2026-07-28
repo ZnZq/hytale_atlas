@@ -425,6 +425,42 @@ export function brokenRefsFor(
   };
 }
 
+export interface FieldDeclarer {
+  readonly logicalId: string;
+  readonly type: string | null;
+  readonly pointer: string;
+}
+
+/**
+ * The assets that actually declare a field, with a real document position.
+ *
+ * `describe` could say a field is "used in 1 assets" and offer no way to find
+ * which one. `common:ItemTool./Speed` is exactly that — one asset in 35 074, and
+ * `--help` steers readers to this very command for the question "what makes a
+ * tool faster". `refs` covers VALUES and value links name their declarers, so a
+ * plain scalar field was the one shape with no route from the field to an
+ * example of it.
+ *
+ * Ordered by identifier so the sample is stable between runs, and over-fetched
+ * by one so the caller can say there are more.
+ */
+export function assetsDeclaringField(
+  db: Database,
+  scope: string,
+  pointer: string,
+  limit = 6,
+): FieldDeclarer[] {
+  return db
+    .prepare(
+      `SELECT DISTINCT a.logical_id AS logicalId, a.type, min(c.json_pointer) AS pointer
+         FROM candidates c JOIN assets a ON a.id = c.asset_id
+        WHERE c.schema_scope = ? AND c.schema_pointer = ?
+        GROUP BY a.logical_id, a.type
+        ORDER BY a.logical_id LIMIT ?`,
+    )
+    .all(scope, pointer, limit) as unknown as FieldDeclarer[];
+}
+
 export function typeExists(db: Database, assetType: string): boolean {
   return count(db, "SELECT count(*) AS n FROM schema_fields WHERE asset_type = ?", assetType) > 0;
 }
@@ -511,15 +547,45 @@ export interface AssetTypeInfo {
 export function assetTypesOp(db: Database): Result<AssetTypeInfo[]> {
   const rows = db
     .prepare(
-      `SELECT t.id AS type, t.schema_path AS path,
+      // `lo`/`hi` are the lexicographic extremes of this type's real paths; the
+      // prefix they share is the prefix every path shares, which is what the
+      // column claims to be. Taken from the corpus rather than from
+      // `hytale.path`, which is pack-root-relative (`Item/Items`) while every
+      // path printed elsewhere carries the root
+      // (`Server/Item/Items/Tool/Pickaxe/...`), so a mod author reading this as
+      // "where its files live" creates the file one level too high.
+      `SELECT t.id AS type, t.schema_path AS declaredPath,
+              (SELECT min(a.path) FROM assets a WHERE a.type = t.id) AS lo,
+              (SELECT max(a.path) FROM assets a WHERE a.type = t.id) AS hi,
               (SELECT count(*) FROM assets a WHERE a.type = t.id) AS assets,
               (SELECT count(*) FROM schema_fields sf
                 WHERE sf.asset_type = t.id AND sf.json_pointer <> '') AS declaredFields
          FROM asset_types t
         ORDER BY assets DESC, t.id`,
     )
-    .all() as unknown as AssetTypeInfo[];
-  return ok(rows);
+    .all() as unknown as (Omit<AssetTypeInfo, "path"> & {
+    declaredPath: string | null;
+    lo: string | null;
+    hi: string | null;
+  })[];
+
+  /** The directory prefix two paths share, cut at a slash. */
+  const sharedDirectory = (a: string, b: string): string => {
+    let i = 0;
+    while (i < a.length && i < b.length && a[i] === b[i]) i++;
+    const cut = a.lastIndexOf("/", i);
+    return cut < 0 ? "" : a.slice(0, cut + 1);
+  };
+
+  return ok(
+    rows.map(({ declaredPath, lo, hi, ...rest }) => ({
+      ...rest,
+      path:
+        lo === null || hi === null
+          ? declaredPath
+          : (sharedDirectory(lo, hi) || declaredPath),
+    })),
+  );
 }
 
 // ---------------------------------------------------------------------------

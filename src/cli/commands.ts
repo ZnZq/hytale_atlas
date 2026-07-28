@@ -26,6 +26,7 @@ import {
   benchIdExists,
   benchRecipeCount,
   assetTypesOp,
+  assetsDeclaringField,
   benchesOp,
   brokenRefsFor,
   declaredCount,
@@ -557,8 +558,12 @@ export async function indexSummary(
       `             observed/declared join: ${formatCount(joined)} of ` +
       `${formatCount(observed)} observed fields match a declared one ` +
       `(${Math.round((joined / Math.max(observed, 1)) * 100)}%)\n` +
+      // Named, not just numbered. `epoch 1` appeared beside a path with nothing
+      // saying what it counts -- a reader deciding whether their index is stale
+      // had to guess between rebuild generation, cache format and schema version.
       `             epoch ${one("SELECT CAST(ifnull(value,'0') AS INTEGER) AS n FROM meta WHERE key = 'epoch'")}` +
-      `   ${dbPath}`
+      ` -- one per index build; rebuild with 'index --force'\n` +
+      `             ${dbPath}`
     );
   } catch (err) {
     return `unreadable (${err instanceof Error ? err.message : String(err)})`;
@@ -633,9 +638,15 @@ export async function cmdSearch(
     // only translated into pt-BR after seeing `[pt-BR]` beside it. The bracket
     // names the locale the match was FOUND in; `~N` means the query had to be
     // loosened N times to reach the row.
+    // "name" was a promise the column cannot keep. Translation references are
+    // recognised by SHAPE, not by an allowlist of field names -- they arrive
+    // under at least eight, `Value` being the second most common -- so the text
+    // here is whichever translated string the asset carries. `Burn` has no name
+    // at all and its only translation is a DeathMessageKey, which the header
+    // then presented as the effect's name.
     process.stdout.write(
       `${"ASSET ID".padEnd(36)} ${"TYPE".padEnd(22)} [locale the match was ` +
-        `found in] name\n\n`,
+        `found in] translated text\n\n`,
     );
     let loosened = false;
     for (const hit of hits) {
@@ -647,7 +658,10 @@ export async function cmdSearch(
         // where the header promises a locale. `get` and `refs` print `(untyped)`
         // for the very same assets.
         `${hit.logicalId.padEnd(36)} ${(hit.type || "(untyped)").padEnd(22)} ` +
-          `[${hit.locale || "id"}] ${hit.displayName}${relaxed}\n`,
+          // Falls back to the identifier: the column now carries the translation
+          // alone, so an asset whose translation resolves to an empty string
+          // would print a bare `[en-US]` with nothing after it.
+          `[${hit.locale || "id"}] ${hit.displayName || hit.logicalId}${relaxed}\n`,
       );
     }
     if (loosened) {
@@ -659,7 +673,9 @@ export async function cmdSearch(
     process.stdout.write(
       `\n[id] means the match was on the identifier, not on a translation.\n` +
       `A locale here is where THIS query matched, not the only language the ` +
-        `asset has.\nUse 'search-lang <id>' for every translation of one asset.\n`,
+        `asset has.\nThe text is whichever translated string the asset carries -- ` +
+        `usually its name, but\nan asset with no name shows another (a death ` +
+        `message, a hint).\nUse 'search-lang <id>' for every translation of one asset.\n`,
     );
     renderCaveats(caveats);
   } finally {
@@ -938,6 +954,18 @@ export async function cmdBench(
       return 1;
     }
 
+    // Headed, because column 2 is a trap. It is the category's translated NAME,
+    // and it routinely collides with a real identifier of something else:
+    // `Workbench_Tools` displays as `Tools`, and `Tools` is separately a
+    // FieldcraftCategory asset used by nine Fieldcraft recipes. A modder copying
+    // column 2 into BenchRequirement.Categories writes a category belonging to a
+    // different bench and gets exactly the runtime silence they are avoiding.
+    // The bench listing prints headers; this block had none and no title.
+    if (categories.length > 0) {
+      process.stdout.write(
+        `  ${"CATEGORY ID (use this)".padEnd(24)} DISPLAY NAME (do not use)\n`,
+      );
+    }
     for (const c of categories) {
       const indent = c.parent_id === null ? "  " : "      ";
       process.stdout.write(
@@ -1146,12 +1174,26 @@ export async function cmdRefs(
     // states; a heuristic one is a name that happens to collide, and 'Stone'
     // collides with a great many things.
     process.stdout.write(
-      "\nhigh   = declared by the schema AND the target is of the declared type,\n" +
+      // The `medium` gloss named a rare cause as if it were the rule. Measured:
+      // 15 386 of 26 274 medium edges come from a field that DOES declare a
+      // target type, and in every one of those the declared type has assets --
+      // so "the declared target type is not itself an asset type" was false for
+      // all of them. The real reason is that this particular destination is not
+      // of the declared type, which is also why `describe` can call the same
+      // value BROKEN without contradicting anything: one statement is about the
+      // edge, the other about the value.
+      "\nhigh   = declared by the schema AND this target IS of the declared type,\n" +
         "         or inheritance the engine resolves itself\n" +
-        "medium = declared by the schema but unverifiable (the declared target type\n" +
-        "         is not itself an asset type), or the field name follows a\n" +
-        "         reference convention\n" +
-        "low    = the value merely collides with an identifier; often coincidence\n",
+        "medium = the schema declares this field a reference, but this target is not\n" +
+        "         of the declared type (some other asset shares the name), or the\n" +
+        "         field declares no target and its name follows a convention\n" +
+        "low    = the value merely collides with an identifier; often coincidence\n" +
+        // Wrapped so no line begins with a confidence word: those start a result
+        // row, and prose that opens with one is indistinguishable from data to
+        // anything reading this output -- including this project's own tests.
+        "\nA field can be declared '-> X', have no X of that name, and still show\n" +
+        "an edge of medium confidence to a same-named asset of another type.\n" +
+        "'describe' calls that value BROKEN; both are true, about different things.\n",
     );
     renderCaveats(caveats);
     return 0;
@@ -1466,6 +1508,26 @@ export async function cmdDescribe(
             `${formatCount(broken.occurrences)} occurrence(s) in total\n`,
         );
       }
+      // Which assets declare it, in the single-field view. "used in 1 assets"
+      // with no way to reach that one asset was a dead end on the exact field
+      // --help points at for "what makes a tool faster" (common:ItemTool./Speed,
+      // used by one asset of 35 074). `refs` answers this for values and value
+      // links name their declarers; a plain scalar field had no route at all.
+      if (args.field !== undefined && o !== null && o.assets > 0) {
+        const declarers = assetsDeclaringField(db, assetType, f.pointer, 7);
+        if (declarers.length > 0) {
+          const shown = declarers.slice(0, 6);
+          process.stdout.write(
+            `    declared by: ${shown.map((s) => s.logicalId).join(", ")}` +
+              (declarers.length > shown.length
+                ? ` ... and ${formatCount(o.assets - shown.length)} more`
+                : "") +
+              `\n    e.g. hytale-atlas get ${shown[0]!.logicalId}` +
+              (shown[0]!.type ? ` --type ${shown[0]!.type}` : "") +
+              `\n`,
+          );
+        }
+      }
       const link = valueLinkFor(db, assetType, f.pointer);
       if (link !== null) {
         process.stdout.write(
@@ -1510,6 +1572,7 @@ export async function cmdDescribe(
         process.stdout.write(
           `    used in ${formatCount(o.assets)} assets` +
             (o.targetTypes ? `, points at ${o.targetTypes.join("/")}` : "") +
+            (o.targetTypes ? ((): string => { markers.add("points at"); return ""; })() : "") +
             // The JSON type, for a field the schema does not declare. Without a
             // declared row there is no type on the line at all, so 418 observed
             // fields printed a count and left the reader to infer from the
@@ -1668,6 +1731,10 @@ export async function cmdDescribe(
         "?": "no declared type, because the schema does not describe this field",
         "->": "the asset TYPE this field declares it points at (hytale.hytaleAssetRef)",
         default: "the value the game uses when the field is absent",
+        "points at":
+          "types the corpus was OBSERVED to resolve this field to. Where it lists\n" +
+          "               more than the declared target, the extras are same-named assets\n" +
+          "               of other types -- 'refs' grades those, this line does not",
       };
       process.stdout.write("\nmarkers in this answer:\n");
       for (const m of [
@@ -1675,6 +1742,7 @@ export async function cmdDescribe(
         "inherits",
         "merges",
         "->",
+        "points at",
         "default",
         "?",
         "UNDECLARED",

@@ -39,24 +39,29 @@ function run(...args: string[]): { out: string; code: number } {
  * Counting raw lines made three tests fail the moment truncation started
  * announcing itself -- the tests were measuring the wrong thing, not the tool.
  */
+/**
+ * Rows of a column-formatted result list, as opposed to prose around it.
+ *
+ * Told apart by SHAPE, not by a list of known sentences. The list-of-prefixes
+ * version had to be edited every time a legend gained a line: round 16 added a
+ * header and two footnotes and made four tests measure the wrong thing, and
+ * round 19's fixes did it again to three more. A helper that needs updating
+ * whenever the wording changes is the same defect the tool itself keeps having
+ * — a rule maintained by repetition rather than by construction.
+ *
+ * A result row is aligned into columns, so it carries a run of two or more
+ * spaces. Prose wraps at the margin and never does. The column HEADER is the one
+ * aligned line that is not a result, and it is upper-case by convention.
+ */
 function resultRows(out: string): string[] {
   return out
     .split("\n")
-    .filter(
-      (l) =>
-        l.trim().length > 0 &&
-        !l.startsWith("...") &&
-        !l.startsWith(" ") &&
-        // Round 16 added a column header and two footnotes to `search`, because
-        // `[locale]` and `~N` were markers with no legend anywhere and a reader
-        // took the bracket for the asset's only language. They are prose, not
-        // results; counting them made four tests measure the wrong thing.
-        !l.startsWith("ASSET ID") &&
-        !l.startsWith("A locale here is") &&
-        !l.startsWith("Use 'search-lang") &&
-        !l.startsWith("~N marks") &&
-        !l.startsWith("[id] means"),
-    );
+    .filter((l) => {
+      if (l.trim().length === 0 || l.startsWith("...") || l.startsWith(" ")) return false;
+      if (!/\S {2,}\S/.test(l)) return false; // prose: no column gap
+      const first = l.split(/\s{2,}/)[0] ?? "";
+      return first !== first.toUpperCase() || /[a-z0-9_]/.test(first); // not a header
+    });
 }
 
 const built = existsSync(CLI);
@@ -760,17 +765,45 @@ test("'validate' does not hand out 'clean' remediation", opts, () => {
   assert.match(out, /describe <Type>/);
 });
 
-test("get states what it did NOT inherit", opts, () => {
-  // Both directions of the inheritance bug. `Recipe` carries no
-  // `inheritsProperty` marker, and copying it anyway made every templated item
-  // claim its parent's recipe; the fix is silent unless it says so.
-  const { out } = run("get", "Plant_Crop_Chilli_Block", "--type", "Item");
-  assert.doesNotMatch(out, /"Recipe"/);
-  // And the nested BlockType merge really happened: Support and the block entity
-  // come from Template_Crop_Block, which is what makes the plant grow at all.
+test("get folds the nested BlockType merge in", opts, () => {
+  // Support and the block entity come from Template_Crop_Block, and they are
+  // what makes the plant grow at all. Getting this wrong made every plant in
+  // the game read as having no farmland restriction and nothing to tick it.
   const raw = run("get", "Plant_Crop_Chilli_Block", "--type", "Item", "--raw").out;
   assert.match(raw, /"Support"/);
   assert.match(raw, /"FarmingBlock"/);
+});
+
+/**
+ * An unmarked property is inherited, and that is a DECISION, not an oversight.
+ *
+ * This replaces an assertion that `Recipe` must not appear in a resolved child.
+ * It passed for one reason only: its fixture's parent (`Template_Crop_Block`)
+ * declares no `Recipe` at all, so there was nothing to inherit and nothing to
+ * test. Meanwhile the resolver does exactly the opposite of what the test's name
+ * claimed — `asset.ts` weighed this case explicitly and kept the field, on the
+ * grounds that a hypothesis about the engine does not get to remove data from an
+ * answer.
+ *
+ * So the behaviour is pinned on a fixture where it is observable, and the test
+ * says which way round it goes. If the project ever decides the engine really
+ * does not inherit recipes, this fails and is meant to.
+ */
+test("an unmarked property is still inherited, and it is visible where it matters", opts, () => {
+  // Armor_Iron_Chest declares a Recipe; Armor_Diving_Crude_Chest declares none.
+  const parent = run("get", "Armor_Iron_Chest", "--type", "Item", "--raw").out;
+  const child = run("get", "Armor_Diving_Crude_Chest", "--type", "Item", "--raw").out;
+  assert.match(parent, /"Recipe"/, "fixture no longer declares a recipe");
+  assert.match(child, /"Recipe"/, "an unmarked property stopped being inherited");
+  assert.match(
+    JSON.parse(child).Recipe.Input.map((i) => i.ItemId).join(" "),
+    /Ingredient_Bar_Iron/,
+    "the inherited recipe is not the parent's",
+  );
+  // ...and the header says where it came from, so the reader is not left to
+  // assume the child declared it.
+  const header = run("get", "Armor_Diving_Crude_Chest", "--type", "Item").out;
+  assert.match(header, /inherited whole|merged with/);
 });
 
 test("refs on a bench asset says recipes reference the declared id instead", opts, () => {
@@ -1704,7 +1737,11 @@ test("the type list is reachable as a command", opts, () => {
   // trial asked for this and rebuilt a partial list from search results.
   const { out, code } = run("types", "--limit", "500");
   assert.equal(code, 0);
-  assert.match(out, /^Item +[\d,]+ +95 +Item\/Items/m);
+  // The WHERE column carries the path assets of this type really sit at, root
+  // included. It used to print `hytale.path` -- pack-root-relative, `Item/Items`
+  // -- while `get` answers `Server/Item/Items/...` for the same type, so a mod
+  // author following it created the file one directory too high.
+  assert.match(out, /^Item +[\d,]+ +95 +Server\/Item\/Items\//m);
   // A type the schema is silent about is listed, with a zero rather than absent.
   assert.match(out, /^NPCRole +[\d,]+ +0 /m);
   assert.match(out, /FIELDS 0 means the generated schema declares nothing/);
