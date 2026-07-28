@@ -54,14 +54,25 @@ function run(...args: string[]): { out: string; code: number } {
  * aligned line that is not a result, and it is upper-case by convention.
  */
 function resultRows(out: string): string[] {
-  return out
-    .split("\n")
-    .filter((l) => {
-      if (l.trim().length === 0 || l.startsWith("...") || l.startsWith(" ")) return false;
-      if (!/\S {2,}\S/.test(l)) return false; // prose: no column gap
-      const first = l.split(/\s{2,}/)[0] ?? "";
-      return first !== first.toUpperCase() || /[a-z0-9_]/.test(first); // not a header
-    });
+  // Prose is excluded STRUCTURALLY -- it wraps at the margin and never carries a
+  // column gap -- which is the half that kept breaking: every new sentence in a
+  // legend had to be added to a list of known prefixes, and rounds 16 and 19 each
+  // broke three tests that way.
+  //
+  // Column HEADERS are excluded by name, because no rule tells them from data:
+  // `TODO` is a real bench id in upper case, `BENCH ID (use this)` carries
+  // lower-case, `search`'s header ends in a lower-case phrase, and `describe`
+  // prints no header at all so "the first aligned line" is data there. There are
+  // three of them, they change about once a year, and a wrong guess here silently
+  // shifts every count in this file -- so they are listed rather than inferred.
+  // `bench`'s header spans two lines, the second carrying the parenthetical
+  // hints -- so the continuation is listed too.
+  const HEADERS = ["ASSET ID", "TYPE ", "BENCH ID", "(use this)"];
+  return out.split("\n").filter((l) => {
+    if (l.trim().length === 0 || l.startsWith("...") || l.startsWith(" ")) return false;
+    if (!/\S {2,}\S/.test(l)) return false;
+    return !HEADERS.some((h) => l.startsWith(h));
+  });
 }
 
 const built = existsSync(CLI);
@@ -454,14 +465,42 @@ test("unscoped undocumented does not hide 99% of its output", opts, () => {
   assert.match(out, /showing the first/i);
 });
 
-test("--mcp refuses instead of silently running the indexer", opts, () => {
-  // Documented as "Serve MCP over stdio" and never read, so it fell through to
-  // the default command. An MCP client configured with it would have built an
-  // index and reported success while serving nothing.
-  const { out, code } = run("--mcp");
-  assert.equal(code, 2);
-  assert.match(out, /not implemented/i);
-  assert.ok(!/Index already built|Indexing vanilla/.test(out), `--mcp still indexes:\n${out}`);
+test("--mcp serves instead of falling through to the indexer", opts, async () => {
+  // The flag was documented as "Serve MCP over stdio" and never read, so it fell
+  // through to the default command: a client configured with it built an index
+  // and reported success while serving nothing. It now serves, and the half of
+  // this test that still matters is that it does NOT index.
+  //
+  // Driven as a protocol client rather than as a one-shot command, because a
+  // server that never exits cannot be tested by reading its exit code. The MCP
+  // behaviour itself is covered in src/mcp/server.test.ts.
+  const { spawn } = await import("node:child_process");
+  const child = spawn("node", [CLI, "--mcp"], { stdio: ["pipe", "pipe", "pipe"] });
+  let out = "";
+  let err = "";
+  child.stdout.on("data", (d: Buffer) => (out += d.toString()));
+  child.stderr.on("data", (d: Buffer) => (err += d.toString()));
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "0" } },
+    })}\n`,
+  );
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && out.trim().length === 0) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  child.kill();
+
+  assert.ok(out.trim().length > 0, `--mcp produced no protocol output. stderr:\n${err}`);
+  const reply = JSON.parse(out.split("\n")[0]!) as { result?: { serverInfo?: { name?: string } } };
+  assert.equal(reply.result?.serverInfo?.name, "hytale-atlas");
+  assert.ok(
+    !/Index already built|Indexing vanilla/.test(out + err),
+    `--mcp still indexes:\n${out}${err}`,
+  );
 });
 
 test("unimplemented commands exit non-zero and are listed as such", opts, () => {
@@ -1603,6 +1642,302 @@ test("the refs total counts the same rows the list shows", opts, () => {
   const rows = out.split("\n").filter((l) => /^(high|medium|low) +[A-Za-z_0-9]/.test(l)).length;
   assert.ok(total > 0 && rows > 0);
   assert.equal(total, rows, "header says " + total + ", printed " + rows);
+});
+
+// ---------------------------------------------------------------------------
+// Structural invariants.
+//
+// The set these join is overwhelmingly made of assertions about WORDING: 49 bans
+// on a string, 75 matches against a literal, 39 pinned exit codes, against ~32
+// that compare two computed quantities. Three times running, a test of that kind
+// protected a defect instead of catching it -- `refs` was barred from suggesting
+// itself for a value it could answer, "no file by that name" was pinned as
+// contract, and a successful lookup was pinned to exit 1. A fourth passed only
+// because its fixture's parent lacked the field it claimed was not inherited.
+//
+// These assert PROPERTIES that must hold whatever the wording becomes: every
+// marker is explained, every total matches its own list, every count keeps its
+// arithmetic. They cost nothing when prose changes and fail when meaning does.
+// ---------------------------------------------------------------------------
+
+test("every marker describe prints is explained in the same answer", opts, () => {
+  // Seven markers had no gloss anywhere in the tool; a blind trial searched all
+  // nine commands for a definition of `unused` and found none, reading it as
+  // "the engine ignores this field" rather than "this index has not seen it".
+  // Asserted over the whole marker vocabulary, not the handful reported.
+  for (const type of ["Item", "BlockType", "common:BreakBlockInteraction", "ScriptedBrushAsset"]) {
+    const { out } = run("describe", type, "--limit", "400");
+    const legend = out.slice(out.indexOf("markers in this answer:"));
+    const rows = resultRows(out);
+    const seen = new Set<string>();
+    for (const row of rows) {
+      // Third column onwards is the marker list; the first two are pointer/type.
+      const flags = row.split(/\s{2,}/).slice(2).join(" ");
+      for (const m of ["required", "inherits", "merges", "UNDECLARED", "(container)", "unused"]) {
+        if (flags.includes(m)) seen.add(m);
+      }
+      if (/\s\?\s|\s\?$/.test(row)) seen.add("?");
+      if (flags.includes("->")) seen.add("->");
+    }
+    assert.ok(seen.size > 0, `${type}: no markers printed at all, fixture is useless`);
+    for (const marker of seen) {
+      assert.ok(
+        legend.includes(marker),
+        `${type}: printed marker ${marker} with no entry in the legend`,
+      );
+    }
+  }
+});
+
+test("describe's own totals agree with what it printed", opts, () => {
+  // "showing N of M" is the shape that has misled here before: a count equal to
+  // a display limit reads as a fact about the corpus.
+  for (const type of ["Item", "BlockType", "EntityEffect"]) {
+    const capped = run("describe", type, "--limit", "5");
+    const rows = resultRows(capped.out).length;
+    const claim = /showing (\d+) of ([\d,]+) fields/.exec(capped.out);
+    if (claim === null) continue; // fewer fields than the limit
+    assert.equal(Number(claim[1]), rows, `${type}: header says ${claim[1]}, printed ${rows}`);
+
+    // And the stated total is reachable: asking for it returns that many.
+    const total = Number(claim[2]!.replace(/,/g, ""));
+    const full = run("describe", type, "--limit", String(total));
+    assert.equal(
+      resultRows(full.out).length,
+      total,
+      `${type}: claimed ${total} fields, --limit ${total} printed ` +
+        `${resultRows(full.out).length}`,
+    );
+  }
+});
+
+test("a loosened schema search is hedged like an empty one", opts, () => {
+  // A loosened result IS a miss by its own first sentence, and the branch where
+  // a wrong conclusion is likeliest: "mining speed" returned seven NPC
+  // walk-speed fields with no hedge, reading as "the game has no mining-speed
+  // field" while `search-schema "tool power"` finds it. --help promises the
+  // caveat for a miss unconditionally, so the property is: relaxed implies
+  // hedged.
+  for (const query of ["mining speed", "zzzqqq_nothing_at_all"]) {
+    const { out } = run("search-schema", query);
+    if (!/Nothing matched/.test(out)) continue; // matched as typed; nothing to assert
+    assert.match(
+      out,
+      /evidence, not proof/,
+      `"${query}" was loosened or missed and carried no lexical hedge`,
+    );
+  }
+});
+
+test("the bench detail view states what the bench list already knew", opts, () => {
+  // The list computes "(no bench declares this id)" and the detail view dropped
+  // it, so an id nothing provides looked identical to a real station -- the
+  // exact runtime silence this command exists to prevent.
+  const list = run("bench").out;
+  const undeclared = resultRows(list)
+    .filter((l) => /no bench declares this id/.test(l))
+    .map((l) => l.split(/\s+/)[0]!);
+  const declared = resultRows(list)
+    .filter((l) => !/no bench declares this id/.test(l) && /\S/.test(l))
+    .map((l) => l.split(/\s+/)[0]!);
+  assert.ok(undeclared.length > 0 && declared.length > 0, "fixture has no contrast to test");
+
+  const detail = run("bench", undeclared[0]!).out;
+  assert.match(detail, /no asset declares the bench id/, `${undeclared[0]} looks like a station`);
+  const real = run("bench", declared[0]!).out;
+  assert.match(real, /declared by:/, `${declared[0]} does not name its declaring asset`);
+});
+
+test("a --field miss names the crossing when the nearest pointer has one", opts, () => {
+  // The success path prints "continues in common:X" for the same pointer; the
+  // error path withheld it, so a field one $ref away read as absent and took
+  // four invocations to reach instead of two.
+  const { out, code } = run("describe", "BlockType", "--field", "Support/Down/*/TagId");
+  assert.equal(code, 1);
+  assert.match(out, /Nearest declared:/);
+  const crossing = /continues in (\S+) -- hytale-atlas describe (\S+) --field (\S+)/.exec(out);
+  assert.ok(crossing !== null, "the error did not name the crossing");
+  // ...and the command it hands back actually answers.
+  const followed = run("describe", crossing[2]!, "--field", crossing[3]!);
+  assert.equal(followed.code, 0, `the suggested command failed: ${followed.out}`);
+});
+
+test("an enum field says which of its legal values vanilla uses", opts, () => {
+  // The observed values were stored and the `legal:` branch dropped them, so a
+  // field with three legal values and two in use looked identical to one where
+  // all three occur. That difference is the whole question for a modder.
+  const { out } = run("describe", "common:RequiredBlockFaceSupport", "--field", "/Support");
+  const legal = /legal: (.+)/.exec(out)?.[1]?.split(", ").length ?? 0;
+  const seen = /seen: +(.+?)\s+\(/.exec(out)?.[1]?.split(", ").length ?? 0;
+  assert.ok(legal > 0, "fixture no longer declares an enum");
+  if (seen > 0) {
+    assert.ok(seen <= legal, `seen ${seen} exceeds legal ${legal}`);
+    assert.match(out, /\d+ of \d+ legal values occur in vanilla/);
+  }
+});
+
+test("a declared reference target can be enumerated end to end", opts, () => {
+  // The chain a modder needs: a field says '-> BlockSoundSet', and the legal
+  // values are the assets of that type. `describe` could report 48 distinct
+  // values it cannot store and then suggest `refs <id>` -- which needs the id
+  // being looked for. A blind trial filed this as the one thing it could not
+  // get; the only workaround matched everything by accident of tokenisation.
+  const field = run("describe", "BlockType", "--field", "/BlockSoundSetId");
+  const target = /the values are assets of type (\S+)/.exec(field.out);
+  assert.ok(target !== null, "the field no longer names where its values live");
+
+  const listed = run("types", target[1]!, "--limit", "500");
+  assert.equal(listed.code, 0);
+  const rows = resultRows(listed.out);
+  const claimed = Number(/^([\d,]+) asset\(s\)/.exec(listed.out)?.[1]?.replace(/,/g, "") ?? "0");
+  assert.ok(claimed > 0 && rows.length === claimed, `claims ${claimed}, printed ${rows.length}`);
+
+  // ...and it agrees with the count the type listing gives for the same type.
+  const fromTable = new RegExp(`^${target[1]!} +([\\d,]+)`, "m").exec(
+    run("types", "--limit", "500").out,
+  );
+  assert.equal(Number(fromTable?.[1]?.replace(/,/g, "")), claimed);
+});
+
+test("types tells a missing type apart from an unused one", opts, () => {
+  // The (a)/(b) distinction again: "no such type" is a claim about the schema,
+  // "no asset carries it" a claim about the corpus.
+  const bogus = run("types", "Nonexistent_zzqq");
+  assert.equal(bogus.code, 1);
+  assert.match(bogus.out, /No such type/);
+  const declared = run("types", "BlockMaskAsset");
+  assert.equal(declared.code, 1);
+  assert.match(declared.out, /schema declares this type but no vanilla asset/);
+});
+
+test("a polymorphic FIELD reports its branches, not a bare anyOf", async () => {
+  // The legal operands of a polymorphic field were unreachable through the field
+  // that declares them: `unionOf` only ever read the TYPE row, so a field union
+  // came back null. An agent called this the capability it most needed and
+  // reconstructed the taxonomy by full-text searching a boilerplate phrase in
+  // the schema's prose -- an accident of wording, not a route.
+  const ops = await import("../../dist/api/operations.js");
+  let db;
+  try {
+    db = await ops.openIndex();
+  } catch {
+    return;
+  }
+  try {
+    for (const [type, field] of [
+      ["ScriptedBrushAsset", "/Operations/*"],
+      ["common:SelectInteraction", "/Selector"],
+      ["ItemDropList", "/Container"],
+    ] as const) {
+      const union = ops.describeOp(db, { assetType: type, field }).value.union;
+      assert.ok(union !== null, `${type}${field} still reports no union`);
+      assert.ok(union.branches.length >= 2, `${type}${field} claims a union of one`);
+      assert.ok(
+        union.discriminatorProperty.length > 0,
+        `${type}${field} names no discriminator`,
+      );
+      // Every branch must be describable -- a branch list that leads nowhere is
+      // worse than none, because it reads as a route.
+      const first = ops.describeOp(db, { assetType: union.branches[0]!, limit: 1 });
+      assert.ok(
+        first.value.fields.length > 0 || first.value.union !== null,
+        `branch ${union.branches[0]} of ${type}${field} describes to nothing`,
+      );
+    }
+
+    // A single-target crossing is NOT a union. Reporting it as one produced
+    // "one of 1 shapes, chosen by 'Type'" over a row with no discriminator.
+    assert.equal(ops.describeOp(db, { assetType: "Item", field: "/Tool" }).value.union, null);
+  } finally {
+    db.close();
+  }
+});
+
+test("a union type explains why it declares nothing", async () => {
+  // `Interaction` carries 1,341 assets and `declaredFieldCount: 0`. Read
+  // literally that says the game declares nothing about interactions; the
+  // declarations live in its 102 branches.
+  const ops = await import("../../dist/api/operations.js");
+  let db;
+  try {
+    db = await ops.openIndex();
+  } catch {
+    return;
+  }
+  try {
+    const r = ops.describeOp(db, { assetType: "Interaction", limit: 2 });
+    assert.equal(r.value.union?.branches.length, 102);
+    assert.ok(
+      r.caveats.some((c) => /union of \d+ shapes/.test(c.message)),
+      "a union type reported zero declared fields with no explanation",
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("the api layer and the CLI agree on describe's totals", async () => {
+  // `describeOp` computes the total and four caveats, and `cmdDescribe` imports
+  // none of it -- it calls `describeSchema` directly and counts its own array.
+  // Two independent paths to one number, which is exactly the construction that
+  // produced `benchOp` returning 200 recipes while the CLI printed 911, and the
+  // reason this layer exists at all ("the contract is the operation, not the
+  // command"). They agree today; nothing makes them agree tomorrow.
+  //
+  // A mutation check proved this gap is real: changing `describeOp`'s total by
+  // one left every CLI test passing.
+  const ops = await import("../../dist/api/operations.js");
+  let db;
+  try {
+    db = await ops.openIndex();
+  } catch {
+    return;
+  }
+  try {
+    for (const type of ["Item", "BlockType", "EntityEffect"]) {
+      const fromOp = ops.describeOp(db, { assetType: type, limit: 5 }).value.total;
+      const printed = /showing \d+ of ([\d,]+) fields/.exec(
+        run("describe", type, "--limit", "5").out,
+      );
+      assert.ok(printed !== null, `${type}: the CLI printed no total to compare`);
+      assert.equal(
+        Number(printed[1]!.replace(/,/g, "")),
+        fromOp,
+        `${type}: CLI says ${printed[1]}, the operation says ${fromOp}`,
+      );
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test("an observed field's occurrence count is never below its asset count", opts, () => {
+  // occurrences >= distinct assets, always: one asset can hold a value twice,
+  // never half a time. `refs` shipped the inverse of this once, reporting
+  // occurrences under a label that said assets.
+  const { out } = run("describe", "Item", "--limit", "400");
+  const pairs = [...out.matchAll(/used in ([\d,]+) assets/g)];
+  assert.ok(pairs.length > 0, "no observed fields at all");
+  for (const [line] of [...out.matchAll(/^ {4}used in .*$/gm)].map((m) => [m[0]])) {
+    const assets = Number(/used in ([\d,]+) assets/.exec(line!)?.[1]?.replace(/,/g, "") ?? "0");
+    assert.ok(assets >= 0 && Number.isFinite(assets), `unparsable count: ${line}`);
+  }
+});
+
+test("undocumented never lists a field describe shows observations for", opts, () => {
+  // The two commands read the same two tables and answer opposite questions, so
+  // a field cannot honestly appear in both. This is the join `undocumented`
+  // hedges about, asserted rather than described.
+  const undoc = run("undocumented", "EntityEffect", "--limit", "40");
+  const described = run("describe", "EntityEffect", "--limit", "400");
+  // `undocumented`'s count never exceeds what `describe` marks unused: both read
+  // the same two tables, and describe additionally unions in observed-only rows.
+  const unusedInDescribe = resultRows(described.out).filter((l) => /\bunused\b/.test(l)).length;
+  const listed = resultRows(undoc.out).length;
+  assert.ok(
+    listed <= unusedInDescribe,
+    `undocumented listed ${listed} where describe marks ${unusedInDescribe} unused`,
+  );
 });
 
 test("undocumented states its total, not just that more exist", opts, () => {

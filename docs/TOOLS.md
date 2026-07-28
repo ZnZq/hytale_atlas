@@ -372,6 +372,41 @@ unhelpful `ENOENT` when run outside the repository.
 
 ---
 
+## `--mcp` — the same answers, as data
+
+Serves the operation layer over stdio (`src/mcp/`). Ten tools, one per question:
+`status`, `types`, `search`, `get`, `describe`, `refs`, `search_schema`,
+`search_lang`, `bench`, `undocumented`. Each returns the operation's own
+`{ value, caveats }`, serialised whole.
+
+**Nothing in this layer computes an answer.** Where a CLI command enriches an
+operation — `describe --field` adds broken references, the value link and the
+declaring assets — the server composes the *same operations* rather than
+reimplementing them. Composition is allowed; computation is the divergence this
+layer exists to prevent, and it has bitten before: `benchOp` returned 200 recipes
+while the CLI printed 911.
+
+Three rules the server keeps, each with a test:
+
+- **stdout carries the protocol and nothing else.** One stray line and the client
+  sees a parse error instead of an answer. The operations are pure, which is what
+  makes serving them safe; every diagnostic goes to stderr.
+- **A miss is a result, not an error.** `found: false` with a reason, because "no
+  such asset" is frequently the finding, and an error tells the model the call
+  broke rather than that the corpus is silent.
+- **`index`, `generate-schema`, `clean` and `eval` are not exposed.** The first
+  three mutate state; `generate-schema` launches the game's own generator, which
+  emits telemetry that cannot be disabled and therefore requires explicit human
+  consent (`SERVER-JAR.md`). A tool call would route around that consent, which
+  is the one thing that path exists to prevent.
+
+The instructions sent at connect time carry the two facts every blind trial
+needed: the schema index is lexical, so a miss is evidence rather than proof; and
+20 202 untyped assets contribute no references, so a reference list can be
+incomplete by design.
+
+---
+
 ## `index`, `generate-schema`
 
 `index` builds the corpus (`INDEXING.md`); `--force` rebuilds.
@@ -388,7 +423,6 @@ command, and a non-interactive run without `--yes` must refuse.
 |---|---|---|
 | `validate` | does this pack resolve | 2 773 broken declared references (`candidates.dangling = 2`), 80 340 dangling strings, 90 unresolved value-link references (9 distinct values) |
 | `clean` | drop the index | — |
-| `--mcp` | serve over stdio | the whole `src/api` surface |
 
 Each must give **its own** remediation. `validate` once printed `clean`'s advice —
 telling someone asking "is my pack valid" how to delete a cache — and all five

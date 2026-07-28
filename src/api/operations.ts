@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 
-import { type Database, openDatabase } from "../db/open.ts";
+import { type Database, openDatabase, pipelineState } from "../db/open.ts";
 import { craftableAt } from "../indexer/benches.ts";
 import { type AssetLoader, type ResolvedAsset, resolveAsset } from "../query/asset.ts";
 import {
@@ -15,10 +15,10 @@ import {
 } from "../query/schema.ts";
 import { type SearchHit, searchAssets } from "../query/search.ts";
 import { archiveStamp } from "../sources/archive.ts";
-import { detectInstallation } from "../sources/detect.ts";
+import { detectInstallation, detectProject } from "../sources/detect.ts";
 import { referenceToKey } from "../sources/lang.ts";
-import { frozenDbPath, frozenKey } from "../util/paths.ts";
-import { type Caveat, type Result, caveat, ok } from "./types.ts";
+import { formatCount, frozenDbPath, frozenKey } from "../util/paths.ts";
+import { type Caveat, type Result, caveat, ok, rendered, truncationLine } from "./types.ts";
 
 /**
  * Every question the tool can answer, once.
@@ -224,18 +224,35 @@ export interface UnionType {
   readonly discriminatorValues: readonly string[];
 }
 
-/** Non-null when a type is nothing but a union of branches. */
-export function unionOf(db: Database, assetType: string): UnionType | null {
+/**
+ * The union at a pointer, or null when there is not one.
+ *
+ * `pointer` defaults to the TYPE row -- `Interaction` is 102 branches and no
+ * fields of its own -- but a FIELD can be a union too, and that case had no
+ * reader at all: `ScriptedBrushAsset./Operations/*` is 56 shapes chosen by `Id`,
+ * `common:SelectInteraction./Selector` is 5, and both came back as a bare
+ * `anyOf` with nothing to say what the legal operands were. An agent working
+ * through MCP called this the single capability it most needed and reconstructed
+ * the taxonomy by full-text searching a boilerplate phrase in the schema's own
+ * prose -- an accident, not a route.
+ *
+ * More than one branch is required. A single-target `$ref` is an ordinary
+ * crossing, and reporting it as a union of one produced "one of 1 shapes,
+ * chosen by 'Type'" above a row whose discriminator column read `?`.
+ */
+export function unionOf(db: Database, assetType: string, pointer = ""): UnionType | null {
   const row = db
     .prepare(
       `SELECT ref_scope, discriminator_property, discriminator_values FROM schema_fields
-        WHERE asset_type = ? AND json_pointer = '' AND ref_scope IS NOT NULL`,
+        WHERE asset_type = ? AND json_pointer = ? AND ref_scope IS NOT NULL`,
     )
-    .get(assetType) as Record<string, unknown> | undefined;
+    .get(assetType, pointer) as Record<string, unknown> | undefined;
   if (row === undefined) return null;
   const split = (v: unknown): string[] => String(v ?? "").split(" ").filter(Boolean);
+  const branches = split(row["ref_scope"]);
+  if (branches.length < 2) return null;
   return {
-    branches: split(row["ref_scope"]),
+    branches,
     discriminatorProperty: (row["discriminator_property"] as string | null) ?? "Type",
     discriminatorValues: split(row["discriminator_values"]),
   };
@@ -263,14 +280,33 @@ export function describeOp(db: Database, request: DescribeRequest): Result<Descr
   // returns a wall of UNDECLARED observations -- 213 of them for `Interaction`,
   // every one with `declared === null`. The CLI intercepts this and prints the
   // branches; this copy did not, and `unionOf` sat thirty lines above it unused.
-  const union = request.field === undefined ? unionOf(db, request.assetType) : null;
   const limit = request.limit ?? 60;
   const field = request.field === undefined ? undefined : normalizeFieldPointer(request.field);
+  // A union at the TYPE when no field was asked for, at the FIELD when one was.
+  // The field case returned null unconditionally, so the legal operands of a
+  // polymorphic field were unreachable through the field that declares them.
+  const union = unionOf(db, request.assetType, field ?? "");
   const caveats: Caveat[] = [];
 
   const all = describeSchema(db, request.assetType, field);
   const fields = all.slice(0, limit);
   if (all.length > limit) caveats.push(caveat.truncated(fields.length, "fields"));
+
+  // A union declares nothing of its own, and the zero says so nowhere. For
+  // `Interaction` -- 1 341 assets -- the payload read `declaredFieldCount: 0`
+  // beside 213 observed-only rows, which states that the game declares nothing
+  // about interactions. It declares a great deal, in the 102 branches, and this
+  // is the line that points at them.
+  if (union !== null) {
+    caveats.push({
+      code: "container-no-observations",
+      message:
+        `This is a union of ${union.branches.length} shapes, chosen by ` +
+        `'${union.discriminatorProperty}'. It declares no field of its own -- the ` +
+        `declarations live on the branches, so describe one of them ` +
+        `(e.g. '${union.branches[0]}') rather than reading this as "nothing is declared".`,
+    });
+  }
   if (fields.some((f) => f.observed !== null)) caveats.push(caveat.preInheritance());
   for (const f of fields) {
     if (f.observed === null && isContainer(f.declared?.type ?? null) && field !== undefined) {
@@ -461,6 +497,29 @@ export function assetsDeclaringField(
     .all(scope, pointer, limit) as unknown as FieldDeclarer[];
 }
 
+/**
+ * Every asset carrying a type, so a legal-value set can be enumerated.
+ *
+ * `describe BlockType --field /BlockSoundSetId` reports 48 distinct values and
+ * cannot list them (the storage ceiling is 40), then suggests `refs <id>` --
+ * which needs the id the reader is trying to find. There was no command that
+ * answers "what are the BlockSoundSets", and the only route was a query that
+ * happens to match everything, which relies on tokenizer behaviour nobody
+ * promised.
+ */
+export function assetsOfTypeList(
+  db: Database,
+  assetType: string,
+  limit = 200,
+): { logicalId: string; path: string }[] {
+  return db
+    .prepare(
+      `SELECT DISTINCT logical_id AS logicalId, min(path) AS path FROM assets
+        WHERE type = ? GROUP BY logical_id ORDER BY logical_id LIMIT ?`,
+    )
+    .all(assetType, limit) as unknown as { logicalId: string; path: string }[];
+}
+
 export function typeExists(db: Database, assetType: string): boolean {
   return count(db, "SELECT count(*) AS n FROM schema_fields WHERE asset_type = ?", assetType) > 0;
 }
@@ -488,7 +547,15 @@ export function searchSchemaOp(db: Database, query: string, limit = 20) {
   if (detailed.relaxation > 0 || detailed.widened) {
     caveats.push(caveat.relaxed(query, detailed.relaxation, detailed.widened));
   }
-  if (hits.length === 0) caveats.push(caveat.lexicalOnly());
+  // On a loosened match too, not only on an empty one. A loosened result IS a
+  // miss by its own first sentence ("nothing matched as written"), and it is the
+  // branch where a wrong conclusion is likeliest: `search-schema "mining speed"`
+  // returned seven NPC walk-speed fields and no hedge, reading as "the game has
+  // no mining-speed field" -- while `search-schema "tool power"` finds it.
+  // `--help` promises the caveat for a miss unconditionally.
+  if (hits.length === 0 || detailed.relaxation > 0 || detailed.widened) {
+    caveats.push(caveat.lexicalOnly());
+  }
   return ok(hits, caveats);
 }
 
@@ -544,6 +611,70 @@ export interface AssetTypeInfo {
  * require you to already know the name, and `search-schema` searches field
  * prose rather than the type list. Every blind trial asked for this.
  */
+/**
+ * `types`, both of its questions, rendered.
+ *
+ * The first operation to carry its own `text`. The CLI writes it and the MCP
+ * server returns it, so the two cannot describe the same corpus differently --
+ * which they did until now: the CLI printed a footnote about `common:`
+ * definitions not being asset types, and MCP omitted it, so an agent reported
+ * "types claims 'Every asset type' and silently omits an entire namespace".
+ */
+export function typesOp(
+  db: Database,
+  request: { type?: string; limit?: number } = {},
+): Result<
+  | { kind: "types"; types: readonly AssetTypeInfo[]; total: number }
+  | { kind: "assets"; type: string; assets: readonly { logicalId: string; path: string }[]; total: number }
+  | { kind: "miss"; type: string; reason: string }
+> {
+  const limit = request.limit ?? 200;
+
+  if (request.type !== undefined) {
+    const type = request.type;
+    const carried = assetsOfType(db, type);
+    if (carried === 0) {
+      const declared = typeExists(db, type);
+      const reason = declared
+        ? `The schema declares this type but no vanilla asset carries it.`
+        : `No such type. Run 'hytale-atlas types' for the list.`;
+      return rendered(
+        { kind: "miss" as const, type, reason },
+        `No assets of type '${type}'.\n${reason}\n`,
+      );
+    }
+    const fetched = assetsOfTypeList(db, type, limit + 1);
+    const shown = fetched.slice(0, limit);
+    const capped = fetched.length > limit;
+    return rendered(
+      { kind: "assets" as const, type, assets: shown, total: carried },
+      `${formatCount(carried)} asset(s) of type '${type}':\n\n` +
+        shown.map((r) => `${r.logicalId.padEnd(44)} ${r.path}\n`).join("") +
+        (capped ? truncationLine(shown.length, "assets", carried) : ""),
+      capped ? [caveat.truncated(shown.length, "assets", carried)] : [],
+    );
+  }
+
+  const all = assetTypesOp(db).value;
+  const shown = all.slice(0, limit);
+  return rendered(
+    { kind: "types" as const, types: shown, total: all.length },
+    `${"TYPE".padEnd(34)} ${"ASSETS".padStart(7)} ${"FIELDS".padStart(7)}  WHERE\n\n` +
+      shown
+        .map(
+          (r) =>
+            `${r.type.padEnd(34)} ${formatCount(r.assets).padStart(7)} ` +
+            `${formatCount(r.declaredFields).padStart(7)}  ${r.path ?? ""}\n`,
+        )
+        .join("") +
+      (all.length > limit ? truncationLine(shown.length, "types", all.length) : "") +
+      `\nFIELDS 0 means the generated schema declares nothing for that type, not ` +
+      `that it is empty.\nShared definitions ('common:...') are not asset types ` +
+      `and are not listed; describe accepts them.\n`,
+    all.length > limit ? [caveat.truncated(shown.length, "types", all.length)] : [],
+  );
+}
+
 export function assetTypesOp(db: Database): Result<AssetTypeInfo[]> {
   const rows = db
     .prepare(
@@ -1365,6 +1496,206 @@ export interface IndexStats {
    */
   readonly locales: readonly string[];
   readonly epoch: number;
+}
+
+export interface StatusValue {
+  readonly project: { kind: string; root: string };
+  readonly install: {
+    readonly found: boolean;
+    readonly root: string | null;
+    readonly patchline: string | null;
+    readonly otherPatchlines: readonly string[];
+    readonly assetsZip: string | null;
+    readonly serverJar: string | null;
+    readonly bundledJava: string | null;
+    readonly uiLanguage: string | null;
+    /** Which paths came from a flag rather than from detection. */
+    readonly overridden: readonly string[];
+  };
+  readonly tiers: readonly number[];
+  readonly index: IndexStats | null;
+  /** Why there are no index stats, when there are none. */
+  readonly indexState:
+    | "ready"
+    | "not-built"
+    | "no-archive"
+    | "unreadable"
+    /** The file exists and opens, but the build never reached its last stage. */
+    | "incomplete"
+    /** Whole, but written by indexer logic that produced different content. */
+    | "stale";
+  readonly databasePath: string | null;
+}
+
+/**
+ * `status`, whole: where the game is, which sources are available, and what the
+ * index holds.
+ *
+ * The two halves used to live apart. Detection, tiers and paths were rendered in
+ * `main.ts`, while `statsOp` returned index counts and nothing else -- so the
+ * MCP tool, reading the operation, could not answer the question its own
+ * description promised, and two agents reported the gap. A third read
+ * `Tier: 1 + 2` printed above `no Assets.zip, nothing to index`, because the
+ * tier was asserted from a path that detection had merely expected.
+ *
+ * Answerable on a cold cache by design: an agent that finds the tool unready
+ * must be able to diagnose why rather than guess.
+ */
+export async function statusOp(
+  options: { assets?: string; patchline?: string; jar?: string } = {},
+): Promise<Result<StatusValue>> {
+  const detected = detectInstallation(options.patchline);
+  const project = detectProject();
+  const overridden = [
+    ...(options.assets === undefined ? [] : ["assetsZip"]),
+    ...(options.jar === undefined ? [] : ["serverJar"]),
+  ];
+  const install =
+    detected === null
+      ? null
+      : {
+          ...detected,
+          ...(options.assets === undefined ? {} : { assetsZip: options.assets }),
+          ...(options.jar === undefined ? {} : { serverJar: options.jar }),
+        };
+
+  const lines: string[] = [`Project:     ${project.kind}  (${project.root})`];
+  if (install === null) {
+    lines.push(
+      "Hytale:      not found",
+      "",
+      "Set HYTALE_ROOT, or pass --assets to point at an archive directly.",
+    );
+    return rendered(
+      {
+        project,
+        install: {
+          found: false,
+          root: null,
+          patchline: null,
+          otherPatchlines: [],
+          assetsZip: null,
+          serverJar: null,
+          bundledJava: null,
+          uiLanguage: null,
+          overridden,
+        },
+        tiers: [],
+        index: null,
+        indexState: "no-archive" as const,
+        databasePath: null,
+      },
+      `${lines.join("\n")}\n`,
+    );
+  }
+
+  const others = install.availablePatchlines.filter((p) => p !== install.patchline);
+  const mark = (name: string): string =>
+    overridden.includes(name) ? `  (from --${name === "assetsZip" ? "assets" : "jar"})` : "";
+  lines.push(
+    `Install:     ${install.root}`,
+    `Patchline:   ${install.patchline}${others.length > 0 ? `  (also present: ${others.join(", ")})` : ""}`,
+    `Assets.zip:  ${install.assetsZip ?? "not found"}${mark("assetsZip")}`,
+    `Server JAR:  ${install.serverJar ?? "not found"}${mark("serverJar")}`,
+    `Bundled JVM: ${install.bundledJava ?? "not found"}`,
+    `UI language: ${install.uiLanguage ?? "unknown"}  (display only; search covers every indexed locale)`,
+  );
+
+  // A source counts only if the file is actually there. Detection returns a path
+  // it expects and an override is whatever the caller typed, so asserting a tier
+  // from a path alone produced "Tier: 1 + 2" above "no Assets.zip".
+  const present = (path: string | null): boolean => path !== null && existsSync(path);
+  const tier1 = present(install.assetsZip);
+  const tier2 = tier1 && present(install.serverJar) && present(install.bundledJava);
+  const tier3 = project.kind !== "none";
+  const tiers = [tier1 ? 1 : 0, tier2 ? 2 : 0, tier3 ? 3 : 0].filter((n) => n > 0);
+
+  lines.push(
+    `Tier:        ${tiers.join(" + ") || "none — no sources found"}  (which sources are available)`,
+    `             1 = Assets.zip  2 = + the game's schema generator  3 = + a project here`,
+  );
+  if (tier1 && !tier2) {
+    lines.push("             schema answers unavailable; pass --jar to enable tier 2");
+  }
+
+  // The index half, from the cache itself rather than from a constant. This line
+  // read "not built (indexing is not implemented yet)" long after indexing
+  // worked, so status contradicted every other command.
+  let stats: IndexStats | null = null;
+  let state: StatusValue["indexState"] = "no-archive";
+  let dbPath: string | null = null;
+  let summary = "no Assets.zip, nothing to index";
+
+  const archivePath = options.assets ?? install.assetsZip;
+  if (archivePath !== null && existsSync(archivePath)) {
+    dbPath = frozenDbPath(frozenKey(archivePath, await archiveStamp(archivePath)));
+    if (!existsSync(dbPath)) {
+      state = "not-built";
+      summary = "not built — run 'hytale-atlas index'";
+    } else {
+      const db = openDatabase(dbPath, { readOnly: true });
+      try {
+        stats = statsOp(db).value;
+        // Counts first, THEN the completion marker. A partial index still has
+        // numbers worth showing -- an author needs to see 35 074 assets and zero
+        // edges to understand why the answers were wrong -- but it must not be
+        // called ready. `pipelineState` is the same check the MCP bootstrap runs.
+        state = pipelineState(db);
+        summary =
+          `${formatCount(stats.assets)} assets ` +
+          `(${formatCount(stats.typed)} typed, ` +
+          `${Math.round((stats.typed / Math.max(stats.assets, 1)) * 100)}%), ` +
+          `${formatCount(stats.declaredFields)} schema fields, ` +
+          `${formatCount(stats.edges)} edges\n` +
+          // Named and attributed. "5 locales" led an agent to infer the list and
+          // conclude Ukrainian was absent; an unlabelled list of five codes then
+          // read as the languages the GAME ships rather than this archive.
+          `             locales in this Assets.zip: ${stats.locales.join(", ")}\n` +
+          `             observed/declared join: ${formatCount(stats.joinedFields)} of ` +
+          `${formatCount(stats.observedFields)} observed fields match a declared one ` +
+          `(${Math.round((stats.joinedFields / Math.max(stats.observedFields, 1)) * 100)}%)\n` +
+          `             epoch ${stats.epoch} -- one per index build; rebuild with 'index --force'\n` +
+          `             ${dbPath}`;
+        if (state !== "ready") {
+          summary =
+            `${
+              state === "incomplete"
+                ? "INCOMPLETE — the build did not reach its last stage"
+                : "OUT OF DATE — built by an older indexer, contents differ from a fresh build"
+            }; rerun 'hytale-atlas index --force'\n             ` + summary;
+        }
+      } catch (err) {
+        state = "unreadable";
+        summary = `unreadable (${err instanceof Error ? err.message : String(err)})`;
+      } finally {
+        db.close();
+      }
+    }
+  }
+  lines.push(`Index:       ${summary}`);
+
+  return rendered(
+    {
+      project,
+      install: {
+        found: true,
+        root: install.root,
+        patchline: install.patchline,
+        otherPatchlines: others,
+        assetsZip: install.assetsZip,
+        serverJar: install.serverJar,
+        bundledJava: install.bundledJava,
+        uiLanguage: install.uiLanguage,
+        overridden,
+      },
+      tiers,
+      index: stats,
+      indexState: state,
+      databasePath: dbPath,
+    },
+    `${lines.join("\n")}\n`,
+    stats === null ? [] : [caveat.joinIncomplete(stats.joinedFields, stats.observedFields, "observed")],
+  );
 }
 
 export function statsOp(db: Database): Result<IndexStats> {

@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
 
-import { type Database, openDatabase } from "../db/open.ts";
+import { type Database, openDatabase, setMeta } from "../db/open.ts";
+import { PIPELINE_VERSION } from "../db/schema.ts";
 import { buildSearchIndex } from "../indexer/corpus.ts";
 import { craftableAt, indexBenches } from "../indexer/benches.ts";
 import { VALUE_LINKS, indexValueLinks } from "../indexer/value-links.ts";
@@ -27,6 +28,8 @@ import {
   benchRecipeCount,
   assetTypesOp,
   assetsDeclaringField,
+  assetsOfTypeList,
+  typeExists,
   benchesOp,
   brokenRefsFor,
   declaredCount,
@@ -41,6 +44,8 @@ import {
   sameNamedCount,
   searchSchemaOp,
   typeAlternatives,
+  typesOp,
+  unionOf,
   valueLinkFor,
   valueOccurrencesWithoutEdges,
   valueUsage,
@@ -424,6 +429,11 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
     // "what can I craft here" and "which tool gathers this" have no answer.
     const links = indexValueLinks(db);
     const benches = indexBenches(db);
+
+    // The completion marker, written last and only here. Everything above this
+    // line commits separately, so any earlier failure leaves a database that
+    // opens cleanly and is wrong. Readers check this key, not the file.
+    setMeta(db, "pipeline", String(PIPELINE_VERSION));
 
     process.stdout.write(
       [
@@ -954,6 +964,28 @@ export async function cmdBench(
       return 1;
     }
 
+    // Whether any asset declares this bench at all. The LIST view computes and
+    // prints this ("Fieldcraft ... (no bench declares this id)"); the detail view
+    // dropped it, so `bench Fieldcraft` and `bench Furnace` were identical in
+    // shape while one is a station you can place and the other is an id nothing
+    // in vanilla provides -- a recipe requiring it can never be crafted. That is
+    // precisely the runtime silence this command exists to prevent, and the fact
+    // was already in hand one screen away.
+    const declaredBy = db
+      .prepare(
+        `SELECT group_concat(a.logical_id, ', ') AS ids FROM bench_declarations d
+           JOIN assets a ON a.id = d.asset_id WHERE d.bench_id = ?`,
+      )
+      .get(benchId) as { ids: string | null } | undefined;
+    if (declaredBy?.ids == null) {
+      process.stdout.write(
+        `  NOTE: no asset declares the bench id '${benchId}'. Recipes require it,\n` +
+          `  but nothing in vanilla provides a station carrying it.\n\n`,
+      );
+    } else {
+      process.stdout.write(`  declared by: ${declaredBy.ids}\n\n`);
+    }
+
     // Headed, because column 2 is a trap. It is the category's translated NAME,
     // and it routinely collides with a real identifier of something else:
     // `Workbench_Tools` displays as `Tools`, and `Tools` is separately a
@@ -1215,28 +1247,29 @@ export async function cmdTypes(args: {
   assets?: string;
   patchline?: string;
   limit?: number;
+  type?: string;
 }): Promise<number> {
   const db = await frozenDb(args.assets, args.patchline);
   try {
     const limit = args.limit ?? 200;
-    const all = assetTypesOp(db).value;
-    const rows = all.slice(0, limit);
-    process.stdout.write(
-      `${"TYPE".padEnd(34)} ${"ASSETS".padStart(7)} ${"FIELDS".padStart(7)}  WHERE\n\n`,
-    );
-    for (const r of rows) {
-      process.stdout.write(
-        `${r.type.padEnd(34)} ${formatCount(r.assets).padStart(7)} ` +
-          `${formatCount(r.declaredFields).padStart(7)}  ${r.path ?? ""}\n`,
-      );
-    }
-    noticeTruncated(rows.length, all.length > limit, "types");
-    process.stdout.write(
-      `\nFIELDS 0 means the generated schema declares nothing for that type, not ` +
-        `that it is empty.\nShared definitions ('common:...') are not asset types ` +
-        `and are not listed; describe accepts them.\n`,
-    );
-    return 0;
+
+    // `types <Type>` lists the assets of one type. Without it there was no way
+    // to enumerate a legal-value set: `describe BlockType --field
+    // /BlockSoundSetId` reports 48 distinct values, cannot show them (above the
+    // 40 storage ceiling), and points at `refs <id>` -- which needs the id you
+    // are looking for. A blind trial filed this as the one thing it could not
+    // get, and the only workaround was a query that matches everything by
+    // accident of tokenisation.
+    // The command renders nothing of its own: the operation carries its text,
+    // and this writes it. The MCP server returns the same string, so the two
+    // front ends cannot describe the same corpus differently.
+    const result = typesOp(db, {
+      ...(args.type === undefined ? {} : { type: args.type }),
+      limit,
+    });
+    const miss = result.value.kind === "miss";
+    (miss ? process.stderr : process.stdout).write(result.text ?? "");
+    return miss ? 1 : 0;
   } finally {
     db.close();
   }
@@ -1331,24 +1364,23 @@ export async function cmdDescribe(
     // declared. Two commands contradicting each other, and the "did you mean"
     // steered readers toward the worse view. The schema states the branches and
     // the discriminator; print those instead.
-    const union = db
-      .prepare(
-        `SELECT ref_scope, discriminator_property, discriminator_values
-           FROM schema_fields
-          WHERE asset_type = ? AND json_pointer = '' AND ref_scope IS NOT NULL`,
-      )
-      .get(assetType) as Record<string, unknown> | undefined;
+    // From the operation, not from a second copy of its query. This block had
+    // its own SELECT against `schema_fields`, so `unionOf` and the CLI could
+    // disagree about what a union is -- and did: the operation now requires more
+    // than one branch (a single `$ref` is an ordinary crossing, not a union of
+    // one) while this copy would still have printed "a union of 1 shapes".
+    const union = unionOf(db, assetType);
 
-    if (union !== undefined && field === undefined) {
-      const branches = String(union["ref_scope"] ?? "").split(" ").filter(Boolean);
-      const values = String(union["discriminator_values"] ?? "").split(" ").filter(Boolean);
-      const property = (union["discriminator_property"] as string | null) ?? "Type";
+    if (union !== null && field === undefined) {
+      const branches = union.branches;
+      const values = union.discriminatorValues;
+      const property = union.discriminatorProperty;
       process.stdout.write(
         `'${assetType}' is a union of ${branches.length} shapes, chosen by the ` +
           `'${property}' field.\nIt declares no field of its own -- describe a branch ` +
           `to see fields.\n\n`,
       );
-      const width = Math.max(...values.map((v) => v.length), 8);
+      const width = Math.max(...values.map((v: string) => v.length), 8);
       for (const [i, branch] of branches.entries()) {
         process.stdout.write(`${(values[i] ?? "?").padEnd(width)}  hytale-atlas describe ${branch}\n`);
       }
@@ -1364,14 +1396,10 @@ export async function cmdDescribe(
       // Order matters. Checking the type first reported a missing FIELD as a
       // missing TYPE, producing "No type 'Item'. Did you mean: describe Item" --
       // a suggestion identical to what had just been typed.
-      const typeExists =
-        (
-          db
-            .prepare("SELECT count(*) AS n FROM schema_fields WHERE asset_type = ?")
-            .get(assetType) as Record<string, unknown>
-        )["n"] !== 0;
+      // The operation's own test, not an inline copy of it.
+      const declaresFields = typeExists(db, assetType);
 
-      if (typeExists && field !== undefined) {
+      if (declaresFields && field !== undefined) {
         // Walk up the pointer to find the deepest prefix that does exist, which
         // is usually where the user's mental model and the schema diverge.
         let probe = field;
@@ -1388,10 +1416,33 @@ export async function cmdDescribe(
             ? `'${assetType}' is a union: its fields live on the branches, not on it.\n` +
               `Run 'hytale-atlas describe ${assetType}' to list the branches, then describe one.\n`
             : `Run 'hytale-atlas describe ${assetType}' to list its fields.\n`;
+        // Where the nearest declared pointer CROSSES into another type, say so.
+        // The success path prints "continues in common:X" for the very same
+        // pointer, and the error path withheld it -- so reaching
+        // `BlockType /Support/Down/*/TagId` took four invocations where two
+        // would do, and the message read as absence for a field that exists one
+        // `$ref` away. Two agents hit this independently, on different types.
+        const crossing = near
+          .map((p) => {
+            const row = db
+              .prepare(
+                `SELECT ref_scope FROM schema_fields
+                  WHERE asset_type = ? AND json_pointer = ? AND ref_scope IS NOT NULL`,
+              )
+              .get(assetType, p) as { ref_scope: string } | undefined;
+            const targets = scopes(row?.ref_scope ?? null);
+            return targets.length === 1
+              ? `  ${p} continues in ${targets[0]} -- ` +
+                `hytale-atlas describe ${targets[0]} --field ${field.slice(p.length) || "/"}\n`
+              : null;
+          })
+          .filter((l): l is string => l !== null)
+          .join("");
+
         process.stderr.write(
           `'${assetType}' has no field '${field}'.\n` +
             (near.length > 0
-              ? `Nearest declared:\n` + near.map((p) => `  ${p}\n`).join("")
+              ? `Nearest declared:\n` + near.map((p) => `  ${p}\n`).join("") + crossing
               : fallback),
         );
         return 1;
@@ -1528,6 +1579,26 @@ export async function cmdDescribe(
           );
         }
       }
+      // Where the legal values live, when the field declares a target type.
+      // `describe` could report "48 distinct values" it cannot store and then
+      // point at `refs <id>`, which needs the id being looked for.
+      if (args.field !== undefined && d?.referenceTarget != null) {
+        process.stdout.write(
+          `    the values are assets of type ${d.referenceTarget} -- ` +
+            `hytale-atlas types ${d.referenceTarget}\n`,
+        );
+      }
+      // Absence of `required` is weak evidence, and silence looked like a fact.
+      // The generated schema marks only 2 455 of 18 396 fields required, so a
+      // field with no marker is usually one the schema simply says nothing
+      // about -- the same (a)/(b) confusion `unused` carries, about the schema
+      // instead of the corpus.
+      if (args.field !== undefined && d !== null && d.optional) {
+        process.stdout.write(
+          `    the schema does not mark this required -- and it marks few fields\n` +
+            `    either way, so that is not evidence the field is optional\n`,
+        );
+      }
       const link = valueLinkFor(db, assetType, f.pointer);
       if (link !== null) {
         process.stdout.write(
@@ -1554,6 +1625,18 @@ export async function cmdDescribe(
         }
       } else if (d?.enumValues) {
         process.stdout.write(`    legal: ${d.enumValues.join(", ")}\n`);
+        // ...and which of them vanilla actually uses. The observed values were
+        // stored and this branch dropped them, so a field with three legal values
+        // and two in use looked identical to one where all three are used --
+        // `common:RequiredBlockFaceSupport./Support` is exactly that, and "do any
+        // vanilla crops set Disallowed" was unanswerable while the index held the
+        // answer. Only worth printing when it is narrower than the legal set.
+        if (o?.values && o.values.length < d.enumValues.length) {
+          process.stdout.write(
+            `    seen:  ${o.values.join(", ")}  (${o.values.length} of ` +
+              `${d.enumValues.length} legal values occur in vanilla)\n`,
+          );
+        }
       } else if (o?.values) {
         // Says how many of how many. The list was cut at 14 in silence, so a
         // field with 21 real bench ids showed 14 of them, ending mid-alphabet at
@@ -1689,7 +1772,14 @@ export async function cmdDescribe(
       process.stdout.write(
         "\n'used in N assets' counts files that declare the field themselves.\n" +
           "'get' resolves inheritance first, so it can show a value on assets that\n" +
-          "are not counted here.\n",
+          "are not counted here.\n" +
+          // A shape can be embedded in a file of another type, so the count is
+          // not a count of assets OF this type: `EntityEffect./Duration` reports
+          // 146 while `types EntityEffect` lists 140, because 19 of them are
+          // inline EntityEffect literals inside Items. Both numbers were right
+          // and the pair read as a plain contradiction.
+          "A file of any type counts if it carries this shape, inline or as its\n" +
+          "own asset -- so this can exceed the number of assets OF this type.\n",
       );
     }
 
@@ -1702,12 +1792,28 @@ export async function cmdDescribe(
       // the honest denominator when the question is "does vanilla use this".
       const one = (sql: string): number =>
         Number((db.prepare(sql).get() as { n: number } | undefined)?.n ?? 0);
+      // Counted over SCALAR declared fields only -- the population that can
+      // carry this marker at all. The first version quoted 2 457 of 17 400,
+      // borrowed from `undocumented`'s caveat where the denominator is the whole
+      // declared side. Here it is wrong twice over: 7 959 of those 17 400 are
+      // containers, which the legend two lines up says can NEVER appear in the
+      // observed layer, so counting them as unmatched inflates the doubt roughly
+      // forty-fold. A blind trial discounted a load-bearing `unused` field on the
+      // strength of it.
+      const SCALAR = `ifnull(declared_type,'') NOT LIKE '%object%'
+        AND ifnull(declared_type,'') NOT LIKE '%array%'
+        AND ifnull(declared_type,'') NOT LIKE '$ref%'
+        AND ifnull(declared_type,'') NOT IN ('anyOf','oneOf')`;
       const joined = markers.has("unused")
-        ? one(`SELECT count(*) AS n FROM field_stats fs JOIN schema_fields sf
-                 ON sf.asset_type = fs.asset_type AND sf.json_pointer = fs.json_pointer`)
+        ? one(`SELECT count(*) AS n FROM schema_fields sf
+                WHERE sf.json_pointer <> '' AND ${SCALAR}
+                  AND EXISTS (SELECT 1 FROM field_stats fs
+                               WHERE fs.asset_type = sf.asset_type
+                                 AND fs.json_pointer = sf.json_pointer)`)
         : 0;
       const declaredTotal = markers.has("unused")
-        ? one("SELECT count(*) AS n FROM schema_fields WHERE json_pointer <> ''")
+        ? one(`SELECT count(*) AS n FROM schema_fields
+                WHERE json_pointer <> '' AND ${SCALAR}`)
         : 0;
       const legend: Record<string, string> = {
         required: "the schema marks this field required",
@@ -1721,13 +1827,13 @@ export async function cmdDescribe(
           "holds other fields, never a value of its own, so it CANNOT appear in the\n" +
           "               observed layer -- absence here says nothing about use",
         unused:
-          "no vanilla asset sets it. A statement about this index, not the engine:\n" +
-          "               only " +
-          formatCount(joined) +
-          " of " +
+          "no vanilla asset sets it. A statement about this index, not the engine.\n" +
+          "               Of the " +
           formatCount(declaredTotal) +
-          " declared fields are matched by the observed\n" +
-          "               layer, so a field may be in use and simply unmatched",
+          " declared fields that CAN be observed (containers cannot),\n" +
+          "               " +
+          formatCount(joined) +
+          " are; the rest are either genuinely unused or missed by the join",
         "?": "no declared type, because the schema does not describe this field",
         "->": "the asset TYPE this field declares it points at (hytale.hytaleAssetRef)",
         default: "the value the game uses when the field is absent",

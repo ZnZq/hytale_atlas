@@ -23,6 +23,33 @@
  */
 export const SCHEMA_VERSION = 16;
 
+/**
+ * Version of the indexing PIPELINE, written to `meta.pipeline` only after every
+ * stage has finished.
+ *
+ * Two problems, one marker.
+ *
+ * **A half-written index is indistinguishable from a whole one.** Stages commit
+ * separately, and `epoch` is bumped by the FIRST of them, so a build that died
+ * after the corpus walk leaves 35 074 assets, zero edges and zero field stats --
+ * a database that opens cleanly and answers "nothing references that" about the
+ * entire corpus. Presence of the file proves nothing; presence of this key
+ * proves the pipeline reached the end.
+ *
+ * **A complete index can still be out of date in CONTENT.** `SCHEMA_VERSION`
+ * guards the database's SHAPE and is part of the cache path, so changing it
+ * orphans old files. But most indexer fixes change what gets written without
+ * touching a single column: reading `hytaleAssetRef` from anyOf branches added
+ * 363 declared targets, the path-length exemption added 957 file edges, and the
+ * dangling rule stopped marking 39 320 resolved references. Every one left the
+ * shape identical, so an existing index stayed silently wrong.
+ *
+ * **Bump this whenever a change alters what indexing writes.** Not for a
+ * refactor, not for rendering, not for a query — for anything that would make a
+ * freshly built index differ from an existing one.
+ */
+export const PIPELINE_VERSION = 1;
+
 export const SCHEMA_SQL = `
 -- ---------------------------------------------------------------------------
 -- Bookkeeping

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { existsSync } from "node:fs";
 
+import { serveMcp } from "../mcp/server.ts";
 import { looksMangled, normalizeFieldPointer } from "../query/schema.ts";
-import { detectInstallation, detectProject } from "../sources/detect.ts";
+import { statusOp } from "../api/operations.ts";
 import {
   cmdBench,
   cmdDescribe,
@@ -16,7 +17,7 @@ import {
   cmdSearchSchema,
   cmdTypes,
   cmdUndocumented,
-  indexSummary,
+
 } from "./commands.ts";
 
 /**
@@ -54,6 +55,8 @@ const USAGE = `hytale-atlas — unofficial local index of Hytale assets
   hytale-atlas types           Every asset type, how many assets carry it, how
                                many fields the schema declares, and where its
                                files live
+  hytale-atlas types <Type>    Every asset OF that type -- the way to enumerate
+                               a field's legal values when it declares '-> Type'
   hytale-atlas describe <Type> Schema for a type: declared and observed layers.
                                Shared types need their namespace: 'common:ItemTool',
                                not 'ItemTool'. Add --field <pointer> for one field,
@@ -77,7 +80,11 @@ Not implemented yet -- these exit 2 rather than pretending
   hytale-atlas validate        Pack validation. Every input exists; the command
                                does not.
   hytale-atlas clean [--all]   Dropping the index or the global cache.
-  hytale-atlas --mcp           Serving MCP over stdio.
+  hytale-atlas --mcp           Serve MCP over stdio: the same answers these
+                               commands give, as structured data with their
+                               caveats attached. Ten read-only tools; 'index'
+                               and 'generate-schema' are deliberately not among
+                               them.
 
 Options
   --assets <path>              Explicit Assets.zip override
@@ -235,92 +242,23 @@ function parseArgs(argv: readonly string[]): Args {
  * server unready can diagnose why rather than guess (`docs/init/06-CLI-UX.md`).
  */
 async function cmdStatus(args: Args): Promise<number> {
-  const patchlineFlag = args.flags.get("patchline");
-  const detected = detectInstallation(
-    typeof patchlineFlag === "string" ? patchlineFlag : undefined,
-  );
-  const project = detectProject();
-
-  // `status` is documented as "where the game is", and it read only --patchline:
-  // `--assets C:/nope/Assets.zip status` printed the DETECTED archive path while
-  // every other command used the override, then asserted "Tier: 1 + 2" two lines
-  // above "no Assets.zip, nothing to index". The one command whose job is to say
-  // which files are in play was the one command that did not apply the flags
-  // choosing them.
-  const assetsFlag = args.flags.get("assets");
-  const jarFlag = args.flags.get("jar");
-  const overrides = {
-    ...(typeof assetsFlag === "string" ? { assetsZip: assetsFlag } : {}),
-    ...(typeof jarFlag === "string" ? { serverJar: jarFlag } : {}),
+  // Renders nothing of its own. Detection, tiers and the index summary all live
+  // in `statusOp`, so the MCP tool answers the question its description promises
+  // -- it used to serve `statsOp`, which knows only the index counts, and two
+  // agents reported the gap between the description and the payload.
+  const flag = (name: string): string | undefined => {
+    const value = args.flags.get(name);
+    return typeof value === "string" ? value : undefined;
   };
-  const install = detected === null ? null : { ...detected, ...overrides };
-  const overridden = Object.keys(overrides);
-
-  const lines: string[] = [];
-  lines.push(`Project:     ${project.kind}  (${project.root})`);
-
-  if (!install) {
-    lines.push("Hytale:      not found");
-    lines.push("");
-    lines.push("Set HYTALE_ROOT, or pass --assets to point at an archive directly.");
-    process.stdout.write(lines.join("\n") + "\n");
-    return 1;
-  }
-
-  lines.push(`Install:     ${install.root}`);
-  lines.push(
-    `Patchline:   ${install.patchline}` +
-      (install.availablePatchlines.length > 1
-        ? `  (also present: ${install.availablePatchlines
-            .filter((p) => p !== install.patchline)
-            .join(", ")})`
-        : ""),
-  );
-  const mark = (name: string): string => (overridden.includes(name) ? "  (from --" + (name === "assetsZip" ? "assets" : "jar") + ")" : "");
-  lines.push(`Assets.zip:  ${install.assetsZip ?? "not found"}${mark("assetsZip")}`);
-  lines.push(`Server JAR:  ${install.serverJar ?? "not found"}${mark("serverJar")}`);
-  lines.push(`Bundled JVM: ${install.bundledJava ?? "not found"}`);
-  lines.push(`UI language: ${install.uiLanguage ?? "unknown"}  (display only; search covers every indexed locale)`);
-
-  // Tiers per docs/init/06-CLI-UX.md. Tier 2 needs the JAR *and* a JVM to run it;
-  // the game bundles one, so this is the normal case rather than the lucky one.
-  //
-  // A source counts only if it is actually there. Detection returns a path it
-  // expects, and an overridden one is whatever the caller typed, so a tier was
-  // asserted from a path alone: `--assets C:/nope/Assets.zip status` claimed
-  // "Tier: 1 + 2" two lines above "no Assets.zip, nothing to index".
-  const present = (path: string | null): boolean => path !== null && existsSync(path);
-  const tier1 = present(install.assetsZip);
-  const tier2 = tier1 && present(install.serverJar) && present(install.bundledJava);
-  const tier3 = project.kind !== "none";
-
-  const tiers = [tier1 && "1", tier2 && "2", tier3 && "3"].filter(Boolean).join(" + ");
-  // Spelled out. A bare "Tier: 1 + 2" was reported by three blind trials as
-  // undefined anywhere in the tool, and one read it as partial coverage -- the
-  // most plausible place a missing locale could have been hiding. It is about
-  // which SOURCES are available, not about how much of the corpus was read.
-  lines.push(`Tier:        ${tiers || "none — no sources found"}  (which sources are available)`);
-  lines.push(
-    `             1 = Assets.zip  2 = + the game's schema generator  ` +
-      `3 = + a project here`,
-  );
-  if (tier1 && !tier2) {
-    lines.push("             schema answers unavailable; pass --jar to enable tier 2");
-  }
-
-  // Reported from the cache itself rather than from a constant. This line read
-  // "not built (indexing is not implemented yet)" long after indexing worked, so
-  // status contradicted every other command and made the tool look broken.
-  lines.push(
-    `Index:       ${await indexSummary(
-      typeof assetsFlag === "string" ? assetsFlag : undefined,
-      typeof patchlineFlag === "string" ? patchlineFlag : undefined,
-    )}`,
-  );
-
-  process.stdout.write(lines.join("\n") + "\n");
-  return install.assetsZip ? 0 : 1;
+  const result = await statusOp({
+    ...(flag("assets") === undefined ? {} : { assets: flag("assets")! }),
+    ...(flag("patchline") === undefined ? {} : { patchline: flag("patchline")! }),
+    ...(flag("jar") === undefined ? {} : { jar: flag("jar")! }),
+  });
+  process.stdout.write(result.text ?? "");
+  return result.value.install.found && result.value.install.assetsZip !== null ? 0 : 1;
 }
+
 
 
 function main(): number | Promise<number> {
@@ -331,21 +269,17 @@ function main(): number | Promise<number> {
     return 0;
   }
 
-  // Refused explicitly. The flag was documented as "Serve MCP over stdio" and
-  // then never read, so it fell through to the default command and ran the
-  // INDEXER -- an MCP client configured with it would have built an index and
-  // reported success while serving nothing.
+  // The flag was documented as "Serve MCP over stdio" and then never read, so it
+  // fell through to the default command and ran the INDEXER: a client configured
+  // with it built an index and reported success while serving nothing. It now
+  // serves. Diagnostics go to stderr, because stdout carries the JSON-RPC stream.
   if (args.flags.has("mcp")) {
-    process.stderr.write(
-      "The MCP server is not implemented yet, and --mcp does nothing.\n" +
-        // The list omitted search-lang and refs, which between them answered
-        // half of every blind trial -- an under-report of the tool's own surface
-        // printed as though it were the whole of it.
-        "Everything it would expose is reachable from this CLI meanwhile:\n" +
-        "  status, search, search-lang, get, refs, describe, search-schema,\n" +
-        "  bench, undocumented, eval\n",
-    );
-    return 2;
+    const assetsForMcp = args.flags.get("assets");
+    const patchlineForMcp = args.flags.get("patchline");
+    return serveMcp({
+      ...(typeof assetsForMcp === "string" ? { assets: assetsForMcp } : {}),
+      ...(typeof patchlineForMcp === "string" ? { patchline: patchlineForMcp } : {}),
+    });
   }
 
   switch (args.command) {
@@ -430,7 +364,9 @@ function main(): number | Promise<number> {
       // returned the whole unscoped corpus and looked like an answer.
       return cmdUndocumented({ ...opts(args), ...(args.rest[0] ? { type: args.rest[0] } : {}) });
     case "types":
-      return cmdTypes(opts(args));
+      // The optional positional lists that type's assets, the same way
+      // `undocumented <Type>` scopes to one type.
+      return cmdTypes({ ...opts(args), ...(args.rest[0] ? { type: args.rest[0] } : {}) });
     case "eval":
       return cmdEval(opts(args));
     case "generate-schema":

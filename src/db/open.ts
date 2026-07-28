@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import { SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
+import { PIPELINE_VERSION, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
 
 /**
  * Opening and initialising an index database.
@@ -127,4 +127,24 @@ export function getMeta(db: Database, key: string): string | null {
     | { value?: string }
     | undefined;
   return row?.value ?? null;
+}
+
+/**
+ * Whether an open database was finished, and by which indexer.
+ *
+ * The only reliable way to recognise a partial index. Counting rows does not
+ * work: a build that dies mid-pipeline leaves a database with tens of thousands
+ * of assets and nothing else, and every count you would think to check is a
+ * legitimate value for some earlier stage. `meta.pipeline` is written once, last,
+ * by `cmdIndex` -- so its ABSENCE means the build never reached the end, and a
+ * value other than `PIPELINE_VERSION` means it finished under indexer logic that
+ * wrote different content (`SCHEMA_VERSION` cannot see that; see schema.ts).
+ *
+ * Shared deliberately: `status` reports this state and the MCP bootstrap acts on
+ * it, and the two must not be able to disagree about whether an index is usable.
+ */
+export function pipelineState(db: Database): "ready" | "incomplete" | "stale" {
+  const written = getMeta(db, "pipeline");
+  if (written === null) return "incomplete";
+  return written === String(PIPELINE_VERSION) ? "ready" : "stale";
 }

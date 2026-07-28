@@ -1,0 +1,464 @@
+import type { Database } from "../db/open.ts";
+import { AssetArchive } from "../sources/archive.ts";
+import type { AssetLoader } from "../query/asset.ts";
+import {
+  assetTypesOp,
+  typesOp,
+  assetsDeclaringField,
+  assetsOfType,
+  assetsOfTypeList,
+  benchDeclaredBy,
+  benchIdExists,
+  benchOp,
+  benchesOp,
+  brokenRefsFor,
+  declaredCount,
+  describeOp,
+  fileRefsOp,
+  getAssetOp,
+  identify,
+  langOp,
+  nearestFields,
+  refsOp,
+  searchAssetsOp,
+  searchSchemaOp,
+  statusOp,
+  typeAlternatives,
+  typeExists,
+  undeclaredObserved,
+  undocumentedOp,
+  valueLinkFor,
+  valueOccurrencesWithoutEdges,
+  valueUsage,
+} from "../api/operations.ts";
+import { isContainer, normalizeFieldPointer } from "../query/schema.ts";
+import type { Caveat, Result } from "../api/types.ts";
+
+/**
+ * The MCP surface: one tool per question, each returning an operation's own
+ * `{ value, caveats }` object.
+ *
+ * **Nothing here computes an answer.** Every handler calls into `src/api` and
+ * serialises what comes back, which is the whole reason that layer exists: the
+ * defects this project keeps finding are *sentences*, and the sentences live in
+ * the caveats. A server that re-derived a total, re-worded a limitation or
+ * dropped a caveat would ship exactly the divergence the CLI already paid for --
+ * `benchOp` returned 200 recipes while the CLI printed 911, and `statsOp`
+ * returned a locale count the CLI had already replaced with names.
+ *
+ * Where a CLI command enriches an operation (describe adds broken references,
+ * value links and declaring assets), this composes the SAME operations rather
+ * than reimplementing the enrichment. Composition is allowed; computation is not.
+ *
+ * **Deliberately not exposed:** `index`, `generate-schema`, `clean` and `eval`.
+ * The first three mutate state, and `generate-schema` launches the game's own
+ * generator, which emits telemetry that cannot be switched off and therefore
+ * requires explicit human consent (`docs/SERVER-JAR.md`). Putting it behind a
+ * tool call would route around that consent, which is the one thing that path
+ * exists to prevent. `eval` measures the tool against a fixture set on disk and
+ * is a development instrument, not an answer about the game.
+ */
+
+export interface ToolDefinition {
+  readonly name: string;
+  readonly description: string;
+  readonly inputSchema: Record<string, unknown>;
+}
+
+/** JSON Schema helpers, kept tiny -- these shapes are all flat. */
+const str = (description: string): Record<string, unknown> => ({ type: "string", description });
+const int = (description: string): Record<string, unknown> => ({
+  type: "integer",
+  description,
+  minimum: 1,
+});
+const object = (
+  properties: Record<string, unknown>,
+  required: readonly string[] = [],
+): Record<string, unknown> => ({
+  type: "object",
+  properties,
+  ...(required.length > 0 ? { required: [...required] } : {}),
+  additionalProperties: false,
+});
+
+const TYPE_ARG = str(
+  "Asset type, e.g. 'Item'. Shared definitions need their namespace: 'common:ItemTool'.",
+);
+const LIMIT_ARG = int("Maximum rows. The answer says so when it truncates.");
+
+export const TOOLS: readonly ToolDefinition[] = [
+  {
+    name: "status",
+    // Promises what it now returns. It once described the CLI command's output
+    // while serving `statsOp`, which knows only the index counts -- two agents
+    // reported the gap. The operation carries both halves, so the description
+    // can be whole again.
+    description:
+      "Where the game is and what the index holds: install paths, patchline, which " +
+      "source tiers are available, and the corpus counts -- assets, typed assets, schema " +
+      "fields, edges, the declared/observed join, and the locales this Assets.zip ships. " +
+      "Answerable even before the index is built, so start here.",
+    inputSchema: object({}),
+  },
+  {
+    name: "types",
+    description:
+      "Every asset type with how many assets carry it, how many fields the schema declares, " +
+      "and where its files live. Pass `type` to list the ASSETS of one type -- that is how " +
+      "to enumerate the legal values of a field declared '-> SomeType'.",
+    inputSchema: object({ type: TYPE_ARG, limit: LIMIT_ARG }),
+  },
+  {
+    name: "search",
+    description:
+      "Find an asset by identifier or localized name, in any indexed locale. Searches NAMES, " +
+      "not field values -- to find what uses a value, call `refs` with it instead.",
+    inputSchema: object({ query: str("Free text: an identifier or a translated name."), type: TYPE_ARG, limit: LIMIT_ARG }, ["query"]),
+  },
+  {
+    name: "get",
+    description:
+      "The effective definition of one asset, with its parent chain folded in -- what the " +
+      "engine sees, not what the file says. Identifiers are not unique across types; pass " +
+      "`type` to choose.",
+    inputSchema: object({ id: str("Asset identifier, e.g. 'Tool_Pickaxe_Iron'."), type: TYPE_ARG }, ["id"]),
+  },
+  {
+    name: "describe",
+    description:
+      "The schema of a type, in two layers that are never merged: DECLARED (what the game " +
+      "accepts) and OBSERVED (what vanilla actually does). Pass `field` for one pointer, " +
+      "which also returns its broken references, value link and declaring assets.",
+    inputSchema: object(
+      { type: TYPE_ARG, field: str("JSON pointer, e.g. '/Tool/Specs/*/Power'."), limit: LIMIT_ARG },
+      ["type"],
+    ),
+  },
+  {
+    name: "refs",
+    description:
+      "What points at this. Answers three questions depending on what the string turns out " +
+      "to be: an asset (inbound edges), a plain field value (where it occurs), or a file " +
+      "(which assets reference it).",
+    inputSchema: object({ id: str("An asset id, a field value, or a file name."), type: TYPE_ARG, limit: LIMIT_ARG }, ["id"]),
+  },
+  {
+    name: "search_schema",
+    description:
+      "Where a capability is declared, searching field names, titles, descriptions and enum " +
+      "values. The index is LEXICAL: a miss is evidence, not proof, and the result says so.",
+    inputSchema: object({ query: str("Words describing a capability, e.g. 'gather type'."), limit: LIMIT_ARG }, ["query"]),
+  },
+  {
+    name: "search_lang",
+    description:
+      "Localization keys and their translations. Returns both spellings: the stored key and " +
+      "the reference an asset must contain (they differ by a root prefix).",
+    inputSchema: object({ query: str("A key, a key fragment, or a translated string."), limit: LIMIT_ARG }, ["query"]),
+  },
+  {
+    name: "bench",
+    description:
+      "Crafting stations. Without an id, every bench; with one, its categories and what it " +
+      "crafts. The bench id a recipe must name is NOT the id of the asset declaring it.",
+    inputSchema: object({ id: str("Bench id, e.g. 'Workbench'. Omit for the full list."), limit: LIMIT_ARG }),
+  },
+  {
+    name: "undocumented",
+    description:
+      "Fields the schema declares that appear in zero vanilla assets. A negative, and " +
+      "qualified as one: the result carries the declared-side join ratio.",
+    inputSchema: object({ type: TYPE_ARG, limit: LIMIT_ARG }),
+  },
+];
+
+/** Arguments arrive as JSON; these read them without trusting the shape. */
+function text(args: Record<string, unknown>, key: string): string | undefined {
+  const value = args[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+function count(args: Record<string, unknown>, key: string): number | undefined {
+  const value = args[key];
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * A miss is an ANSWER, not an error.
+ *
+ * The CLI exits 1 for "nothing matched" and that is right for a shell, but an
+ * MCP error would tell the model the call failed rather than that the corpus is
+ * silent -- and "no such asset" is frequently the finding. So a miss returns a
+ * normal result carrying `found: false` and the same guidance the CLI prints.
+ */
+function miss(reason: string, next?: Record<string, unknown>): Result<Record<string, unknown>> {
+  return { value: { found: false, reason, ...(next ?? {}) }, caveats: [] };
+}
+
+export interface ToolContext {
+  readonly db: Database;
+  /** Opened lazily: only `get` needs the archive, and it costs ~4s. */
+  openArchive: () => Promise<AssetArchive>;
+  /** Where the index lives, for the CLI renderer to reopen. */
+  readonly options: { assets?: string; patchline?: string };
+}
+
+export async function callTool(
+  ctx: ToolContext,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<Result<unknown>> {
+  const { db } = ctx;
+  const limit = count(args, "limit");
+
+  switch (name) {
+    case "status":
+      // The whole question, from the same operation the CLI prints: install
+      // paths, patchline, tiers AND index counts. It used to serve `statsOp`,
+      // which knows only the counts, so the description promised paths and a
+      // tier that the payload never carried.
+      return statusOp(ctx.options);
+
+    case "types": {
+      // The operation renders itself, so this returns exactly what the CLI
+      // prints -- including the footnote about `common:` definitions, whose
+      // absence here an agent reported as "types silently omits a namespace".
+      const type = text(args, "type");
+      const result = typesOp(db, {
+        ...(type === undefined ? {} : { type }),
+        ...(limit === undefined ? {} : { limit }),
+      });
+      if (result.value.kind === "miss") {
+        return miss(result.value.reason, {
+          type: result.value.type,
+          didYouMean: typeExists(db, result.value.type)
+            ? []
+            : typeAlternatives(db, result.value.type),
+          rendered: result.text,
+        });
+      }
+      return result;
+    }
+
+    case "search": {
+      const query = text(args, "query");
+      if (query === undefined) return miss("A 'query' is required.");
+      return searchAssetsOp(db, query, limit ?? 20, text(args, "type"));
+    }
+
+    case "get": {
+      const id = text(args, "id");
+      if (id === undefined) return miss("An 'id' is required.");
+      const type = text(args, "type");
+      const archive = await ctx.openArchive();
+      const byId = db.prepare(
+        "SELECT path, type FROM assets WHERE logical_id = ?1 AND (?2 IS NULL OR type = ?2)" +
+          " ORDER BY is_effective DESC, type LIMIT 1",
+      );
+      // The loader is handed the type when resolving a PARENT, because
+      // inheritance is within a type -- the same rule the index enforces on
+      // edges. Without it a parent is chosen by identifier alone.
+      const load: AssetLoader = async (logicalId, forType) => {
+        const row = byId.get(logicalId, forType ?? type ?? null) as
+          | { path: string; type: string | null }
+          | undefined;
+        if (row === undefined) return null;
+        try {
+          return {
+            path: row.path,
+            type: row.type,
+            document: JSON.parse(await archive.readText(row.path)) as unknown,
+          };
+        } catch {
+          return null;
+        }
+      };
+      const resolved = await getAssetOp(db, id, load, type);
+      if (resolved.value === null) {
+        return miss(
+          benchIdExists(db, id)
+            ? `'${id}' is a bench id, not an asset. Call 'bench' with it.`
+            : `No asset '${id}'${type === undefined ? "" : ` of type '${type}'`}.`,
+          { alsoKnownAs: identify(db, id) },
+        );
+      }
+      return resolved;
+    }
+
+    case "describe": {
+      const type = text(args, "type");
+      if (type === undefined) return miss("A 'type' is required.");
+      const field = text(args, "field");
+      const request = {
+        assetType: type,
+        ...(field === undefined ? {} : { field }),
+        ...(limit === undefined ? {} : { limit }),
+      };
+      const described = describeOp(db, request);
+
+      if (described.value.fields.length === 0 && described.value.union === null) {
+        const carried = assetsOfType(db, type);
+        if (!typeExists(db, type) && carried === 0) {
+          return miss(`No type '${type}' in the schema.`, {
+            didYouMean: typeAlternatives(db, type),
+          });
+        }
+        if (field !== undefined) {
+          return miss(`'${type}' has no field '${normalizeFieldPointer(field)}'.`, {
+            nearestDeclared: nearestFields(db, type, normalizeFieldPointer(field)),
+          });
+        }
+        return miss(
+          `'${type}' is a real asset type (${carried} assets) but the schema declares ` +
+            `no fields for it.`,
+        );
+      }
+
+      // Enrichment by COMPOSITION -- the same operations the CLI calls, not a
+      // second implementation of them.
+      const enriched = described.value.fields.map((f) => {
+        const broken = brokenRefsFor(db, type, f.pointer);
+        const container = isContainer(f.declared?.type ?? null);
+        return {
+          ...f,
+          // Per FIELD, because the caveat is per call. In bulk mode a container
+          // arrived as `observed: null` with no marker at all, which reads as
+          // "no vanilla asset uses this" -- false for `EntityEffect./DamageResistance`,
+          // which `Immunity_Fire` plainly sets. The same call with `field` set
+          // added `container-no-observations` and the reading flipped. The CLI
+          // encodes this as a `(container)` marker on every row; the served
+          // shape had nowhere to put it.
+          isContainer: container,
+          ...(container
+            ? {
+                observedNote:
+                  "Containers hold other fields and never a value of their own, so they " +
+                  "CANNOT appear in the observed layer. Absence here says nothing about use.",
+              }
+            : {}),
+          ...(broken.distinct > 0 ? { brokenReferences: broken } : {}),
+          ...(field === undefined
+            ? {}
+            : {
+                valueLink: valueLinkFor(db, type, f.pointer),
+                // The sample and its total, together. Returned bare, seven rows
+                // against `observed.assets: 11` looked like the whole set to
+                // anything counting array lengths -- which is exactly what a
+                // machine-readable payload invites.
+                declaredBy: {
+                  shown: assetsDeclaringField(db, type, f.pointer, 7),
+                  total: f.observed?.assets ?? 0,
+                },
+              }),
+        };
+      });
+      return {
+        value: {
+          ...described.value,
+          fields: enriched,
+          declaredFieldCount: declaredCount(db, type),
+          observedOnlyFieldCount: undeclaredObserved(db, type),
+        },
+        caveats: described.caveats,
+      };
+    }
+
+    case "refs": {
+      const id = text(args, "id");
+      if (id === undefined) return miss("An 'id' is required.");
+      const type = text(args, "type");
+      const asAsset = refsOp(db, id, type, limit ?? 40);
+      if (asAsset.value.targets.length > 0) {
+        const beyond = valueOccurrencesWithoutEdges(
+          db,
+          id,
+          asAsset.value.targets.map((t) => t.id),
+        );
+        return {
+          value: {
+            kind: "asset",
+            ...asAsset.value,
+            ...(beyond.occurrences > 0 ? { alsoAValueElsewhere: beyond } : {}),
+            ...(benchDeclaredBy(db, id) === null
+              ? {}
+              : { declaresBenchId: benchDeclaredBy(db, id) }),
+          },
+          caveats: asAsset.caveats,
+        };
+      }
+
+      const usage = valueUsage(db, id, limit ?? 40);
+      if (usage.occurrences > 0) {
+        return { value: { kind: "value", ...usage }, caveats: [] };
+      }
+
+      const asFile = fileRefsOp(db, id, limit ?? 40);
+      if (asFile.value.length > 0) {
+        return { value: { kind: "file", files: asFile.value }, caveats: asFile.caveats };
+      }
+      return miss(
+        `'${id}' is not an asset, carries no value, and no referenced file has that name. ` +
+          `Asset documents themselves are not in the file index.`,
+        { alsoKnownAs: identify(db, id) },
+      );
+    }
+
+    case "search_schema": {
+      const query = text(args, "query");
+      if (query === undefined) return miss("A 'query' is required.");
+      return searchSchemaOp(db, query, limit ?? 20);
+    }
+
+    case "search_lang": {
+      const query = text(args, "query");
+      if (query === undefined) return miss("A 'query' is required.");
+      const found = langOp(db, query, limit ?? 20);
+      if (found.value.length === 0) {
+        return miss(
+          `No localization key or value matches '${query}'. Keys are stored without their ` +
+            `root: 'server.' and 'common.' are stripped automatically, any other first ` +
+            `segment is tried as a literal root. This covers the locales this index holds, ` +
+            `and matching is literal.`,
+        );
+      }
+      return found;
+    }
+
+    case "bench": {
+      const id = text(args, "id");
+      if (id === undefined) return benchesOp(db);
+      if (!benchIdExists(db, id)) {
+        const declares = benchDeclaredBy(db, id);
+        return miss(
+          declares === null
+            ? `No bench '${id}'.`
+            : `'${id}' is the asset that declares a bench, not the bench id. Use '${declares}'.`,
+          { alsoKnownAs: identify(db, id) },
+        );
+      }
+      const one = benchOp(db, id, limit ?? 200);
+      return {
+        value: {
+          ...one.value,
+          // The list view computes this and the detail view used to drop it: a
+          // bench id nothing declares looks identical to a real station.
+          declaredByAssets: db
+            .prepare(
+              `SELECT a.logical_id AS logicalId FROM bench_declarations d
+                 JOIN assets a ON a.id = d.asset_id WHERE d.bench_id = ?`,
+            )
+            .all(id) as unknown as { logicalId: string }[],
+        },
+        caveats: one.caveats,
+      };
+    }
+
+    case "undocumented":
+      return undocumentedOp(db, text(args, "type"), limit ?? 40);
+
+    default:
+      return miss(`No tool named '${name}'.`);
+  }
+}
+
+export type { Caveat };

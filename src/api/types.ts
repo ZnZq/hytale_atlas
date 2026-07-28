@@ -50,14 +50,51 @@ export type CaveatCode =
   /** Found by identifier only: these rows are not in the search index. */
   | "identifier-only";
 
-/** Every operation returns its answer alongside what qualifies it. */
+/**
+ * Every operation returns its answer alongside what qualifies it.
+ *
+ * `text` is the answer RENDERED -- the exact bytes a person should see. It lives
+ * here, beside the data, because two front ends rendering the same result
+ * independently is how this project's front ends drifted: `cmdDescribe` computed
+ * its own totals, markers and legends while `describeOp` computed them again,
+ * and every round of blind trials found another place the two disagreed. The CLI
+ * writes `text` to stdout and the MCP server returns it verbatim, so identical
+ * output is a property of the design rather than of anyone's diligence.
+ *
+ * The structured `value` travels with it and is not redundant: a model acts on
+ * `origins`, `declared`/`observed` and the caveat CODES, none of which survive
+ * being flattened into prose.
+ */
 export interface Result<T> {
   readonly value: T;
   readonly caveats: readonly Caveat[];
+  /** Rendered form. Optional while the commands are being moved across. */
+  readonly text?: string;
 }
 
 export function ok<T>(value: T, caveats: readonly Caveat[] = []): Result<T> {
   return { value, caveats };
+}
+
+/** Builds a result that carries its own rendering. */
+export function rendered<T>(
+  value: T,
+  text: string,
+  caveats: readonly Caveat[] = [],
+): Result<T> {
+  return { value, caveats, text };
+}
+
+/**
+ * The line every capped list prints, in one place.
+ *
+ * Each command wrote its own and they disagreed on wording and on whether a
+ * total was included at all.
+ */
+export function truncationLine(shown: number, what: string, total?: number): string {
+  return total === undefined
+    ? `\n... showing the first ${shown} ${what}; more exist.\n`
+    : `\n... showing ${shown} of ${total} ${what}; raise the limit for more.\n`;
 }
 
 /** Builds a caveat, keeping the wording in one place per code. */
@@ -69,12 +106,15 @@ export const caveat = {
    * word "more" was all a reader got -- the defect its own docstring records is
    * the silence, and "more" is only marginally louder than silence.
    */
+  // "Use --limit <n>" named a CLI flag, and this layer is also served over MCP
+  // where the argument is `limit` and no flags exist. A remedy the caller cannot
+  // apply is the same defect as no remedy, in a costume.
   truncated: (shown: number, what: string, total?: number): Caveat => ({
     code: "truncated",
     message:
       total === undefined
         ? `Showing the first ${shown} ${what}; more exist.`
-        : `Showing the first ${shown} of ${total} ${what}. Use --limit <n> for more.`,
+        : `Showing the first ${shown} of ${total} ${what}; raise the limit for more.`,
   }),
   relaxed: (query: string, level: number, widened: boolean): Caveat => ({
     code: "relaxed",
@@ -141,11 +181,19 @@ export const caveat = {
    * this sentence quoted the observed side, 2 457 of 2 875, 86%. The most
    * reassuring of the two ratios introduced a list of 7 405 rows.
    */
+  // The hazard runs the opposite way depending on what the list contains, and
+  // one wording served both. `undocumented` LISTS the unmatched, so a failed
+  // join puts a field INTO the results -- it is presence that the ratio
+  // undermines, not absence. `status` reports the ratio itself, where the
+  // reader's risk is trusting the observed layer to be complete.
   joinIncomplete: (joined: number, total: number, side: "observed" | "declared"): Caveat => ({
     code: "join-incomplete",
     message:
-      `Only ${joined} of ${total} ${side} fields are matched by the other layer, ` +
-      "so absence from this list is weaker evidence than it reads as.",
+      `Only ${joined} of ${total} ${side} fields are matched by the other layer` +
+      (side === "declared"
+        ? ", so a field can appear here because the join missed it rather than because " +
+          "vanilla never uses it."
+        : ", so absence from the observed layer is weaker evidence than it reads as."),
   }),
   // `unsearchable` is measured, not written down. A hard-coded 497 was true of
   // one archive on one day, and this file has already had to correct several

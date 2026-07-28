@@ -2,8 +2,16 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { buildRelaxedMatchExpressions, normalizeSearchText } from "../util/text.ts";
-import { bumpEpoch, currentEpoch, getMeta, migrate, openDatabase, setMeta } from "./open.ts";
-import { SCHEMA_VERSION } from "./schema.ts";
+import {
+  bumpEpoch,
+  currentEpoch,
+  getMeta,
+  migrate,
+  openDatabase,
+  pipelineState,
+  setMeta,
+} from "./open.ts";
+import { PIPELINE_VERSION, SCHEMA_VERSION } from "./schema.ts";
 
 function fresh() {
   return openDatabase(":memory:");
@@ -67,6 +75,39 @@ test("meta round-trips and overwrites in place", () => {
   assert.equal(getMeta(db, "patchline"), "release");
   setMeta(db, "patchline", "pre-release");
   assert.equal(getMeta(db, "patchline"), "pre-release");
+  db.close();
+});
+
+/**
+ * The half-written index, which no count can recognise.
+ *
+ * Indexing commits stage by stage and `epoch` is bumped by the FIRST stage, so a
+ * build killed after the corpus walk leaves a database with every asset in it and
+ * no edges, no field stats and a non-zero epoch. It opens cleanly and answers
+ * "nothing references that" about the whole corpus. This is the case the marker
+ * exists for, so it is asserted on a database populated exactly that way.
+ */
+test("a populated database with no completion marker reads as incomplete", () => {
+  const db = fresh();
+  db.prepare("INSERT INTO packs (id, name, path, kind) VALUES (1,'Hytale','/x','vanilla')").run();
+  db.prepare(
+    "INSERT INTO assets (pack_id, logical_id, path) VALUES (1,'item:Sword','Server/Item/Sword.json')",
+  ).run();
+  bumpEpoch(db);
+
+  assert.equal(pipelineState(db), "incomplete");
+  setMeta(db, "pipeline", String(PIPELINE_VERSION));
+  assert.equal(pipelineState(db), "ready");
+  db.close();
+});
+
+test("a marker from an older indexer reads as stale, not ready", () => {
+  // SCHEMA_VERSION guards the database's SHAPE and cannot see this: most indexer
+  // fixes change what is written without touching a column, so an existing index
+  // stays whole and silently wrong.
+  const db = fresh();
+  setMeta(db, "pipeline", String(PIPELINE_VERSION - 1));
+  assert.equal(pipelineState(db), "stale");
   db.close();
 });
 
