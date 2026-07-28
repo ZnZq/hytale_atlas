@@ -41,6 +41,7 @@ import {
   searchSchemaOp,
   typeAlternatives,
   valueLinkFor,
+  valueOccurrencesWithoutEdges,
   valueUsage,
   undocumentedOp,
 } from "../api/operations.ts";
@@ -797,17 +798,28 @@ export async function cmdGet(
     // file on disk declares fewer" over an effective definition of 148 leaves,
     // more than half of them the file's own. That sentence answers exactly the
     // question a modder asks -- what must I write myself -- with the wrong side.
+    // Counted over the TOP-LEVEL keys, which is the thing the reader can see and
+    // check. `origins` records every pointer at every depth, so counting all of
+    // them produced a pair reconcilable with nothing on screen: "13 declared in
+    // this file, 12 from ancestors" above a document with 19 top-level keys and
+    // 40 leaves. Two blind trials tried to check those numbers and could not.
+    // The unit is now stated, and the two sides sum to what is printed below.
     const byOrigin = new Map<string, string>();
     for (const o of resolved.origins) {
+      if (o.pointer.split("/").length !== 2) continue; // top level only
+      // `merged` is recorded after the recursive call, so it must not overwrite
+      // the per-key verdict already stored for the same pointer.
       if (o.via === "merged" && byOrigin.has(o.pointer)) continue;
       byOrigin.set(o.pointer, o.via);
     }
-    const inherited = [...byOrigin.values()].filter((v) => v !== "declared").length;
+    const inherited = [...byOrigin.values()].filter((v) => v === "inherited").length;
+    const merged = [...byOrigin.values()].filter((v) => v === "merged").length;
     const declared = [...byOrigin.values()].filter((v) => v === "declared").length;
-    if (inherited > 0 || declared > 0) {
+    if (byOrigin.size > 0) {
       header.push(
-        `  ${declared} field(s) declared in this file, ${inherited} from ancestors ` +
-          `(${resolved.parentChain[0] ?? "none"})`,
+        `  of ${byOrigin.size} top-level field(s): ${declared} declared here, ` +
+          `${inherited} inherited whole, ${merged} merged with ` +
+          `${resolved.parentChain[0] ?? "the parent"}`,
       );
     }
     process.stdout.write(`${header.join("\n")}\n\n`);
@@ -996,7 +1008,14 @@ export async function cmdRefs(
         const carriers = usage.examples.slice(0, valueLimit);
         // Both numbers, because they differ and the difference matters: one
         // asset can hold the same value in two fields.
-        process.stderr.write(
+        //
+        // stdout and exit 0: this is an ANSWER, not a miss. It went to stderr
+        // with exit 1 -- a successful lookup reported as a failure, unusable in
+        // a pipeline -- and once `search` began suggesting this exact command
+        // for a value, the suggestion led somewhere that printed nothing to
+        // stdout and signalled an error. The asset branch has always used
+        // stdout and 0 for the same question.
+        process.stdout.write(
           `'${logicalId}' is not an asset. It appears as a VALUE ` +
             `${formatCount(usage.occurrences)} time(s) in ` +
             `${formatCount(usage.assets)} asset(s):\n` +
@@ -1030,8 +1049,15 @@ export async function cmdRefs(
             (usage.examples.length > carriers.length
               ? `  ... ${formatCount(usage.occurrences - carriers.length)} more. ` +
                 `Use --limit <n>.\n`
-              : ""),
-        );        return 1;
+              : "") +
+            // The same caveat the asset branch carries. A value inherited from a
+            // parent is not in this list: `refs "Type=Soil"` names 30 assets and
+            // omits every crop that inherits its Support block from
+            // Template_Crop_Block, while `get` shows the value on all of them.
+            `\nCounts cover files that declare the value themselves. 'get' resolves\n` +
+            `inheritance first, so it can show this value on assets not listed here.\n`,
+        );
+        return 0;
       }
 
       // Before giving up: it may be a FILE. Models, textures, icons, sounds and
@@ -1103,12 +1129,16 @@ export async function cmdRefs(
     // answered with four NPCRole rows and no hint that 'which blocks require
     // Quality 5' -- the question a tool author actually has -- was sitting
     // behind the branch not taken.
-    const alsoValue = identify(db, logicalId);
-    if (alsoValue.valueOccurrences > 0) {
+    const beyond = valueOccurrencesWithoutEdges(
+      db,
+      logicalId,
+      value.targets.map((t) => t.id),
+    );
+    if (beyond.occurrences > 0) {
       process.stdout.write(
-        `\n'${logicalId}' is ALSO a field value: ${formatCount(alsoValue.valueOccurrences)} ` +
-          `occurrence(s) in ${formatCount(alsoValue.valueAssets)} asset(s), not listed above.\n` +
-          `Those are shown when the name is not an asset; this one is.\n`,
+        `\n'${logicalId}' also appears ${formatCount(beyond.occurrences)} time(s) in ` +
+          `${formatCount(beyond.assets)} asset(s) as a value that produced no edge above ` +
+          `(filtered as\ngeneric, or in a type the schema declares no fields for).\n`,
       );
     }
 
@@ -1387,9 +1417,14 @@ export async function cmdDescribe(
       // -- reasonably -- as "the engine ignores this field" rather than "no
       // vanilla asset sets it, and the declared/observed join is partial".
       for (const flag of flags) {
-        if (typeof flag === "string" && !flag.startsWith("->") && !flag.startsWith("default")) {
-          markers.add(flag);
-        }
+        if (typeof flag !== "string") continue;
+        // `-> Target` and `default X` carry a value, so the marker recorded is
+        // the symbol itself. `->` was excluded as "data, not a marker" and a
+        // blind trial had to guess what the arrow meant on a container row,
+        // where no `points at` line follows to gloss it.
+        if (flag.startsWith("->")) markers.add("->");
+        else if (flag.startsWith("default")) markers.add("default");
+        else markers.add(flag);
       }
       if (d?.type == null) markers.add("?");
 
@@ -1631,9 +1666,21 @@ export async function cmdDescribe(
           " declared fields are matched by the observed\n" +
           "               layer, so a field may be in use and simply unmatched",
         "?": "no declared type, because the schema does not describe this field",
+        "->": "the asset TYPE this field declares it points at (hytale.hytaleAssetRef)",
+        default: "the value the game uses when the field is absent",
       };
       process.stdout.write("\nmarkers in this answer:\n");
-      for (const m of ["required", "inherits", "merges", "?", "UNDECLARED", "(container)", "unused"]) {
+      for (const m of [
+        "required",
+        "inherits",
+        "merges",
+        "->",
+        "default",
+        "?",
+        "UNDECLARED",
+        "(container)",
+        "unused",
+      ]) {
         if (markers.has(m) && legend[m] !== undefined) {
           process.stdout.write(`  ${m.padEnd(12)} ${legend[m]}\n`);
         }

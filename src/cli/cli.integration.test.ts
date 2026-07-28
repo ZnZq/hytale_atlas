@@ -683,11 +683,18 @@ test("refs explains that a value is not an asset instead of looping", opts, () =
   // keeps -- use refs", which is where the reader just came from. All five blind
   // trials hit it; two called it the biggest gap in the tool. It now names the
   // assets instead of forwarding the question.
+  //
+  // Round 19: this asserted exit 1, and that was the defect rather than the
+  // contract. The command answers the question in full -- the value, its field
+  // positions and the assets carrying it -- so it is a success, and reporting it
+  // as a failure made it unusable in a pipeline. It became load-bearing once a
+  // miss started suggesting this exact command for a value.
   const { out, code } = run("refs", "Workbench_Tools");
-  assert.equal(code, 1);
+  assert.equal(code, 0, "a complete answer must not exit non-zero");
   assert.match(out, /is not an asset/);
   assert.match(out, /as a VALUE/);
   assert.match(out, /Carried by:/);
+  assert.match(out, /inheritance first/, "the value branch dropped the pre-inheritance caveat");
   assert.ok(!/Try 'hytale-atlas search Workbench_Tools'/.test(out), "still loops back to search");
   assert.ok(
     !/describe .*--field/.test(out),
@@ -1818,6 +1825,70 @@ test("every command a miss suggests actually answers for that token", async () =
         );
       }
     }
+  } finally {
+    db.close();
+  }
+});
+
+/**
+ * INVARIANT: a number offered as "additional" must count rows that are not
+ * already on screen.
+ *
+ * Round 19 regression, found independently by four of five agents. Edges are
+ * built FROM candidates, so for an asset every inbound reference is also an
+ * occurrence of its name as a value; reporting the raw occurrence count as a
+ * second set printed "10 occurrence(s) ... not listed above" directly beneath
+ * the same ten rows. The counts matched exactly every time (10/10, 22/22,
+ * 164/164), which is what proved it a double count rather than a coincidence.
+ *
+ * The residue is real where it exists — `refs 5` has 4 edges and 4 756
+ * occurrences — so the assertion is on the arithmetic, not on silence.
+ */
+test("value occurrences reported beyond the edges exclude the edges themselves", async () => {
+  const ops = await import("../../dist/api/operations.js");
+  let db;
+  try {
+    db = await ops.openIndex();
+  } catch {
+    return;
+  }
+  try {
+    for (const id of ["Tool_Pickaxe_Iron", "Soil_Mud_Dry", "ISS_Items_Foliage"]) {
+      const r = ops.refsOp(db, id, undefined, 500);
+      if (r.value.total === 0) continue;
+      const beyond = ops.valueOccurrencesWithoutEdges(
+        db,
+        id,
+        r.value.targets.map((t) => t.id),
+      );
+      const all = ops.identify(db, id).valueOccurrences;
+      assert.ok(
+        beyond.occurrences < all || all === 0,
+        `${id}: the "beyond" count (${beyond.occurrences}) did not exclude any of ` +
+          `the ${all} occurrences the edges already cover`,
+      );
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test("a value lookup is an answer: stdout, exit 0", async () => {
+  // It went to stderr with exit 1 — a successful lookup reported as failure,
+  // and unusable in a pipeline. It only became visible once `search` started
+  // suggesting this exact command for a value.
+  const ops = await import("../../dist/api/operations.js");
+  let db;
+  try {
+    db = await ops.openIndex();
+  } catch {
+    return;
+  }
+  try {
+    // The operation itself must report the usage rather than nothing.
+    const usage = ops.valueUsage(db, "RunOnBlockTypes", 5);
+    assert.ok(usage.occurrences > 0, "fixture is no longer a field value");
+    assert.equal(ops.identify(db, "RunOnBlockTypes").assets, 0, "fixture became an asset");
   } finally {
     db.close();
   }

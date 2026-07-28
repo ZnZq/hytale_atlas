@@ -539,7 +539,12 @@ export function refsOp(
   logicalId: string,
   type: string | undefined,
   limit = 40,
-): Result<{ references: Reference[]; total: number; targets: AssetCandidate[] }> {
+): Result<{
+  references: Reference[];
+  total: number;
+  /** Row ids carried through: callers need them to ask what the edges did NOT cover. */
+  targets: (AssetCandidate & { id: number })[];
+}> {
   const targets = db
     .prepare("SELECT id, type, path FROM assets WHERE logical_id = ?1 AND (?2 IS NULL OR type = ?2)")
     .all(logicalId, type ?? null) as unknown as ({ id: number } & AssetCandidate)[];
@@ -747,6 +752,46 @@ export interface TokenIdentity {
   readonly langKey: string | null;
   readonly benchId: boolean;
   readonly benchCategory: boolean;
+}
+
+/**
+ * Occurrences of a string as a field value that produced NO edge to these assets.
+ *
+ * The number that means something when the token is BOTH an asset and a value.
+ * Edges are built FROM candidates, so for an asset every inbound reference is
+ * also an occurrence of its name as a value: reporting the raw occurrence count
+ * as an additional set said "10 occurrences, not listed above" directly beneath
+ * the same ten rows. Four of five blind trials caught it, with counts matching
+ * exactly (10/10, 22/22, 164/164, 4/4) -- which is what makes it a double count
+ * rather than a coincidence.
+ *
+ * The residue is real and worth naming: a value can appear where no edge was
+ * built -- filtered as noise, inside an unaligned type, or contradicted by a
+ * declared target. `refs 5` has 4 edges and 4 756 occurrences, and that gap is
+ * the whole answer to "which blocks require Quality 5".
+ */
+export function valueOccurrencesWithoutEdges(
+  db: Database,
+  token: string,
+  targetIds: readonly number[],
+): { occurrences: number; assets: number } {
+  if (targetIds.length === 0) return { occurrences: 0, assets: 0 };
+  const holes = targetIds.map(() => "?").join(",");
+  const where = `c.raw_value = ?
+      AND NOT EXISTS (SELECT 1 FROM edges e
+                       WHERE e.src = c.asset_id
+                         AND e.json_pointer = c.json_pointer
+                         AND e.dst_kind = 'asset'
+                         AND e.dst IN (${holes}))`;
+  return {
+    occurrences: count(db, `SELECT count(*) AS n FROM candidates c WHERE ${where}`, token, ...targetIds),
+    assets: count(
+      db,
+      `SELECT count(DISTINCT c.asset_id) AS n FROM candidates c WHERE ${where}`,
+      token,
+      ...targetIds,
+    ),
+  };
 }
 
 export function identify(db: Database, token: string): TokenIdentity {
