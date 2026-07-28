@@ -457,7 +457,12 @@ export function computeFieldStats(db: Database): StatsResult {
     // finding rather than a bug.
     db.exec(`
       UPDATE field_stats SET target_types = (
-        SELECT group_concat(t, ' ') FROM (
+        -- The shared encoding, like the other two value columns. This one was
+        -- left space-joined, and when the tolerant space fallback was removed
+        -- from the reader it began decoding as ONE type: the API returned
+        -- ["ItemPlayerAnimations ParticleSystem"], a string that is not an
+        -- asset type. Two encodings for one decoder is the bug, not the split.
+        SELECT group_concat(t, ${VALUE_SEP_SQL}) FROM (
           SELECT DISTINCT d.type AS t
             FROM candidates c
             JOIN assets s ON s.id = c.asset_id

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import { VALUE_SEP, joinValues, splitValues } from "./values.ts";
@@ -54,6 +55,23 @@ test("a single value containing spaces is one value, not several", () => {
   // The regression the tolerant fallback caused, pinned at the encoding rather
   // than at one command's output.
   assert.deepEqual(splitValues(joinValues(["the Crossroads"])), ["the Crossroads"]);
+});
+
+test("every writer of a value list uses the shared encoding", () => {
+  // The round trip above cannot see a column written by SQL rather than by
+  // joinValues. field_stats.target_types was one: still space-joined after the
+  // reader stopped tolerating spaces, so it decoded as a single value and the
+  // API returned ["ItemPlayerAnimations ParticleSystem"] -- a string that is
+  // not an asset type. Two encodings for one decoder is the defect.
+  const stats = readFileSync(new URL("../indexer/stats.ts", import.meta.url), "utf8");
+  const joins = stats.match(/group_concat([a-z], [^)]+)/g) ?? [];
+  for (const join of joins) {
+    // group_concat(t, ' ') builds FTS terms, where a space IS correct; every
+    // other one builds a value list.
+    const isTerms = /group_concat(t, " ")/.test(join.replace(/'/g, String.fromCharCode(34)));
+    if (isTerms) continue;
+    assert.match(join, /VALUE_SEP_SQL/, "space-joined value list: " + join);
+  }
 });
 
 test("an empty list and an empty string are both absence", () => {
