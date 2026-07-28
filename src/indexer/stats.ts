@@ -1,4 +1,5 @@
 import type { Database } from "../db/open.ts";
+import { VALUE_SEP_SQL } from "../db/values.ts";
 import { scopes } from "../sources/schema-doc.ts";
 
 /**
@@ -204,6 +205,29 @@ function normalisePointersAgainstSchema(db: Database): {
   // value to look up even once the declaration was read.
   const properties = new Set(["Type", ...discriminatorAt.values()]);
   const discriminators = new Map<string, string>();
+
+  /**
+   * asset -> the asset its `/Parent` names, when one exists.
+   *
+   * The discriminator is inheritable. `Weapon_Sword_Primary_Swing_Left_Damage`
+   * declares only `Parent: "DamageEntityParent"`; the `Type: "DamageEntity"` that
+   * says which union branch it is lives in that parent. 152 of 1 341 Interaction
+   * assets are shaped this way, so their fields never reached a branch namespace
+   * and `common:DamageEntityInteraction/Parent` -- the primary inheritance
+   * mechanism of every weapon in the game -- was reported as used by nobody.
+   */
+  const parentOf = new Map<number, number>();
+  for (const row of db
+    .prepare(
+      `SELECT c.asset_id, p.id AS parent_id
+         FROM candidates c
+         JOIN assets self ON self.id = c.asset_id
+         JOIN assets p ON p.logical_id = c.raw_value AND p.type IS self.type
+        WHERE c.json_pointer = '/Parent' AND c.value_kind = 'string' AND p.id <> c.asset_id`,
+    )
+    .all() as unknown as { asset_id: number; parent_id: number }[]) {
+    parentOf.set(row.asset_id, row.parent_id);
+  }
   for (const property of properties) {
     for (const row of db
       .prepare(
@@ -228,6 +252,23 @@ function normalisePointersAgainstSchema(db: Database): {
    * ref rather than a container. Without the switch the tail matches nothing:
    * only 819 of 10,501 observed pointers joined.
    */
+  /**
+   * The discriminator at a position, following `/Parent` when the asset itself
+   * is silent.
+   *
+   * Bounded by the chain length so a cycle in the corpus cannot hang the pass;
+   * inheritance in this corpus is at most a few links deep.
+   */
+  const discriminatorFor = (assetId: number, pointer: string, property: string): string | undefined => {
+    let at: number | undefined = assetId;
+    for (let hops = 0; at !== undefined && hops < 8; hops++) {
+      const found = discriminators.get(discriminatorKey(at, `${pointer}/${property}`));
+      if (found !== undefined) return found;
+      at = parentOf.get(at);
+    }
+    return undefined;
+  };
+
   let resolvedUnions = 0;
   let unresolvedUnions = 0;
 
@@ -245,9 +286,7 @@ function normalisePointersAgainstSchema(db: Database): {
     // observations sit on a namespace with no fields to join to.
     const startBranches = unionBranches.get(`${type}|`);
     if (startBranches !== undefined) {
-      const discriminator = discriminators.get(
-        discriminatorKey(assetId, `/${discriminatorAt.get(`${type}|`) ?? "Type"}`),
-      );
+      const discriminator = discriminatorFor(assetId, "", discriminatorAt.get(`${type}|`) ?? "Type");
       const branch =
         discriminator === undefined ? undefined : selectBranch(startBranches, discriminator);
       if (branch !== undefined && byType.has(branch)) {
@@ -295,8 +334,10 @@ function normalisePointersAgainstSchema(db: Database): {
       if (scope === undefined) {
         const branches = unionBranches.get(`${type}|${next}`);
         if (branches !== undefined) {
-          const discriminator = discriminators.get(
-            discriminatorKey(assetId, `${rawNext}/${discriminatorAt.get(`${type}|${next}`) ?? "Type"}`),
+          const discriminator = discriminatorFor(
+            assetId,
+            rawNext,
+            discriminatorAt.get(`${type}|${next}`) ?? "Type",
           );
           const branch =
             discriminator === undefined ? undefined : selectBranch(branches, discriminator);
@@ -324,8 +365,10 @@ function normalisePointersAgainstSchema(db: Database): {
         // the discriminator sitting at this same position in the data.
         const rootBranches = unionBranches.get(`${type}|`);
         if (rootBranches !== undefined) {
-          const discriminator = discriminators.get(
-            discriminatorKey(assetId, `${rawNext}/${discriminatorAt.get(`${type}|${next}`) ?? "Type"}`),
+          const discriminator = discriminatorFor(
+            assetId,
+            rawNext,
+            discriminatorAt.get(`${type}|`) ?? "Type",
           );
           const branch =
             discriminator === undefined ? undefined : selectBranch(rootBranches, discriminator);
@@ -376,6 +419,12 @@ function normalisePointersAgainstSchema(db: Database): {
 
 export function computeFieldStats(db: Database): StatsResult {
   const started = Date.now();
+
+  // Built here rather than declared with the table: the edge post-processing
+  // below correlates every edge with the candidate that produced it on exactly
+  // this pair, and without it the passes never finish -- but carrying it through
+  // 479 000 inserts is worse, and stalled the build outright.
+  db.exec("CREATE INDEX IF NOT EXISTS idx_candidates_asset_ptr ON candidates (asset_id, json_pointer)");
 
   db.exec("BEGIN");
   try {
@@ -434,7 +483,7 @@ export function computeFieldStats(db: Database): StatsResult {
     db.exec(`
       UPDATE field_stats
          SET observed_values = (
-               SELECT group_concat(v, ' ') FROM (
+               SELECT group_concat(v, ${VALUE_SEP_SQL}) FROM (
                  SELECT DISTINCT c.raw_value AS v
                    FROM candidates c
                   WHERE c.schema_scope = field_stats.asset_type
@@ -451,7 +500,7 @@ export function computeFieldStats(db: Database): StatsResult {
     db.exec(`
       UPDATE schema_fields
          SET observed_values = (
-               SELECT group_concat(v, ' ') FROM (
+               SELECT group_concat(v, ${VALUE_SEP_SQL}) FROM (
                  SELECT DISTINCT c.raw_value AS v
                    FROM candidates c
                    JOIN assets a ON a.id = c.asset_id
@@ -491,6 +540,108 @@ export function computeFieldStats(db: Database): StatsResult {
                  JOIN assets d ON d.id = edges.dst AND d.type = sf.reference_target
                 WHERE c.asset_id = edges.src
                   AND c.json_pointer = edges.json_pointer)
+    `);
+
+    // Drop heuristic edges the schema contradicts.
+    //
+    // Pass 2 excludes declared fields from the heuristic tier, but it joins on the
+    // UN-rebased pointer, so a reference reached through a `$ref` was invisible to
+    // that guard and got an edge to every same-named asset. `Rock_Stone_Cobble`
+    // therefore pointed at both the ResourceType it declares and an unrelated Item
+    // of the same name, and `refs --type` looked like a no-op on the lower tiers
+    // because those rows were identical whichever target was asked about.
+    //
+    // The schema names one target type. Anything else at that pointer is a name
+    // collision, not a weak reference.
+    //
+    // Declared but unverified: raise to medium.
+    //
+    // Three tiers, one rule each:
+    //   high   the schema declares the target type AND the destination has it
+    //   medium the schema declares the field is a reference, but the destination
+    //          type does not match, or the field name follows a convention
+    //   low    neither -- the value merely collides with an identifier
+    //
+    // The middle tier exists because a declared target type is often unusable in
+    // practice: BlockTypeToPlace declares -> BlockType, and exactly one asset of
+    // 35 074 has that type, while thousands of blocks are Items carrying an
+    // embedded BlockType. Seed_Place, which literally places Rock_Stone, was
+    // therefore labelled "often coincidence".
+    //
+    // An earlier attempt DEMOTED such edges instead, on the reasoning that a type
+    // mismatch means a name collision. That was a regression: it buried real
+    // references, and one round of review introduced it while the next found it.
+    // The schema saying a field IS a reference outranks any name heuristic; it
+    // simply does not outrank a verified one.
+    db.exec(`
+      UPDATE edges SET confidence = 'medium'
+       WHERE kind = 'REFERENCES' AND confidence = 'low'
+         AND EXISTS (
+               SELECT 1 FROM candidates c
+                 JOIN schema_fields sf
+                       ON sf.asset_type = c.schema_scope
+                      AND sf.json_pointer = c.schema_pointer
+                      AND sf.reference_target IS NOT NULL
+                WHERE c.asset_id = edges.src AND c.json_pointer = edges.json_pointer)
+    `);
+
+    // A Parent nested inside an inline object is inheritance, not a name
+    // collision.
+    //
+    // Only the top-level `/Parent` was treated as such, so
+    // `Tool_Sickle_Copper` overriding a selector through
+    // `/InteractionVars/Swing_Left_Selector/Interactions/0/Parent`, and
+    // `Block_Explosion` through `/Next/Interactions/0/Parent`, came out `low` --
+    // the tier whose legend says 'often coincidence'. Two blind trials caught
+    // one command printing `high` and `low` for the same mechanism, differing
+    // only in depth.
+    //
+    // It has to happen HERE rather than in pass 2: `schema_scope` is assigned
+    // by the alignment above, so in pass 2 the test matches nothing at all --
+    // which is exactly what the first attempt did, silently.
+    //
+    // The type test cannot be the containing asset's type: an Item holds an
+    // inline Interaction. It is 'the destination's type is a root union that
+    // declares this candidate's own scope as a branch', which is what makes the
+    // inline object that type in the first place.
+    db.exec(`
+      UPDATE edges SET kind = 'INHERITS_FROM', confidence = 'high'
+       WHERE kind = 'REFERENCES'
+         AND json_pointer LIKE '%/Parent' AND json_pointer <> '/Parent'
+         AND EXISTS (
+               SELECT 1 FROM candidates c
+                 JOIN assets d ON d.id = edges.dst
+                 JOIN schema_fields r
+                       ON r.json_pointer = '' AND r.ref_scope IS NOT NULL
+                      AND r.asset_type = d.type
+                      AND ' ' || r.ref_scope || ' ' LIKE '% ' || c.schema_scope || ' %'
+                WHERE c.asset_id = edges.src
+                  AND c.json_pointer = edges.json_pointer
+                  AND c.schema_scope IS NOT NULL)
+    `);
+
+    // A declared reference that resolves to nothing.
+    //
+    // Pass 2 ran this joined on `schema_pointer`, which pass 3 only fills in
+    // above -- the same trap the nested-Parent rule fell into -- so it marked
+    // one row. Joined on the aligned scope it finds 2 674 occurrences: 2 175 of
+    // `Item./Categories/*` naming an ItemCategory that does not exist, 256 of
+    // `BlockType./HitboxType` naming a BlockBoundingBoxes called 'Full'.
+    //
+    // These are the findings `validate` will report. Recorded now so the data
+    // exists before the command does.
+    db.exec(`
+      UPDATE candidates SET dangling = 2
+       WHERE value_kind = 'string'
+         AND schema_scope IS NOT NULL
+         AND lower(raw_value) NOT IN ('none','default','null','true','false','any','all')
+         AND EXISTS (SELECT 1 FROM schema_fields sf
+                      WHERE sf.asset_type = candidates.schema_scope
+                        AND sf.json_pointer = candidates.schema_pointer
+                        AND sf.reference_target IS NOT NULL
+                        AND NOT EXISTS (SELECT 1 FROM assets a
+                                         WHERE a.logical_id = candidates.raw_value
+                                           AND a.type = sf.reference_target))
     `);
 
     const one = (sql: string): number =>

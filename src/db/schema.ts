@@ -21,7 +21,7 @@
  * makes a bump orphan old databases rather than silently reusing one whose shape
  * no longer matches.
  */
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 16;
 
 export const SCHEMA_SQL = `
 -- ---------------------------------------------------------------------------
@@ -129,6 +129,13 @@ CREATE TABLE IF NOT EXISTS lang_keys (
   key     TEXT NOT NULL,
   locale  TEXT NOT NULL,
   value   TEXT NOT NULL,
+  -- The .lang file's stem, which IS the reference root: a key stored as
+  -- 'items.Foo.name' in server.lang is referenced by an asset as
+  -- 'server.items.Foo.name'. Without it the tool printed the stored form and
+  -- a modder pasting it back got a dead key -- reported in four blind trials
+  -- -- and 'wordlists.runes.algas', whose root is 'wordlists', was declared a
+  -- 'real miss' while server.runes.algas wrongly resolved.
+  root    TEXT,
   UNIQUE (pack_id, key, locale)
 ) STRICT;
 
@@ -407,6 +414,9 @@ CREATE INDEX IF NOT EXISTS idx_candidates_value ON candidates (raw_value);
 CREATE INDEX IF NOT EXISTS idx_candidates_schema_ptr ON candidates (schema_scope, schema_pointer);
 CREATE INDEX IF NOT EXISTS idx_schema_fields_ref ON schema_fields (reference_target);
 CREATE INDEX IF NOT EXISTS idx_candidates_asset ON candidates (asset_id);
+-- NOTE: idx_candidates_asset_ptr is created in pass 3, not here. Declaring it up
+-- front made every one of 479 000 candidate inserts maintain a second wide index
+-- and the build stopped finishing at all -- see computeFieldStats().
 CREATE INDEX IF NOT EXISTS idx_assets_logical   ON assets (logical_id);
 CREATE INDEX IF NOT EXISTS idx_assets_epoch     ON assets (last_changed_epoch);
 CREATE INDEX IF NOT EXISTS idx_assets_type      ON assets (type);

@@ -46,7 +46,9 @@ export type CaveatCode =
   /** The declared/observed join is incomplete, so absence is weak evidence. */
   | "join-incomplete"
   /** This index stores identifiers and names, not field values. */
-  | "names-not-values";
+  | "names-not-values"
+  /** Found by identifier only: these rows are not in the search index. */
+  | "identifier-only";
 
 /** Every operation returns its answer alongside what qualifies it. */
 export interface Result<T> {
@@ -60,9 +62,19 @@ export function ok<T>(value: T, caveats: readonly Caveat[] = []): Result<T> {
 
 /** Builds a caveat, keeping the wording in one place per code. */
 export const caveat = {
-  truncated: (shown: number, what: string): Caveat => ({
+  /**
+   * `total` is optional because not every list can count its own tail cheaply,
+   * but pass it wherever it is known: "more exist" is the weakest honest thing
+   * this sentence can say. `undocumented` showed 40 rows of 7,405 and the
+   * word "more" was all a reader got -- the defect its own docstring records is
+   * the silence, and "more" is only marginally louder than silence.
+   */
+  truncated: (shown: number, what: string, total?: number): Caveat => ({
     code: "truncated",
-    message: `Showing the first ${shown} ${what}; more exist.`,
+    message:
+      total === undefined
+        ? `Showing the first ${shown} ${what}; more exist.`
+        : `Showing the first ${shown} of ${total} ${what}. Use --limit <n> for more.`,
   }),
   relaxed: (query: string, level: number, widened: boolean): Caveat => ({
     code: "relaxed",
@@ -101,15 +113,42 @@ export const caveat = {
     code: "cardinality-elided",
     message: `${distinct} distinct values -- too many to enumerate.`,
   }),
-  ambiguousIdentifier: (id: string, types: readonly string[]): Caveat => ({
+  // `total` is separate from `types` because the type list is a SAMPLE. Using
+  // its length said "8 assets are named Entry.node" where 461 are.
+  ambiguousIdentifier: (id: string, types: readonly string[], total = types.length): Caveat => ({
     code: "ambiguous-identifier",
-    message: `${types.length} assets are named '${id}' (${types.join(", ")}).`,
+    message:
+      `${total} assets are named '${id}' (${types.join(", ")}` +
+      (total > types.length ? ", and more" : "") +
+      ").",
   }),
-  joinIncomplete: (joined: number, observed: number): Caveat => ({
+  /**
+   * Stated over the side the reader's question is on.
+   *
+   * `undocumented` lists DECLARED fields with no observation, so the risk it
+   * carries is measured on the declared side -- 2 457 of 18 396, 13% -- while
+   * this sentence quoted the observed side, 2 457 of 2 875, 86%. The most
+   * reassuring of the two ratios introduced a list of 7 405 rows.
+   */
+  joinIncomplete: (joined: number, total: number, side: "observed" | "declared"): Caveat => ({
     code: "join-incomplete",
     message:
-      `Only ${joined} of ${observed} observed fields match a declared one, so ` +
-      "absence from this list is weaker evidence than it reads as.",
+      `Only ${joined} of ${total} ${side} fields are matched by the other layer, ` +
+      "so absence from this list is weaker evidence than it reads as.",
+  }),
+  // `unsearchable` is measured, not written down. A hard-coded 497 was true of
+  // one archive on one day, and this file has already had to correct several
+  // numbers that were baked into a sentence.
+  identifierOnly: (count: number, unsearchable: number): Caveat => ({
+    code: "identifier-only",
+    message:
+      `Nothing matched in the search index, so these ${count} row(s) come from a ` +
+      // 'worldgen under Server/World' was 496 of 497 -- one is a prefab. The
+      // comment above this object warns against baking a fact into a sentence,
+      // and a 99.8%-true clause is still a sentence that can be shown wrong.
+      `literal identifier lookup instead. ${unsearchable} identifiers -- mostly ` +
+      "world and prefab content -- are indexed as assets but carry no searchable " +
+      "name, so they are reachable this way only.",
   }),
   namesNotValues: (): Caveat => ({
     code: "names-not-values",

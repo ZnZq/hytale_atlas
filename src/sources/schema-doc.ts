@@ -421,7 +421,7 @@ function emit(
     enumValues,
     title: asString(node["title"]),
     description: asString(node["markdownDescription"]) ?? asString(node["description"]),
-    inheritsProperty: meta?.["inheritsProperty"] === true,
+    inheritsProperty: inheritsFlag(node),
     mergesProperties: meta?.["mergesProperties"] === true,
     // A SIBLING of the `hytale` block, not a member of it. Reading it from inside
     // `hytale` silently yields null for all 932 fields, which is exactly how this
@@ -431,6 +431,31 @@ function emit(
     typeConstant: declaredConstant(asString(node["description"])),
     discriminatorProperty: null,
     discriminatorValues: null,
+  });
+}
+
+/**
+ * Whether a property takes part in inheritance.
+ *
+ * The marker is `hytale.inheritsProperty`, and for 13 of Item's 52 marked
+ * properties it sits inside an `anyOf` BRANCH rather than on the property node:
+ * `BlockType`, `Tool`, `Weapon`, `Armor`, `Light`, `Reticle` and friends are all
+ * `anyOf: [{$ref, hytale: {inheritsProperty}}, {null}]`. Reading only the
+ * property node marked them as not inherited, and `get` then replaced the whole
+ * of a crop's `BlockType` with the child's, dropping `Support` (the farmland
+ * restriction) and `BlockEntity.Components.FarmingBlock` (what makes it tick)
+ * from every plant in the game.
+ *
+ * This is the third marker found one level away from where it was read --
+ * `hytaleAssetRef` twice, then `hytaleSchemaTypeField`. Check the branches.
+ */
+function inheritsFlag(node: Node): boolean {
+  if (hytale(node)?.["inheritsProperty"] === true) return true;
+  const branches = node["anyOf"] ?? node["oneOf"];
+  if (!Array.isArray(branches)) return false;
+  return branches.some((b) => {
+    const branch = asNode(b);
+    return branch !== null && hytale(branch)?.["inheritsProperty"] === true;
   });
 }
 
@@ -501,7 +526,13 @@ function flatten(
   // using the discriminator in the data.
   if (pointer === "" && !ctx.seenPointers.has("")) {
     const branches = rootUnionScopes(node, currentFile);
-    if (branches.length > 1) {
+    // `mergesProperties` is a TYPE-level marker sitting on the schema root, not a
+    // per-property one: 141 occurrences, nearly all at the root of a file. Read as
+    // a property marker it was true for almost nothing, so `get` replaced every
+    // nested object wholesale -- the opposite of what the type declares. Recorded
+    // on the root row so the resolver can ask 'does this type merge?'.
+    const typeMerges = hytale(node)?.["mergesProperties"] === true;
+    if (branches.length > 1 || typeMerges) {
       // The root carries its own hytaleSchemaTypeField too -- Interaction.json
       // declares `property: "Type"` and 102 values aligned with its branches.
       // Omitting it left `describe Interaction` printing "?" for every branch
@@ -519,9 +550,12 @@ function flatten(
         title: asString(node["title"]),
         description: null,
         inheritsProperty: false,
-        mergesProperties: false,
+        mergesProperties: typeMerges,
         referenceTarget: null,
-        refScope: (rootDeclared?.scopes ?? branches).join(" "),
+        // Null unless this really is a union. An empty string here made
+        // `describe Item` announce "a union of 0 shapes": the merge-only root
+        // rows added for `mergesProperties` all matched `ref_scope IS NOT NULL`.
+        refScope: branches.length > 1 ? (rootDeclared?.scopes ?? branches).join(" ") : null,
         typeConstant: null,
         discriminatorProperty: rootDeclared?.property ?? null,
         discriminatorValues: rootDeclared?.values.join(" ") ?? null,

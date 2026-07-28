@@ -42,7 +42,21 @@ function run(...args: string[]): { out: string; code: number } {
 function resultRows(out: string): string[] {
   return out
     .split("\n")
-    .filter((l) => l.trim().length > 0 && !l.startsWith("...") && !l.startsWith(" "));
+    .filter(
+      (l) =>
+        l.trim().length > 0 &&
+        !l.startsWith("...") &&
+        !l.startsWith(" ") &&
+        // Round 16 added a column header and two footnotes to `search`, because
+        // `[locale]` and `~N` were markers with no legend anywhere and a reader
+        // took the bracket for the asset's only language. They are prose, not
+        // results; counting them made four tests measure the wrong thing.
+        !l.startsWith("ASSET ID") &&
+        !l.startsWith("A locale here is") &&
+        !l.startsWith("Use 'search-lang") &&
+        !l.startsWith("~N marks") &&
+        !l.startsWith("[id] means"),
+    );
 }
 
 const built = existsSync(CLI);
@@ -552,17 +566,27 @@ test("a high-cardinality field reports its count instead of going quiet", opts, 
   // no list, no count, no caveat, while a neighbouring field printed 33 values.
   // Two agents independently read the silence as "this field has no values".
   const { out } = run("describe", "common:MaterialQuantity", "--field", "ItemId");
-  assert.match(out, /distinct values -- too many to list/);
+  assert.match(out, /[\d,]+ distinct values/);
   assert.match(out, /refs <id>/);
 });
 
 test("a search miss explains that search indexes names, not values", opts, () => {
   // "No matches." reads as "this string appears nowhere". Searching a sound-set
   // id returned the set itself and none of the items referencing it.
+  //
+  // Round 16: the `refs <query>` suggestion this used to assert was half of a
+  // closed loop -- `search X` said try `refs X`, `refs X` said try `search X` --
+  // which three blind trials walked into and none escaped. It is now offered
+  // only when the string really is an asset, so the two commands cannot hand a
+  // reader back and forth over a name that exists nowhere.
   const { out, code } = run("search", "ApplyEntityEffect");
   assert.equal(code, 1);
   assert.match(out, /NOT field values/);
-  assert.match(out, /refs /);
+  assert.doesNotMatch(out, /hytale-atlas refs ApplyEntityEffect/, "still loops back to refs");
+
+  // And a real asset that simply has no localized name still gets the pointer.
+  const real = run("search", "Rock_Stone", "--type", "ItemToolSpec");
+  assert.match(real.out, /hytale-atlas refs Rock_Stone|No asset of type/);
 });
 
 test("describe states that its counts predate inheritance", opts, () => {
@@ -641,12 +665,93 @@ test("refs explains that a value is not an asset instead of looping", opts, () =
   // `search-schema` said "use refs <id>"; `refs Workbench_Tools` said "no such
   // asset, try search"; `search` said "try refs". Two commands handing off to
   // each other, neither able to say the thing is a value nested in a field.
+  //
+  // Round 15: pointing at `describe <Type> --field <p>` was itself a loop. For a
+  // high-cardinality field that command answers "more values than this index
+  // keeps -- use refs", which is where the reader just came from. All five blind
+  // trials hit it; two called it the biggest gap in the tool. It now names the
+  // assets instead of forwarding the question.
   const { out, code } = run("refs", "Workbench_Tools");
   assert.equal(code, 1);
   assert.match(out, /is not an asset/);
   assert.match(out, /as a VALUE/);
-  assert.match(out, /describe .*--field/);
+  assert.match(out, /Carried by:/);
   assert.ok(!/Try 'hytale-atlas search Workbench_Tools'/.test(out), "still loops back to search");
+  assert.ok(
+    !/describe .*--field/.test(out),
+    "still forwards to a describe that cannot answer it",
+  );
+});
+
+test("a value report separates occurrences from assets", opts, () => {
+  // It said "N assets carry it as a VALUE" while counting occurrences, so
+  // `refs HarvestCrop` claimed 29 where `describe` counted 25, and
+  // `refs Necromancy_Bones` claimed 2 for one asset holding the value twice.
+  const { out } = run("refs", "HarvestCrop");
+  const m = /VALUE ([\d,]+) time\(s\) in ([\d,]+) asset\(s\)/.exec(out);
+  assert.ok(m !== null, `no occurrence/asset split:\n${out}`);
+  const occurrences = Number(m[1]!.replace(/,/g, ""));
+  const assets = Number(m[2]!.replace(/,/g, ""));
+  assert.ok(occurrences >= assets, `${occurrences} occurrences under ${assets} assets`);
+
+  // And the asset count is the one `describe` reports for the same field.
+  const described = /used in ([\d,]+) assets/.exec(
+    run("describe", "common:HarvestCropInteraction", "--field", "Type").out,
+  );
+  assert.ok(described !== null);
+  assert.equal(assets, Number(described[1]!.replace(/,/g, "")));
+});
+
+test("a scoped miss never denies the whole corpus", opts, () => {
+  // Five blind trials, five reports. `search Workbench --type BenchCategory`
+  // answered "No asset is named 'Workbench', in any indexed locale" about a
+  // string that is an asset's own en-US name -- the --type scope was dropped
+  // from the sentence, turning a scoped miss into a claim about the game.
+  const bogus = run("search", "Bench", "--type", "Nonexistent");
+  assert.match(bogus.out, /No asset type 'Nonexistent' exists/);
+  assert.doesNotMatch(bogus.out, /in any indexed locale/);
+
+  // And `refs` agrees with `get` about a name that exists under another type,
+  // rather than calling it "not an asset".
+  const scoped = run("refs", "Wood", "--type", "Item");
+  assert.match(scoped.out, /No 'Wood' of type 'Item'\. It exists as:/);
+  assert.doesNotMatch(scoped.out, /is not an asset/);
+});
+
+test("bench reports the true total and says when it truncated", opts, () => {
+  // `bench Builders` printed "200 craftable here" -- its own default limit --
+  // while the bench table said 911, with no notice, against --help's explicit
+  // promise. Four of five blind trials found it.
+  const capped = run("bench", "Builders");
+  const full = run("bench", "Builders", "--limit", "2000");
+  const total = (out: string): number =>
+    Number(/([\d,]+) craftable here/.exec(out)?.[1]?.replace(/,/g, "") ?? "0");
+  assert.ok(total(capped.out) > 200, `still reporting the cap: ${total(capped.out)}`);
+  assert.equal(total(capped.out), total(full.out), "the total moved with the limit");
+  assert.match(capped.out, /showing the first 200 recipes/);
+  assert.doesNotMatch(full.out, /showing the first/);
+});
+
+test("'validate' does not hand out 'clean' remediation", opts, () => {
+  // Every blind trial asked "is my pack valid?" and was told how to delete the
+  // index -- advice for a different question, printed with full confidence.
+  const { out, code } = run("validate");
+  assert.equal(code, 2);
+  assert.doesNotMatch(out, /manual equivalent of 'clean'/);
+  assert.match(out, /describe <Type>/);
+});
+
+test("get states what it did NOT inherit", opts, () => {
+  // Both directions of the inheritance bug. `Recipe` carries no
+  // `inheritsProperty` marker, and copying it anyway made every templated item
+  // claim its parent's recipe; the fix is silent unless it says so.
+  const { out } = run("get", "Plant_Crop_Chilli_Block", "--type", "Item");
+  assert.doesNotMatch(out, /"Recipe"/);
+  // And the nested BlockType merge really happened: Support and the block entity
+  // come from Template_Crop_Block, which is what makes the plant grow at all.
+  const raw = run("get", "Plant_Crop_Chilli_Block", "--type", "Item", "--raw").out;
+  assert.match(raw, /"Support"/);
+  assert.match(raw, /"FarmingBlock"/);
 });
 
 test("refs on a bench asset says recipes reference the declared id instead", opts, () => {
@@ -692,6 +797,33 @@ test("generic values do not become references", opts, () => {
   // which is what this asserts.
   const { out } = run("refs", "Default");
   assert.match(out, /Nothing references 'Default'/);
+});
+
+// ---------------------------------------------------------------------------
+// Round 11.
+// ---------------------------------------------------------------------------
+
+test("a union branch chosen by an INHERITED discriminator is not reported unused", opts, () => {
+  // 152 of 1,341 Interaction assets declare only `Parent` -- the `Type` that says
+  // which branch they are lives in the parent they name. Their fields therefore
+  // never reached a branch namespace, and
+  // `common:DamageEntityInteraction/Parent` -- the inheritance mechanism of every
+  // weapon in the game -- was reported as used by nobody.
+  const { out } = run("describe", "common:DamageEntityInteraction", "--field", "Parent");
+  assert.ok(!/\bunused\b/.test(out), `still unused:\n${out}`);
+  assert.match(out, /used in [\d,]+ assets/);
+  assert.match(out, /DamageEntityParent/);
+});
+
+test("indexing still finishes in a sane time", opts, () => {
+  // Edge post-processing added a correlated DELETE that took the build from 42
+  // seconds to over six minutes without finishing. --dry-run exercises the same
+  // resolution path cheaply; the real guard is that the suite runs at all against
+  // a freshly built index, but this catches a wedged CLI outright.
+  const before = Date.now();
+  const { code } = run("status");
+  assert.equal(code, 0);
+  assert.ok(Date.now() - before < 20_000, "status hangs");
 });
 
 // ---------------------------------------------------------------------------
@@ -843,4 +975,835 @@ test("an interaction branch reached through a root union has observed data", opt
   const { out } = run("describe", "common:BreakBlockInteraction", "--field", "Harvest");
   assert.ok(!/\bunused\b/.test(out), `still unused:\n${out}`);
   assert.match(out, /used in [\d,]+ assets/);
+});
+
+test("the bench list includes benches no asset declares", opts, () => {
+  // Built from declarations alone, so Fieldcraft -- with no physical block to
+  // declare it -- was absent from a table titled "all benches" while
+  // `bench Fieldcraft` worked and listed nine real recipes, and vanilla's own
+  // Workbench recipe requires it.
+  //
+  // Round 16: the cell used to read "(no declaring asset -- hand crafting)".
+  // Two agents called that out: no such concept exists in the schema, and one of
+  // the six ids so labelled (`Furniture_Misc`) is a declared BenchCategory
+  // typo'd into an Id slot. The index knows only that nothing declares the id,
+  // so that is all it now says.
+  const { out } = run("bench");
+  assert.match(out, /^Fieldcraft/m);
+  assert.match(out, /no bench declares this id/);
+  assert.doesNotMatch(out, /hand crafting/);
+  assert.match(
+    out,
+    /^Furniture_Misc.*it IS a declared bench category/m,
+    "a category id in an Id slot is still glossed as a plain bench",
+  );
+});
+
+test("bench prints the Type its recipes declare rather than '?'", opts, () => {
+  // Six ids showed TYPE '?' though every one of their 78 requirements carries
+  // Type "Crafting" -- and `describe common:BenchRequirement` puts a number on
+  // it: exactly one of 1,928 requirements in the corpus lacks a Type.
+  const out = run("bench").out;
+  const todo = out.split("\n").find((l) => l.startsWith("TODO"));
+  assert.ok(todo !== undefined, `no TODO row:\n${out}`);
+  assert.doesNotMatch(todo, /\?/, `still a question mark: ${todo}`);
+  assert.match(todo, /Crafting/);
+});
+
+test("the CAT column says whose categories it counts", opts, () => {
+  // `bench` said Weapon_Bench has 5 categories; `bench Weapon_Bench` grouped its
+  // recipes under 8. Both are right -- one counts what the asset declares, the
+  // other what recipes name -- but nothing said so, so they read as one number
+  // contradicting itself.
+  const { out } = run("bench");
+  assert.match(out, /CAT counts categories the bench ASSET declares/);
+  assert.match(out, /RECIPES name/);
+});
+
+test("a positional query mangled by the shell is recovered too", opts, () => {
+  // The same rewriting that mangles `--field /Foo` mangles a positional `/Foo`,
+  // and only the flag was checked: `search-schema "/Set"` arrived as a Windows
+  // path and was reported as a genuine miss.
+  const { out, code } = run("search-schema", "C:/Program Files/Git/Set");
+  assert.equal(code, 0);
+  assert.match(out, /your shell rewrote/);
+  assert.ok(!/No schema field matches/.test(out), "still reported as a real miss");
+});
+
+test("refs exits zero when it answers", opts, () => {
+  const { code } = run("refs", "Template_Crop_Block");
+  assert.equal(code, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Round 12. The cleanest round: three of four scenarios reported no false
+// statements and no contradictions at all.
+// ---------------------------------------------------------------------------
+
+test("a declared reference is never called coincidence", opts, () => {
+  // BlockTypeToPlace declares '-> BlockType', but blocks are Items carrying an
+  // embedded BlockType -- exactly one asset of 35,074 has that type. So the
+  // declaration could not be verified, the field name follows no convention, and
+  // Seed_Place, which literally places Rock_Stone, was labelled "the value merely
+  // collides with an identifier". An earlier attempt DEMOTED such edges, which
+  // buried real references; one round introduced that and the next found it.
+  const { out } = run("refs", "Rock_Stone", "--type", "Item", "--limit", "500");
+  const line = out.split("\n").find((l) => l.includes("Seed_Place"));
+  assert.ok(line !== undefined, `Seed_Place edge missing entirely:\n${out}`);
+  assert.ok(!/^low/.test(line), `declared reference still called coincidence: ${line}`);
+});
+
+test("refs does not count the same reference once per same-named target", opts, () => {
+  // Four assets are named Rock_Stone, so a world-gen entry naming that string
+  // produced an edge to each. The unfiltered list reported 303 references where
+  // 162 exist -- the Item view plus the ResourceType view concatenated, with 141
+  // rows in both. The total matched the rows printed, so it was internally
+  // consistent while answering a different question than the reader asked.
+  const all = /^([\d,]+) references/m.exec(run("refs", "Rock_Stone").out);
+  const item = /^([\d,]+) references/m.exec(run("refs", "Rock_Stone", "--type", "Item").out);
+  const res = /^([\d,]+) references/m.exec(
+    run("refs", "Rock_Stone", "--type", "ResourceType").out,
+  );
+  assert.ok(all !== null && item !== null && res !== null);
+  const n = (m: RegExpExecArray) => Number(m[1]!.replace(/,/g, ""));
+  assert.ok(
+    n(all) < n(item) + n(res),
+    `unfiltered total ${n(all)} is still the sum of the two views`,
+  );
+});
+
+test("a nested union field lists its shapes like a union type does", opts, () => {
+  // `describe Interaction` lists its 102 branches and the value selecting each,
+  // but `describe ItemDropList --field Container` said only "(container)" and
+  // never mentioned that Type picks Single or Multiple -- structure recoverable
+  // only by fetching a real asset.
+  const { out } = run("describe", "ItemDropList", "--field", "Container");
+  assert.match(out, /one of \d+ shapes, chosen by 'Type'/);
+  assert.match(out, /Multiple\s+common:MultipleItemDropContainer/);
+});
+
+test("a closed pipe exits quietly instead of crashing", opts, () => {
+  // Piping into a reader that closes early made the next write fail with EPIPE,
+  // which Node reports as an unhandled crash complete with a stack trace.
+  const proc = spawnSync("node", [CLI, "search-schema", "type", "--limit", "500"], {
+    encoding: "utf8",
+    shell: true,
+  });
+  assert.ok(!/EPIPE|Unhandled/.test(`${proc.stdout}${proc.stderr}`), "still crashes on EPIPE");
+});
+
+test("the value ceiling says --limit cannot lift it", opts, () => {
+  // An agent tested --limit 10, 500 and 1000 against a field with 132 distinct
+  // values and got identical output, reasonably reading that as the flag being
+  // ignored. Values above the enum threshold are never stored.
+  const { out } = run("describe", "common:MaterialQuantity", "--field", "ItemId");
+  assert.match(out, /--limit cannot show them/);
+});
+
+// ---------------------------------------------------------------------------
+// Round 13. Three of four scenarios reported no false statements and no
+// contradictions; every "unused" claim checked against real assets held.
+// ---------------------------------------------------------------------------
+
+test("search --type actually narrows", opts, () => {
+  // The flag was parsed, honoured by `get`, and dropped here: `search stone
+  // --type BlockSet` returned byte-identical output to no flag at all.
+  const scoped = run("search", "stone", "--type", "BlockSet", "--limit", "10");
+  const all = run("search", "stone", "--limit", "10");
+  assert.notEqual(scoped.out, all.out, "search --type is still ignored");
+  for (const line of resultRows(scoped.out)) {
+    assert.match(line, /\bBlockSet\b/, `leaked another type: ${line}`);
+  }
+});
+
+test("an undeclared field names the assets it came from", opts, () => {
+  // Asset type comes from the file's PATH, and when a file sits in the wrong
+  // directory the mismatch is silent. Two deprecated food files typed
+  // EntityEffect contain a plain EffectConditionInteraction, so /Match, /Next and
+  // /EntityEffectIds surfaced as EntityEffect capabilities. Byte-identical
+  // siblings one directory over are typed correctly, which is how it hid.
+  const { out } = run("describe", "EntityEffect", "--field", "Match");
+  assert.match(out, /UNDECLARED/);
+  assert.match(out, /from Food_EffectCondition_Buff/);
+  assert.match(out, /_Deprecated/);
+});
+
+test("refs --type says what it excluded", opts, () => {
+  // Scoping legitimately changes the edge set, but the totals then varied between
+  // runs with nothing explaining why, which reads as edges being dropped.
+  const { out } = run("refs", "Stone", "--type", "BlockSet", "--limit", "3");
+  assert.match(out, /Scoped to 'BlockSet'/);
+  assert.match(out, /share this name/);
+});
+
+test("--type is documented for every command that honours it", opts, () => {
+  const help = run("--help").out;
+  // The options block, not the first mention: `--type <Type>` also appears inside
+  // the `get` command's own description.
+  const line = help.slice(help.lastIndexOf("  --type <Type>"));
+  for (const command of ["get", "search", "refs"]) {
+    assert.match(line.slice(0, 200), new RegExp(`'${command}'`), `--type omits ${command}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Round 14 defects. Four blind trials: the sword scenario reported none, the
+// pickaxe and plant scenarios reported no false statement, and the remaining
+// findings are the ones below -- all of them wording or reachability, not
+// arithmetic, except the first.
+// ---------------------------------------------------------------------------
+
+test("a type-scoped ref total never exceeds the unscoped one", opts, () => {
+  // Four assets are named Stone. The same source line produced an edge to each,
+  // so `--type PhysicalMaterial` and `--type BlockSet` both counted
+  // Alchemy_Cauldron_Big's PhysicalMaterialId -- once as 'high', once as
+  // 'medium'. Scoping is supposed to narrow; the four scoped totals summed to
+  // 5 087 against an unscoped 2 262. Edges the schema contradicts are now
+  // dropped at query time.
+  const total = (out: string): number =>
+    Number(/([\d,]+) references to/.exec(out)?.[1]?.replace(/,/g, "") ?? "0");
+  const unscoped = total(run("refs", "Stone", "--limit", "1").out);
+  assert.ok(unscoped > 0, "no baseline to compare against");
+  for (const type of ["PhysicalMaterial", "BlockSet", "BlockSoundSet", "BlockParticleSet"]) {
+    const scoped = total(run("refs", "Stone", "--type", type, "--limit", "1").out);
+    assert.ok(
+      scoped <= unscoped,
+      `refs Stone --type ${type} counts ${scoped}, more than the unscoped ${unscoped}`,
+    );
+  }
+});
+
+test("a scoped total that still overlaps says so, with a number", opts, () => {
+  // The residue is real ambiguity, not a bug: a field that declares no target
+  // type cannot choose between four assets called Stone, so the same line
+  // appears under each. Stating 'references to those are excluded' denied that
+  // and made the arithmetic look like the tool losing edges.
+  const { out } = run("refs", "Stone", "--type", "BlockSet", "--limit", "1");
+  assert.match(out, /Scoped to 'BlockSet'/);
+  assert.match(out, /\d+ of these \d+ references also point at one of those/);
+  assert.match(out, /does not declare which type it means/);
+});
+
+test("status names the locales instead of counting them", opts, () => {
+  // It printed a count. An agent needing to know whether a language was
+  // available inferred the list from the ones it had seen quoted elsewhere and
+  // concluded Ukrainian was absent. It is present.
+  const { out } = run("status");
+  assert.match(out, /uk-UA/);
+  assert.match(out, /en-US/);
+  assert.doesNotMatch(out, /\b\d+ locales\b/);
+});
+
+test("a container field names the type it continues into", opts, () => {
+  // `describe BlockType --field Farming` printed a bare '(container)'. The type
+  // on the other side is common:FarmingData and nothing said so, so the only
+  // way across the boundary was to guess a name from a lexical search.
+  const { out } = run("describe", "BlockType", "--field", "Farming");
+  assert.match(out, /continues in common:FarmingData/);
+  assert.match(out, /hytale-atlas describe common:FarmingData/);
+  // And the branch table is for real unions only: one target used to render as
+  // "one of 1 shapes, chosen by 'Type'" over a row whose value column read '?'.
+  assert.doesNotMatch(out, /one of 1 shapes/);
+});
+
+test("a near-miss type name reaches the type that exists", opts, () => {
+  // Two rounds ended with an agent asking for common:FarmingBlock and
+  // common:Shape. Neither exists; each is one word from one that does. Exact
+  // respelling could not reach them, so the miss fell through to a search-schema
+  // suggestion that searches field text and finds nothing for a type name nobody
+  // ever wrote -- and the reader concluded the type was undocumented.
+  const farming = run("describe", "common:FarmingBlock");
+  assert.match(farming.out, /Did you mean/);
+  assert.match(farming.out, /common:FarmingData/);
+  const shape = run("describe", "common:Shape");
+  assert.match(shape.out, /Did you mean/);
+  assert.match(shape.out, /common:(BrushShapeArg|ShapeOperation|ConnectedBlockShape)/);
+});
+
+test("a missing field on a union does not promise a field list", opts, () => {
+  // The miss said "Run 'describe Interaction' to list its fields". That command
+  // lists 102 branches and no fields at all, because a union declares none.
+  const { out } = run("describe", "Interaction", "--field", "Damage");
+  assert.doesNotMatch(out, /to list its fields/);
+  assert.match(out, /fields live on the branches/);
+  assert.match(out, /list the branches/);
+});
+
+test("a bench id typed at 'get' is sent to 'bench'", opts, () => {
+  // 'Farmingbench' is a bench id, not an asset. `get Farmingbench` walked a
+  // three-hop chain of same-named candidates and never mentioned the one command
+  // that answers it.
+  const { out } = run("get", "Farmingbench");
+  assert.match(out, /is a bench id, not an asset/);
+  assert.match(out, /hytale-atlas bench Farmingbench/);
+  assert.equal(run("bench", "Farmingbench").code, 0, "the command it points at fails");
+});
+
+// ---------------------------------------------------------------------------
+// Round 16 defects. Four blind trials. Three of the findings were regressions
+// introduced by round 15's own fixes, which is the argument for these tests.
+// ---------------------------------------------------------------------------
+
+test("the overlap a scoped ref total reports is the real overlap", opts, () => {
+  // Round 15 added the warning and computed its number wrongly: the sibling
+  // edge was not put through the same contradiction filter as the edge being
+  // counted, so `refs Stone --type PhysicalMaterial` claimed 644 of 644 where
+  // 285 overlap, and `refs Burn --type EntityEffect` claimed 7 of 7 against an
+  // observable 3. Two agents measured it by hand from the printed rows.
+  const shared = (out: string): number =>
+    Number(/([\d,]+) of these ([\d,]+) references/.exec(out)?.[1]?.replace(/,/g, "") ?? "-1");
+  const total = (out: string): number =>
+    Number(/^([\d,]+) references/m.exec(out)?.[1]?.replace(/,/g, "") ?? "0");
+
+  const scoped = run("refs", "Stone", "--type", "PhysicalMaterial", "--limit", "1").out;
+  assert.ok(shared(scoped) >= 0, `no overlap note:\n${scoped}`);
+  assert.ok(
+    shared(scoped) < total(scoped),
+    `claims every reference is shared: ${shared(scoped)} of ${total(scoped)}`,
+  );
+
+  // The declared-target rows cannot be shared with a sibling of another type,
+  // because the filter that keeps them is the one that drops those siblings.
+  const declared = run("refs", "Stone", "--type", "PhysicalMaterial", "--limit", "5000")
+    .out.split("\n")
+    .filter((l) => l.includes("/BlockType/PhysicalMaterialId")).length;
+  assert.ok(declared > 0, "no declared-target rows to reason about");
+  assert.ok(
+    shared(scoped) <= total(scoped) - declared,
+    `overlap ${shared(scoped)} leaves no room for ${declared} declared rows`,
+  );
+});
+
+test("refs value mode honours the --limit it recommends", opts, () => {
+  // It capped at a hard 10 and printed '... N more. Use --limit <n>.' at every
+  // limit the reader tried. Naming a remedy that does nothing is worse than
+  // naming none: three agents tested it at six different values.
+  const carriers = (out: string): number =>
+    out.split("\n").filter((l) => /^ {2}\S+ +\S+ +\//.test(l)).length;
+  const small = run("refs", "Workbench_Tools", "--limit", "3").out;
+  const large = run("refs", "Workbench_Tools", "--limit", "100").out;
+  assert.equal(carriers(small), 3, `--limit 3 ignored:\n${small}`);
+  assert.ok(carriers(large) > carriers(small), "--limit does not raise the cap");
+  assert.doesNotMatch(large, /more\. Use --limit/, "still claims more at a limit above the total");
+});
+
+test("describe and undocumented agree on how many fields a type declares", opts, () => {
+  // Adding a root row per type -- carrying the union branches and the
+  // type-level merge marker -- leaked an unnamed row into describe and put its
+  // count one ahead of undocumented for 996 types. The empty pointer is the
+  // TYPE, not a field.
+  for (const type of ["common:FarmingData", "common:Rangef", "common:SoilConfig"]) {
+    const listed = run("describe", type, "--limit", "300").out
+      .split("\n")
+      .filter((l) => l.startsWith("/")).length;
+    const declared = /declares ([\d,]+) fields/.exec(run("undocumented", type).out);
+    assert.ok(declared !== null, `no declared count for ${type}`);
+    assert.equal(listed, Number(declared[1]!.replace(/,/g, "")), `${type} disagrees`);
+  }
+});
+
+test("a type whose describe shows more rows explains the difference", opts, () => {
+  // Item legitimately lists 96 rows against 95 declared, because describe
+  // unions the observed layer. Both numbers are right and the pair still read
+  // as an off-by-one, so the difference is now stated.
+  const { out } = run("undocumented", "Item");
+  assert.match(out, /declares 95 fields/);
+  assert.match(out, /lists 96 rows/);
+  assert.match(out, /the schema never\s+declares/);
+});
+
+test("a discriminator prints its own constant, not the union's menu", opts, () => {
+  // `legal: Crafting, Processing, DiagramCrafting, StructuralCrafting` sat one
+  // line under "must be set to the constant value \"Crafting\"". Following the
+  // menu selects a different branch, whose next field has a different shape.
+  const { out } = run("describe", "common:CraftingBench", "--field", "Type");
+  assert.match(out, /legal here: "Crafting" \(this branch only\)/);
+  assert.match(out, /each selects a different shape/);
+
+  // A plain enum is untouched.
+  const plain = run("describe", "common:BenchRequirement", "--field", "Type").out;
+  assert.match(plain, /^ +legal: Crafting, Processing/m);
+});
+
+test("get merges nested structures the schema says merge", opts, () => {
+  // The deepest defect of the round, and it went both ways. Reading
+  // `inheritsProperty` as a gate dropped `StageSetAfterHarvest` from 14 of the
+  // 15 crops inheriting Template_Crop_Block -- each of which still carried a
+  // `Harvested` stage set that nothing pointed at. Replacing nested values
+  // wholesale dropped `Support`, the block entity, and the per-stage detail.
+  const raw = run("get", "Plant_Crop_Tomato_Block", "--type", "Item", "--raw").out;
+  const doc = JSON.parse(raw) as Record<string, any>;
+  const block = doc["BlockType"];
+  assert.equal(block.Farming.StageSetAfterHarvest, "Harvested");
+  assert.ok(block.Support, "lost the farmland restriction");
+  assert.ok(block.BlockEntity?.Components?.FarmingBlock, "lost what makes it tick");
+  assert.equal(
+    block.State.Definitions.StageFinal.InteractionHint,
+    "server.interactionHints.harvest",
+    "a map of stage definitions was replaced instead of merged per key",
+  );
+  // And the child's own value still wins where it declares one.
+  assert.equal(block.State.Definitions.Stage1.PhysicalMaterialId, "Foliage");
+});
+
+test("a union-typed asset resolves through its branch", opts, () => {
+  // `Interaction` is 102 branches and no fields of its own, so nothing matched
+  // and every field read as not-inherited: an asset named for block damage
+  // came back with no block damage in it.
+  const raw = run("get", "Explode_Generic_Blocks", "--type", "Interaction", "--raw").out;
+  const doc = JSON.parse(raw) as Record<string, any>;
+  assert.equal(doc["Config"].DamageBlocks, true);
+  assert.equal(doc["Config"].BlockDamageRadius, 3);
+  // The child's own override survives the merge.
+  assert.equal(doc["Config"].DamageEntities, false);
+});
+
+test("--raw prints JSON and nothing else on stdout", opts, () => {
+  // Reported as broken because the reporting harness merged stderr. Pinned so
+  // that if a note ever does reach stdout, it fails here rather than in a
+  // reader's JSON.parse.
+  const proc = spawnSync(process.execPath, [CLI, "get", "Bench_Armory", "--raw"], {
+    encoding: "utf8",
+  });
+  assert.doesNotThrow(
+    () => JSON.parse(proc.stdout),
+    `--raw stdout is not parseable:\n${proc.stdout.slice(0, 200)}`,
+  );
+  assert.match(proc.stderr, /assets are named/, "the ambiguity note vanished entirely");
+});
+
+// ---------------------------------------------------------------------------
+// Round 16, second batch: statements about the world that were really
+// statements about the index, and markers printed with no legend.
+// ---------------------------------------------------------------------------
+
+test("a localization hit shows the key an asset must contain", opts, () => {
+  // Four blind trials in a row: `search-lang` printed the STORED key
+  // (`items.X.name`) while an asset must contain the ROOTED reference
+  // (`server.items.X.name`), and the rule was explained only on a miss. A
+  // modder who searched successfully pasted a key the game cannot resolve.
+  const { out } = run("search-lang", "Plant_Crop_Tomato");
+  assert.match(out, /^items\.Plant_Crop_Tomato\.name/m);
+  assert.match(out, /write this in an asset: server\.items\.Plant_Crop_Tomato\.name/);
+});
+
+test("a localization root other than 'server.' resolves", opts, () => {
+  // The root is the .lang file's own stem, and only 'server.' and 'common.'
+  // were known. So `wordlists.runes.algas` -- the full path the schema's own
+  // WordList documentation gives -- was declared 'a real miss', while the
+  // incorrect `server.runes.algas` resolved.
+  const { out } = run("search-lang", "wordlists.runes.algas");
+  assert.match(out, /^runes\.algas/m);
+  assert.match(out, /write this in an asset: wordlists\.runes\.algas/);
+});
+
+test("a localization miss is hedged like every other miss", opts, () => {
+  // It was the only command asserting 'this is a real miss' -- a claim about
+  // the game that only the index could answer -- and the one a reader uses to
+  // ask whether a language exists at all.
+  const { out } = run("search-lang", "Schwert");
+  assert.doesNotMatch(out, /real miss/);
+  assert.match(out, /evidence, not proof/);
+  assert.match(out, /locales this index holds/);
+});
+
+test("status attributes the locale list to the archive", opts, () => {
+  // Naming them was not enough. Five codes appended to a counts line read as
+  // the set of languages the GAME ships, and a trial asked to support 'every
+  // language the game ships' could neither confirm nor refute it.
+  const { out } = run("status");
+  assert.match(out, /locales in this Assets\.zip: .*uk-UA/);
+});
+
+test("status says what a tier is", opts, () => {
+  // 'Tier: 1 + 2' appeared in status and nowhere else in the tool. Three
+  // trials flagged it; one read it as partial corpus coverage, which is the
+  // most plausible place a missing locale could have hidden.
+  const { out } = run("status");
+  assert.match(out, /which sources are available/);
+  assert.match(out, /1 = Assets\.zip/);
+});
+
+test("search explains its locale bracket and its ~N marker", opts, () => {
+  // Both are properties of the QUERY, not the asset: the same asset shows
+  // [pt-BR] for one query and [ru-RU] for another, and a reader concluded an
+  // item was only translated into Portuguese. Neither had a legend anywhere.
+  const { out } = run("search", "sword", "--limit", "3");
+  assert.match(out, /locale the match was\s+found in/);
+  assert.match(out, /not the only language the asset has/);
+  assert.match(out, /search-lang <id>/);
+});
+
+test("the bench list honours --limit", opts, () => {
+  // Documented in --help ('bench 200'), ignored entirely by the list form:
+  // --limit 3 printed all 21 rows with no notice.
+  const rows = (out: string): number =>
+    out.split("\n").filter((l) => /^\S+ +\S+ +\d+/.test(l)).length;
+  const capped = run("bench", "--limit", "3");
+  assert.equal(rows(capped.out), 3, `--limit ignored:\n${capped.out}`);
+  assert.match(capped.out, /showing the first 3 benches/);
+  assert.ok(rows(run("bench", "--limit", "100").out) > 3);
+});
+
+// ---------------------------------------------------------------------------
+// Round 17 fixes, found by reading the code rather than by a blind trial.
+// ---------------------------------------------------------------------------
+
+test("an observed value containing spaces survives being stored", opts, () => {
+  // Value lists live in one TEXT column, joined and split on a SPACE, so any
+  // value with a space in it was shredded: two whole sentences came back as 25
+  // comma-separated tokens that read like an enum of legal values.
+  //
+  // Third delimiter bug in this project, second of exactly this shape -- the
+  // discriminator map was once written with \0 and read with a space, and all
+  // 21,439 lookups missed in silence.
+  const { out } = run("describe", "ScriptedBrushAsset", "--field", "Description");
+  assert.match(out, /Example: Places water only where there is NOT stone/);
+  assert.doesNotMatch(out, /Example:, Places, water/);
+});
+
+test("a Parent nested in an inline object counts as inheritance", opts, () => {
+  // `refs Explode_Generic` printed `high INHERITS_FROM /Parent` for three assets
+  // and `low REFERENCES /Next/Interactions/0/Parent` for a fourth -- the same
+  // mechanism, opposite labels, differing only in nesting depth, with `low`
+  // glossed as 'often coincidence'. Two blind trials caught it.
+  const { out } = run("refs", "Explode_Generic", "--limit", "20");
+  const nested = out.split("\n").find((l) => l.includes("/Next/Interactions/0/Parent"));
+  assert.ok(nested !== undefined, `the nested edge is gone entirely:\n${out}`);
+  assert.match(nested, /^high/, `still graded a coincidence: ${nested}`);
+  assert.match(nested, /INHERITS_FROM/);
+});
+
+test("the telemetry disclosure does not contradict the command it prints", opts, () => {
+  // The dry run printed `--disable-sentry` and then said the server has no flag
+  // to disable this. Three trials across two rounds called it out, and this is
+  // the text a user's consent is given against.
+  const { out } = run("generate-schema", "--dry-run");
+  assert.match(out, /--disable-sentry/);
+  assert.match(out, /turns off crash reporting/);
+  assert.match(out, /NOT\s+the same thing as telemetry/);
+  assert.doesNotMatch(out, /the server has no such flag/);
+});
+
+test("a value link is shown on the fields that take part in it", opts, () => {
+  // Pass 4 fills `value_links` -- 5,287 rows -- and value_links had no reader at
+  // all. It holds the one kind of legal-value set JSON Schema cannot express: a
+  // string whose legal values are declared elsewhere in the corpus. One agent
+  // rebuilt the gather-type set by merging three commands and still missed
+  // three values; another reported the tool 'cannot define or extend GatherType'.
+  const { out } = run("describe", "common:BlockBreakingDropType", "--field", "GatherType");
+  assert.match(out, /value link 'gather-type': this field references the value/);
+  assert.match(out, /14 value\(s\) are declared/);
+  // The declarer list is a sample of 27, and saying so is the point: six of 27
+  // read as the complete set, which is the silent-truncation class every other
+  // cap in the file announces.
+  assert.match(out, /declared by 27 asset\(s\), e\.g\. .*Tool_Hatchet/);
+  // And the honest half: values blocks require that no tool declares.
+  assert.match(out, /referenced but declared nowhere: Pickaxe_Tier0, SoftWoods, Unbreakable/);
+});
+
+// ---------------------------------------------------------------------------
+// Critic round 1: found by reading the code against the database rather than by
+// using the tool. Every one is the index holding an answer the command denied.
+// ---------------------------------------------------------------------------
+
+test("an identifier missing from the search index is still found", opts, () => {
+  // `assets` holds 22,734 distinct identifiers and `assets_fts` 22,237: 497
+  // worldgen ids have no FTS row, so `search` denied assets that exist -- while
+  // the very next line offered `refs` for the same string, because that
+  // suggestion consults `assets`.
+  const { out } = run("search", "001_start.node");
+  assert.match(out, /^001_start\.node/m);
+  assert.match(out, /identifier lookup instead/);
+  assert.doesNotMatch(out, /No asset is named/);
+});
+
+test("the identifier fallback still honours --type", opts, () => {
+  // The fallback's first version ignored --type, so a bogus type started
+  // returning rows: a fixed defect turned into a worse one.
+  const { out } = run("search", "Bench", "--type", "Nonexistent");
+  assert.match(out, /No asset type 'Nonexistent' exists/);
+  assert.doesNotMatch(out, /^Bench\b/m);
+});
+
+test("an ambiguity note counts assets, not the sample it prints", opts, () => {
+  // `get Entry.node` said '8 assets are named' -- its own display cap -- where
+  // 461 are. 442 identifiers exceed the cap, and `refs`, whose query has no
+  // LIMIT, printed the true figure for every one of them.
+  const { out } = run("get", "Entry.node");
+  const note = /note: ([\d,]+) assets are named/.exec(out);
+  assert.ok(note !== null, "no ambiguity note in: " + out.slice(0, 200));
+  assert.ok(
+    Number(note[1]!.replace(/,/g, "")) > 8,
+    "still reporting the sample size: " + note[1],
+  );
+  assert.match(out, /and [\d,]+ more; add --type/);
+});
+
+test("the refs total counts the same rows the list shows", opts, () => {
+  // The list collapsed two same-named sources into one row while the total kept
+  // them apart, so `refs Adventure` announced 96 above 85 printed rows -- with
+  // no truncation notice, because nothing had been truncated.
+  const { out } = run("refs", "Adventure", "--limit", "500");
+  const total = Number(/^([\d,]+) references/m.exec(out)?.[1]?.replace(/,/g, "") ?? "0");
+  // The legend lines start with the same words ("high   = declared by ..."), so
+  // the row test requires an identifier after the confidence, not an equals sign.
+  const rows = out.split("\n").filter((l) => /^(high|medium|low) +[A-Za-z_0-9]/.test(l)).length;
+  assert.ok(total > 0 && rows > 0);
+  assert.equal(total, rows, "header says " + total + ", printed " + rows);
+});
+
+test("undocumented states its total, not just that more exist", opts, () => {
+  // Its own docstring records the original defect as '40 rows out of 6,324 in
+  // silence'. The silence became the word 'more' and never became a number.
+  const { out } = run("undocumented");
+  assert.match(out, /Showing the first 40 of [\d,]+ fields/);
+});
+
+test("undocumented hedges against the side it is asking about", opts, () => {
+  // It listed DECLARED fields with no observation while quoting the OBSERVED
+  // ratio -- 86% -- where the applicable one is the declared side, 13%. The more
+  // reassuring of the two numbers introduced a list of 7,405 rows.
+  const { out } = run("undocumented");
+  assert.match(out, /of [\d,]+ declared fields are matched/);
+  assert.doesNotMatch(out, /observed fields match a declared one/);
+});
+
+test("undocumented suggests types as well as describe does", opts, () => {
+  // It kept only the exact-respelling half of the shared suggester, so it gave
+  // up where `describe` reaches common:FarmingData.
+  const { out } = run("undocumented", "FarmingBlock");
+  assert.match(out, /common:FarmingData/);
+});
+
+test("search prints a type and a locale for every row", opts, () => {
+  // The `?? "(untyped)"` fallback never fired: assets_fts stores an empty
+  // string, not NULL, so 14,198 rows showed a blank TYPE column and an empty
+  // `[]` where the header promises a locale.
+  const { out } = run("search", "Caldera", "--limit", "5");
+  const rows = out
+    .split("\n")
+    .filter((l) => /^\S/.test(l) && l.includes("[") && !l.startsWith("ASSET ID"));
+  assert.ok(rows.length > 0, "no result rows in: " + out);
+  for (const row of rows) {
+    assert.doesNotMatch(row, /\[\]/, "empty locale bracket: " + row);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Critic round 1, second batch.
+// ---------------------------------------------------------------------------
+
+test("a type with assets but no schema is not called nonexistent", opts, () => {
+  // Existence was tested against schema_fields alone, so `describe NPCRole`
+  // answered "No type 'NPCRole'" about a type 975 assets carry and `search`
+  // prints in its own TYPE column -- then suggested other:NPC:Role, a different
+  // concept. 'The schema says nothing about this type' and 'this type does not
+  // exist' are different answers.
+  const described = run("describe", "NPCRole");
+  assert.match(described.out, /is a real asset type/);
+  assert.match(described.out, /975 assets carry it/);
+  assert.doesNotMatch(described.out, /No type 'NPCRole'/);
+
+  const undoc = run("undocumented", "NPCRole");
+  assert.match(undoc.out, /is a real asset type/);
+  // And no spelling suggestion under a sentence confirming the name was right.
+  assert.doesNotMatch(undoc.out, /Did you mean/);
+});
+
+test("a real type that is merely misspelt still gets suggestions", opts, () => {
+  const { out } = run("undocumented", "FarmingBlock");
+  assert.match(out, /No type 'FarmingBlock' in the schema/);
+  assert.match(out, /Did you mean/);
+});
+
+test("refs resolves a file, not just an asset", opts, () => {
+  // `refsOp` filtered dst_kind='asset', so 33,782 REFERENCES_FILE edges over
+  // 24,923 files were unreachable: `refs Glow.png` said 'nothing carries it as
+  // a value' about a texture 221 edges point at. The schema names 'file' as a
+  // first-class destination kind and nothing joined the table.
+  const { out, code } = run("refs", "Glow.png");
+  assert.equal(code, 0);
+  assert.match(out, /Common\/Particles\/Textures\/Basic\/Glow\.png/);
+  assert.match(out, /[\d,]+ asset\(s\) reference this file/);
+  assert.match(out, /ParticleSpawner/);
+});
+
+test("a name that is neither asset, file nor value says all three", opts, () => {
+  const { out, code } = run("refs", "zzqqxx-nothing");
+  assert.equal(code, 1);
+  assert.match(out, /no file by that name/);
+});
+
+// ---------------------------------------------------------------------------
+// Critic round 2. Three of these are defects the CLI had already fixed and the
+// shared api layer still carried -- i.e. exactly what an MCP server would ship.
+// ---------------------------------------------------------------------------
+
+test("a lowercase 'id' ending is not a reference convention", opts, () => {
+  // SQLite's LIKE folds ASCII case, so the pointer test `LIKE '%Id'` also
+  // matched /Solid, /Fluid, /TransformFluid and /SpreadFluid: 5,292 edges were
+  // promoted to `medium` under a legend reading "the field name follows a
+  // reference convention". /Material/Solid follows no convention; it is a word.
+  const { out } = run("refs", "Empty", "--type", "BlockSet", "--limit", "400");
+  const solid = out
+    .split("\n")
+    .filter((l) => l.includes("/Material/Solid"))
+    .filter((l) => /^medium/.test(l));
+  assert.equal(solid.length, 0, "still calling /Material/Solid a convention:\n" + solid[0]);
+});
+
+test("a declared reference that resolves to nothing is reported", opts, () => {
+  // The marker for these was computed in pass 2 against a pointer pass 3 only
+  // fills in, so it matched one row -- and the generic dangling pass then
+  // overwrote even that. 2,674 occurrences exist. `BlockType./HitboxType`
+  // declares `-> BlockBoundingBoxes` and its own DEFAULT value names nothing.
+  const { out } = run("describe", "BlockType", "--field", "HitboxType");
+  assert.match(out, /BROKEN: 'Full' names no BlockBoundingBoxes/);
+  assert.match(out, /256 occurrence\(s\)/);
+});
+
+test("describe prints the default a field declares", opts, () => {
+  // 2,064 fields across 724 types declare one; it was decoded into the row
+  // being rendered and no branch printed it, while "what happens if I omit
+  // this field" is the commonest schema question.
+  const { out } = run("describe", "Item", "--field", "Consumable");
+  assert.match(out, /default false/);
+});
+
+test("the type list is reachable as a command", opts, () => {
+  // `asset_types` holds 102 rows and had no reader anywhere, while `describe`
+  // and `undocumented` both need a name you must already know. Every blind
+  // trial asked for this and rebuilt a partial list from search results.
+  const { out, code } = run("types", "--limit", "500");
+  assert.equal(code, 0);
+  assert.match(out, /^Item +[\d,]+ +95 +Item\/Items/m);
+  // A type the schema is silent about is listed, with a zero rather than absent.
+  assert.match(out, /^NPCRole +[\d,]+ +0 /m);
+  assert.match(out, /FIELDS 0 means the generated schema declares nothing/);
+});
+
+test("status counts fields the way every other command does", opts, () => {
+  // `status` counted the 996 empty-pointer TYPE rows as fields and said 18,396
+  // while `undocumented` said 17,400 about the same thing.
+  const status = run("status").out;
+  const undoc = run("undocumented").out;
+  const a = /([\d,]+) schema fields/.exec(status);
+  const b = /of ([\d,]+) declared fields/.exec(undoc);
+  assert.ok(a !== null && b !== null);
+  assert.equal(a[1]!.replace(/,/g, ""), b[1]!.replace(/,/g, ""));
+});
+
+// These three exercise src/api directly rather than through the CLI, because the
+// defects they pin were cases where the two DISAGREED -- the CLI fixed, the api
+// copy still carrying the bug that a future MCP server would ship. They import
+// from dist rather than src: this file already tests the built output, and
+// archive.ts uses syntax Node's type-stripping loader does not accept.
+test("the api layer agrees with the CLI on bench totals", async () => {
+  // `benchOp` called craftableAt without the over-fetch and returned no total,
+  // reproducing verbatim the defect cmdBench's own comment records as fixed.
+  // An MCP server reads this layer, so the copy has to be right too.
+  const ops = await import("../../dist/api/operations.js");
+  let db;
+  try {
+    db = await ops.openIndex();
+  } catch {
+    return; // no index on this machine; the CLI tests skip for the same reason
+  }
+  try {
+    const r = ops.benchOp(db, "Builders", 200);
+    assert.equal(r.value.total, ops.benchRecipeCount(db, "Builders"));
+    assert.ok(r.value.total > r.value.items.length);
+    assert.ok(r.caveats.some((c) => c.code === "truncated"), "no truncation caveat");
+  } finally {
+    db.close();
+  }
+});
+
+test("the api layer agrees with the CLI on ambiguous identifiers", async () => {
+  // `getAssetOp` built its caveat from the 8-row sample: '8 assets are named
+  // Entry.node' where 461 are.
+  const ops = await import("../../dist/api/operations.js");
+  let db;
+  try {
+    db = await ops.openIndex();
+  } catch {
+    return;
+  }
+  try {
+    const total = ops.sameNamedCount(db, "Entry.node");
+    assert.ok(total > 8);
+    const r = await ops.getAssetOp(db, "Entry.node", async () => null);
+    const note = r.caveats.find((c) => c.code === "ambiguous-identifier");
+    assert.ok(note !== undefined, "no ambiguity caveat");
+    assert.match(note.message, new RegExp("^" + String(total) + " assets are named"));
+  } finally {
+    db.close();
+  }
+});
+
+test("the api layer answers a union the way the CLI does", async () => {
+  // `describeOp` had no union branch, so it returned 213 rows for a type with
+  // no fields of its own -- every one declared === null.
+  const ops = await import("../../dist/api/operations.js");
+  let db;
+  try {
+    db = await ops.openIndex();
+  } catch {
+    return;
+  }
+  try {
+    const r = ops.describeOp(db, { assetType: "Interaction" });
+    assert.ok(r.value.union !== null, "union not reported");
+    assert.ok(r.value.union.branches.length > 50);
+    assert.equal(r.value.union.discriminatorProperty, "Type");
+  } finally {
+    db.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Regressions introduced by the round-2 fixes, found by verifying them. Each
+// one is a fix that was right about the case it targeted and wrong next to it.
+// ---------------------------------------------------------------------------
+
+test("a single observed value containing spaces stays one value", opts, () => {
+  // The separator fix round-tripped 2+ values correctly and mangled exactly the
+  // case it was written for: a ONE-element list has no separator in it, so the
+  // tolerant reader could not tell it from the old space-joined form and split
+  // it anyway. `seen: the, Crossroads` for a world named 'the Crossroads'.
+  const one = run("describe", "InstanceConfig", "--field", "DisplayName").out;
+  assert.match(one, /seen: +the Crossroads/);
+  assert.doesNotMatch(one, /seen: +the, Crossroads/);
+
+  // ...and the many-value case still works, which is what the fix was for.
+  const many = run("describe", "ScriptedBrushAsset", "--field", "Description").out;
+  assert.match(many, /Example: Places water only where there is NOT stone/);
+});
+
+test("a file reference count says assets and occurrences separately", opts, () => {
+  // The file branch counted EDGES and labelled them 'asset(s)':
+  // Frown.blockyanim reported '148 asset(s)' where 38 assets hold 148 pointers.
+  // 1,534 of 19,497 referenced files are affected; Glow.png happens to be 1:1,
+  // which is why the fix's own example looked correct.
+  const { out } = run("refs", "Frown.blockyanim", "--limit", "500");
+  const m = /([\d,]+) asset\(s\) reference this file, ([\d,]+) time\(s\)/.exec(out);
+  assert.ok(m !== null, "no split count in: " + out.slice(0, 200));
+  const assets = Number(m[1].replace(/,/g, ""));
+  const times = Number(m[2].replace(/,/g, ""));
+  assert.ok(times > assets, "this file is meant to have more pointers than assets");
+
+  // The printed rows are the pointers, so they match the larger number.
+  const rows = out.split("\n").filter((l) => /^ {4}\S/.test(l)).length;
+  assert.equal(rows, times, "rows " + rows + " do not match the stated " + times);
+});
+
+test("the identifier-fallback caveat does not over-claim", opts, () => {
+  // It said the unsearchable ids are 'worldgen under Server/World'. 496 of 497
+  // are; one is a prefab. The comment above that factory warns against baking a
+  // fact into a sentence, and 99.8% true is still a sentence that can be shown
+  // wrong.
+  const { out } = run("search", "001_start.node");
+  assert.match(out, /mostly world and prefab content/);
+  assert.doesNotMatch(out, /-- worldgen under Server\/World --/);
 });

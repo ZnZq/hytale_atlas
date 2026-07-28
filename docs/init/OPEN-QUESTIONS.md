@@ -906,25 +906,31 @@ via the resolver-precision regression test in `09-EVALUATION.md`, not assumed.
 
 ---
 
-## Q20 — What selects a union branch when no sibling `Type` exists? 🟡 OPEN
+## Q20 — What selects a union branch when no sibling `Type` exists? 🟡 OPEN (narrowed)
 
 **Discovered while raising the declared/observed join.**
 
 Polymorphic `anyOf` unions are normally resolved from the data: the sibling `Type`
 names the branch (`Type: "Fixed"` → `FixedTradeSlot`), which now settles **40 388
-of 44 187 crossings (91.4 %)**. The remaining 3 799 fall into two shapes that the
-`Type` rule cannot reach, and both are visible in the top unjoined pointers:
+of 44 187 crossings (91.4 %)**. One of the two remaining shapes has since been
+closed — see the strikethrough below — taking the declared/observed join to 89 %.
+What is left:
 
 - **`ScriptedBrushAsset./Operations/*`** — 56 branches, and instances carry `Id`,
   `ClickType`, `BlockPattern` but **no `Type`**. If `Id` is the discriminator its
   vocabulary does not match the branch names, so the mapping is not mechanical.
   Worldgen brushes are editor tooling, so this is low-value; recorded so the
   count is explained rather than mysterious.
-- **`RootInteraction./Interactions/*`** — `ref_scope` is null here, meaning the
-  branches were **not `$ref`s at all** but inline objects. The union is invisible
-  to the current reader, which is why 1 689 `/Interactions/*/Parent` observations
-  sit unjoined. This one is worth fixing: interactions are how right-click
-  behaviour is described, which the pickaxe scenario needs.
+- ~~**`RootInteraction./Interactions/*`**~~ — **RESOLVED.** `ref_scope` read as
+  null because the branches were being looked for in the wrong place. The pointer
+  declares `-> Interaction`, and `Interaction` is itself a root-level union of 102
+  branches with no fields of its own, so a corpus pointer has to hop onto the
+  branch *before* it can match. Three things closed it: that root-union hop, the
+  schema's own `hytaleSchemaTypeField` discriminator (244 occurrences across 35
+  files, positionally aligned with the branches), and following `/Parent` for the
+  152 of 1 341 `Interaction` assets that declare nothing but a parent and inherit
+  their `Type` from it. The pointer now reports 1 230 assets, and
+  `describe Interaction` names every branch with the value that selects it.
 
 A third family is not a union problem at all: `common:DensityTerrainAsset` recurses
 (`/Density/Inputs/*/Inputs/*/…`) and 543 rows sit below `MAX_POINTER_DEPTH`. Those
@@ -1046,3 +1052,42 @@ promote what survives inspection to a declared line.
 - **`Server/World` and `Server/Prefabs` are a third of the corpus** (20 006 of
   60 148 entries) and have no matching codec asset type. Decide explicitly whether
   worldgen data belongs in the graph before it dominates every field statistic.
+
+---
+
+## Q22 — Why do 1 116 `anyOf` fields carry a `ref_scope` but no reference target? 🔴 OPEN
+
+**Found while verifying the round-2 critic fixes, 2026-07-28.**
+
+`Item./BlockType` declares `"hytaleAssetRef": "BlockType"` on the property node,
+as a sibling of `anyOf`. The indexed row has `declared_type = 'anyOf'`,
+`ref_scope = 'BlockType'` and `reference_target = NULL`.
+
+Measured:
+
+```
+raw hytaleAssetRef occurrences across 104 schema files   932
+indexed rows with reference_target IS NOT NULL           545   across 184 types
+anyOf rows with a target                                 264
+anyOf rows with ref_scope and NO target                 1116
+anyOf properties carrying the marker at property level    215
+```
+
+Some of the 932 → 545 gap is legitimate: the same property is marked at more than
+one nesting level and collapses to one row. The rest is not, and the shape is
+familiar — the row for an `anyOf` property is emitted from a branch node rather
+than from the property node, so a marker sitting on the property is dropped.
+
+**Why it matters.** `reference_target` is what promotes an edge to `high` and what
+the query-time contradiction filter tests. A missing target means a real,
+schema-declared reference is graded as a name collision, which is the exact defect
+two blind trials reported for nested `/Parent` and one reported for
+`GatherType`.
+
+**This is the fourth marker read at the wrong level** — `hytaleAssetRef` itself
+(twice), `hytaleSchemaTypeField`, `inheritsProperty`, and now this. The pattern is
+strong enough to be a rule: **when reading a marker off a schema node, check the
+property node, every `anyOf`/`oneOf` branch, and the type root — and write a test
+that counts what the raw files contain against what the index stores.** Three of
+the four were found only because a number in the corpus disagreed with a number in
+the index.

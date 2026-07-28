@@ -20,13 +20,27 @@ import {
 import { AssetArchive, archiveStamp } from "../sources/archive.ts";
 import { detectInstallation } from "../sources/detect.ts";
 import { TELEMETRY_DISCLOSURE, withGeneratedSchemas } from "../sources/schema-gen.ts";
-import { readGeneratedSchemas } from "../sources/schema-doc.ts";
+import { readGeneratedSchemas, scopes } from "../sources/schema-doc.ts";
 import {
   benchDeclaredBy,
+  benchIdExists,
+  benchRecipeCount,
+  assetTypesOp,
+  benchesOp,
+  brokenRefsFor,
+  declaredCount,
+  fileRefsOp,
+  undeclaredObserved,
   langOp,
   refsOp,
   searchAssetsOp,
+  sameNamed,
+  assetsOfType,
+  sameNamedCount,
   searchSchemaOp,
+  typeAlternatives,
+  valueLinkFor,
+  valueUsage,
   undocumentedOp,
 } from "../api/operations.ts";
 import type { Caveat } from "../api/types.ts";
@@ -44,13 +58,6 @@ function stripAnsi(text: string): string {
   // eslint-disable-next-line no-control-regex
   return text.replace(/\[[0-9;]*m/g, "");
 }
-
-/**
- * A value no asset type can equal, for the "match nothing" arm of a suggestion
- * query. Spelled out rather than left as a literal, because the literal that sat
- * here was an invisible control character.
- */
-const NO_SUCH_TYPE = "\u0000-no-such-type";
 
 /**
  * Shortens prose for a list, and says so when it does.
@@ -430,7 +437,12 @@ export async function indexSummary(
       Number((db.prepare(sql).get() as Record<string, unknown> | undefined)?.["n"] ?? 0);
     const assets = one("SELECT count(*) AS n FROM assets");
     const typed = one("SELECT count(*) AS n FROM assets WHERE type IS NOT NULL");
-    const declared = one("SELECT count(*) AS n FROM schema_fields");
+    // Excludes the empty-pointer TYPE rows, like every other count in the
+    // project. `status` said 18,396 while `undocumented` said 17,400 about the
+    // same thing, and the 996 difference is types, not fields.
+    const declared = one(
+      "SELECT count(*) AS n FROM schema_fields WHERE json_pointer <> ''",
+    );
     const joined = one(
       `SELECT count(*) AS n FROM field_stats fs
         JOIN schema_fields sf ON sf.asset_type = fs.asset_type
@@ -444,8 +456,23 @@ export async function indexSummary(
       `${formatCount(assets)} assets ` +
       `(${formatCount(typed)} typed, ${Math.round((typed / Math.max(assets, 1)) * 100)}%), ` +
       `${formatCount(declared)} schema fields, ` +
-      `${formatCount(one("SELECT count(*) AS n FROM edges"))} edges, ` +
-      `${one("SELECT count(DISTINCT locale) AS n FROM lang_keys")} locales\n` +
+      `${formatCount(one("SELECT count(*) AS n FROM edges"))} edges` +
+      // Named, not counted. "5 locales" led an agent to work out which ones by
+      // inference and conclude Ukrainian was absent -- it is not. The tool said
+      // nothing false; its silence produced a false belief, which is the same
+      // failure wearing a different hat.
+      // ...and attributed. Naming them was not enough: an unlabelled list of five
+      // codes on a counts line reads as the set of languages the GAME ships, and
+      // a blind trial asked to support "every language the game ships" could
+      // neither confirm nor refute it. These are the locales found in the
+      // archive that was indexed -- which is a fact about this archive.
+      `\n             locales in this Assets.zip: ${(
+        db.prepare("SELECT DISTINCT locale FROM lang_keys ORDER BY locale").all() as unknown as {
+          locale: string;
+        }[]
+      )
+        .map((r) => r.locale)
+        .join(", ")}\n` +
       `             observed/declared join: ${formatCount(joined)} of ` +
       `${formatCount(observed)} observed fields match a declared one ` +
       `(${Math.round((joined / Math.max(observed, 1)) * 100)}%)\n` +
@@ -461,11 +488,11 @@ export async function indexSummary(
 
 export async function cmdSearch(
   query: string,
-  args: { assets?: string; patchline?: string; limit?: number },
+  args: { assets?: string; patchline?: string; limit?: number; type?: string },
 ): Promise<number> {
   const db = await frozenDb(args.assets, args.patchline);
   try {
-    const { value: hits, caveats } = searchAssetsOp(db, query, args.limit ?? 20);
+    const { value: hits, caveats } = searchAssetsOp(db, query, args.limit ?? 20, args.type);
     if (hits.length === 0) {
       // Said "No matches." and stopped, which reads as "this string appears
       // nowhere". It indexes identifiers and localized names, not field VALUES:
@@ -473,15 +500,44 @@ export async function cmdSearch(
       // items referencing it, and searching a literal interaction value returned
       // nothing at all. Both agents inferred the limitation from repeated empty
       // results rather than being told.
+      // The `--type` scope was dropped from the sentence, so a scoped miss made
+      // a claim about the whole corpus: `search Workbench --type BenchCategory`
+      // answered "No asset is named 'Workbench', in any indexed locale" about a
+      // string that is an asset's own en-US name. Five blind trials hit this and
+      // one nearly concluded a damage type does not exist. The type is also
+      // checked now -- `--type Zzz` was accepted in silence and its emptiness
+      // reported as a fact about the game, while `get` has always validated it.
+      const unscoped =
+        args.type === undefined ? 0 : searchAssetsOp(db, query, 1).value.length;
+      const known =
+        args.type === undefined ||
+        (db.prepare("SELECT count(*) AS n FROM assets WHERE type = ?").get(args.type) as {
+          n: number;
+        }).n > 0;
       process.stdout.write(
-        `No asset is named "${query}", in any indexed locale.\n\n` +
+        (args.type === undefined
+          ? `No asset is named "${query}", in any indexed locale.\n\n`
+          : !known
+            ? `No asset type '${args.type}' exists, so nothing could match. ` +
+              `Drop --type, or check the spelling.\n\n`
+            : `No asset of type '${args.type}' is named "${query}", in any indexed ` +
+              `locale.` +
+              (unscoped > 0
+                ? ` Without --type there ARE matches -- run the same search without it.`
+                : ` Without --type there are none either.`) +
+              `\n\n`) +
           // Wording comes from the operation layer, so the MCP server states the
           // same limitation rather than a paraphrase of it.
           `${caveats.map((c) => c.message).join("\n")}\n\n`.replace(
             "not field values.",
             "NOT field values.",
           ) +
-          `  hytale-atlas refs ${query.split(/\s+/)[0]}    what references that asset\n` +
+          // Only when it IS an asset. Suggesting `refs` on a miss produced a
+          // closed loop -- `search X` said try `refs X`, `refs X` said try
+          // `search X` -- which three blind trials walked into and none escaped.
+          (sameNamed(db, query.split(/\s+/)[0] ?? query).length > 0
+            ? `  hytale-atlas refs ${query.split(/\s+/)[0]}    what references that asset\n`
+            : "") +
           "  hytale-atlas search-schema <words>   where a capability is declared\n",
       );
       return 1;
@@ -490,13 +546,39 @@ export async function cmdSearch(
     // Goblin_Pickaxe and Outlander_Pickaxe, which are ItemPlayerAnimations rather
     // than items -- without the type they are indistinguishable from real tools
     // and cost a `get` each to rule out.
+    // Two markers were printed with no legend anywhere, and both are about the
+    // QUERY rather than the asset -- which is how a reader concluded an item was
+    // only translated into pt-BR after seeing `[pt-BR]` beside it. The bracket
+    // names the locale the match was FOUND in; `~N` means the query had to be
+    // loosened N times to reach the row.
+    process.stdout.write(
+      `${"ASSET ID".padEnd(36)} ${"TYPE".padEnd(22)} [locale the match was ` +
+        `found in] name\n\n`,
+    );
+    let loosened = false;
     for (const hit of hits) {
       const relaxed = hit.relaxation > 0 ? `  ~${hit.relaxation}` : "";
+      if (hit.relaxation > 0) loosened = true;
       process.stdout.write(
-        `${hit.logicalId.padEnd(36)} ${(hit.type ?? "(untyped)").padEnd(22)} ` +
-          `[${hit.locale}] ${hit.displayName}${relaxed}\n`,
+        // `??` never fired: the FTS table stores an empty string, not NULL, so
+        // 14 198 of 45 449 rows printed a blank TYPE column and an empty `[]`
+        // where the header promises a locale. `get` and `refs` print `(untyped)`
+        // for the very same assets.
+        `${hit.logicalId.padEnd(36)} ${(hit.type || "(untyped)").padEnd(22)} ` +
+          `[${hit.locale || "id"}] ${hit.displayName}${relaxed}\n`,
       );
     }
+    if (loosened) {
+      process.stdout.write(
+        `\n~N marks a row the query only reached after being loosened N time(s); ` +
+          `those are weaker matches.\n`,
+      );
+    }
+    process.stdout.write(
+      `\n[id] means the match was on the identifier, not on a translation.\n` +
+      `A locale here is where THIS query matched, not the only language the ` +
+        `asset has.\nUse 'search-lang <id>' for every translation of one asset.\n`,
+    );
     renderCaveats(caveats);
   } finally {
     db.close();
@@ -539,14 +621,23 @@ export async function cmdGet(
     const sameName = db
       .prepare(`SELECT type, path FROM assets WHERE logical_id = ? ${PICK_ORDER} LIMIT 8`)
       .all(logicalId) as unknown as { type: string | null; path: string }[];
-    if (sameName.length > 1 && args.type === undefined) {
+    // The COUNT is unlimited; only the sample below it is capped. Deriving the
+    // count from the sample made `get Entry.node` say '8 assets are named' where
+    // 461 are, and 442 identifiers are over the cap -- while `refs`, whose query
+    // has no LIMIT, printed the true figure for the same id.
+    const sameNameTotal = sameNamedCount(db, logicalId);
+    if (sameNameTotal > 1 && args.type === undefined) {
       process.stderr.write(
-        `note: ${sameName.length} assets are named '${logicalId}'. Showing the ` +
+        `note: ${formatCount(sameNameTotal)} assets are named '${logicalId}'. Showing the ` +
           `${sameName[0]!.type ?? "untyped"} one.\n` +
           sameName
             .slice(1)
             .map((s) => `      also: ${s.type ?? "untyped"}  ${s.path}\n`)
-            .join(""),
+            .join("") +
+          (sameNameTotal > sameName.length
+            ? `      ... and ${formatCount(sameNameTotal - sameName.length)} more; ` +
+              `add --type <Type> to choose\n`
+            : ""),
       );
     }
 
@@ -572,6 +663,13 @@ export async function cmdGet(
         process.stderr.write(
           `No '${logicalId}' of type '${args.type}'. It exists as: ` +
             `${sameName.map((s) => s.type ?? "untyped").join(", ")}\n`,
+        );
+      } else if (benchIdExists(db, logicalId)) {
+        // `get Farmingbench` sent readers to `search`, which sent them to `refs`,
+        // which finally explained it is a value rather than an asset -- three
+        // hops that never named the one command built for the question.
+        process.stderr.write(
+          `'${logicalId}' is a bench id, not an asset. Use: hytale-atlas bench ${logicalId}\n`,
         );
       } else if (logicalId.includes(":")) {
         const [maybeType, ...rest] = logicalId.split(":");
@@ -635,23 +733,11 @@ export async function cmdBench(
   const db = await frozenDb(args.assets, args.patchline);
   try {
     if (benchId === undefined) {
-      const rows = db
-        .prepare(
-          `SELECT b.id, b.bench_type,
-                  (SELECT group_concat(a.logical_id, ', ') FROM bench_declarations d
-                     JOIN assets a ON a.id = d.asset_id WHERE d.bench_id = b.id) declared_by,
-                  (SELECT count(*) FROM bench_categories c WHERE c.bench_id = b.id) cats,
-                  (SELECT count(*) FROM bench_requirements r WHERE r.bench_id = b.id) reqs
-             FROM benches b
-            ORDER BY reqs DESC`,
-        )
-        .all() as unknown as {
-        id: string;
-        bench_type: string | null;
-        declared_by: string | null;
-        cats: number;
-        reqs: number;
-      }[];
+      // --help documents a cap for `bench`; the list form ignored it entirely,
+      // printing all 21 rows at --limit 3.
+      const benchLimit = args.limit ?? 200;
+      const allRows = benchesOp(db).value;
+      const rows = allRows.slice(0, benchLimit);
       // Headed, and the key column is named. Two ids sit on every row and only
       // one of them works anywhere: 'Workbench' is what `bench <id>` takes AND
       // what a recipe's BenchRequirement.Id must say, while 'Bench_WorkBench' is
@@ -662,15 +748,32 @@ export async function cmdBench(
         `${"BENCH ID".padEnd(18)} ${"TYPE".padEnd(18)} ${"RECIPES".padStart(7)} ` +
           `${"CAT".padStart(3)}  DECLARED BY\n` +
           `${"(use this)".padEnd(18)} ${"".padEnd(18)} ${"".padStart(7)} ` +
-          `${"".padStart(3)}  (the asset, not the id)\n\n`,
+          `${"".padStart(3)}  (the asset, not the id)\n` +
+          // CAT counts what the BENCH ASSET declares. The bracketed groups in
+          // 'bench <id>' are what the RECIPES name, which is a different set --
+          // Weapon_Bench declares 5 and its recipes name 8. Unlabelled, the two
+          // read as the same number disagreeing with itself.
+          `\nCAT counts categories the bench ASSET declares. The [groups] under\n` +
+          `'bench <id>' are the categories its RECIPES name -- a different set,\n` +
+          `so the two numbers differ by design.\n\n`,
       );
       for (const r of rows) {
+        // Report, do not interpret. '(no declaring asset -- hand crafting)' was
+        // an invented causal story: no such concept exists in the schema, and one
+        // of the six ids it labelled that way is a declared BenchCategory typo'd
+        // into an Id slot. All the index knows is that nothing declares the id.
+        const origin =
+          r.declared_by ??
+          (r.is_category === 1
+            ? "(no bench declares this id; it IS a declared bench category)"
+            : "(no bench declares this id)");
         process.stdout.write(
-          `${r.id.padEnd(18)} ${String(r.bench_type ?? "?").padEnd(18)} ` +
+          `${r.id.padEnd(18)} ${String(r.bench_type ?? r.req_type ?? "?").padEnd(18)} ` +
             `${String(r.reqs).padStart(7)} ${String(r.cats).padStart(3)}  ` +
-            `${r.declared_by ?? ""}\n`,
+            `${origin}\n`,
         );
       }
+      noticeTruncated(rows.length, allRows.length > benchLimit, "benches");
       return 0;
     }
 
@@ -689,7 +792,15 @@ export async function cmdBench(
       value: string | null;
     }[];
 
-    const items = craftableAt(db, benchId, args.limit ?? 200);
+    // Over-fetch by one so the printed total is the TOTAL. Using items.length
+    // meant a capped list reported the cap: `bench Builders` said "200 craftable
+    // here" while the bench table one screen earlier said 911, with no truncation
+    // notice and against an explicit --help promise that every command gives one.
+    // Four of five blind trials reported it independently.
+    const limit = args.limit ?? 200;
+    const fetched = craftableAt(db, benchId, limit + 1);
+    const items = fetched.slice(0, limit);
+    const totalCraftable = benchRecipeCount(db, benchId);
     if (categories.length === 0 && items.length === 0) {
       // The most likely mistake is passing the declaring asset instead of the
       // bench id, so name the right one rather than only rejecting the wrong one.
@@ -715,7 +826,8 @@ export async function cmdBench(
         `${indent}${c.category_id.padEnd(26 - indent.length)} ${c.value ?? c.name_key ?? ""}\n`,
       );
     }
-    process.stdout.write(`\n${formatCount(items.length)} craftable here:\n`);
+    process.stdout.write(`\n${formatCount(totalCraftable)} craftable here:\n`);
+    noticeTruncated(items.length, fetched.length > limit, "recipes");
     let current: string | null | undefined;
     for (const it of items) {
       if (it.category !== current) {
@@ -755,37 +867,86 @@ export async function cmdRefs(
       // another asset's field -- so `refs Workbench_Tools` failed and suggested
       // `search`, which suggested `refs` back. Two commands handing off to each
       // other, neither able to say the thing is not an asset at all.
-      const asValue = db
-        .prepare(
-          `SELECT c.schema_scope, c.schema_pointer, count(*) AS n
-             FROM candidates c
-            WHERE c.raw_value = ? AND c.schema_scope IS NOT NULL
-            GROUP BY c.schema_scope, c.schema_pointer
-            ORDER BY n DESC LIMIT 3`,
-        )
-        .all(logicalId) as unknown as {
-        schema_scope: string;
-        schema_pointer: string;
-        n: number;
-      }[];
+      // Before treating it as a plain string: does it exist as an asset of
+      // ANOTHER type? `refs Wood --type Item` answered "'Wood' is not an asset"
+      // about a name four assets carry. `get` has always got this right, and
+      // the two commands contradicting each other is worse than either alone.
+      if (args.type !== undefined) {
+        const elsewhere = sameNamed(db, logicalId);
+        if (elsewhere.length > 0) {
+          process.stderr.write(
+            `No '${logicalId}' of type '${args.type}'. It exists as: ` +
+              `${elsewhere.map((c) => c.type ?? "untyped").join(", ")}\n` +
+              `Try: hytale-atlas refs ${logicalId} --type ${elsewhere[0]!.type ?? ""}\n`,
+          );
+          return 1;
+        }
+      }
 
-      if (asValue.length > 0) {
-        const total = asValue.reduce((sum, r) => sum + r.n, 0);
+      const valueLimit = args.limit ?? 40;
+      const usage = valueUsage(db, logicalId, valueLimit);
+      if (usage.occurrences > 0) {
+        const fields = usage.byField.slice(0, usage.fieldsShown);
+        const carriers = usage.examples.slice(0, valueLimit);
+        // Both numbers, because they differ and the difference matters: one
+        // asset can hold the same value in two fields.
         process.stderr.write(
-          `'${logicalId}' is not an asset. ${formatCount(total)} assets carry it as a VALUE:\n` +
-            asValue
-              .map((r) => `  ${formatCount(r.n)}x  ${r.schema_scope} :: ${r.schema_pointer}\n`)
+          `'${logicalId}' is not an asset. It appears as a VALUE ` +
+            `${formatCount(usage.occurrences)} time(s) in ` +
+            `${formatCount(usage.assets)} asset(s):\n` +
+            fields
+              .map((r) => `  ${formatCount(r.count)}x  ${r.scope} :: ${r.pointer}\n`)
               .join("") +
-            "\nReferences track asset ids. For a value like this, describe the field\n" +
-            `that holds it: hytale-atlas describe ${asValue[0]!.schema_scope} ` +
-            `--field ${asValue[0]!.schema_pointer}\n`,
-        );
-        return 1;
+            (usage.unattributed > 0
+              ? `  ${formatCount(usage.unattributed)} occurrence(s) could not be ` +
+                `attributed to a declared field, so the breakdown above does not ` +
+                `sum to the total.\n`
+              : "") +
+            (usage.fields > fields.length
+              ? `  ... and ${formatCount(usage.fields - fields.length)} more field(s). ` +
+                `Use --limit <n>.\n`
+              : "") +
+            `\nCarried by:\n` +
+            carriers
+              .map(
+                (e) =>
+                  `  ${e.logicalId.padEnd(38)} ${(e.type ?? "untyped").padEnd(18)} ${e.pointer}\n`,
+              )
+              .join("") +
+            (usage.examples.length > carriers.length
+              ? `  ... ${formatCount(usage.occurrences - carriers.length)} more. ` +
+                `Use --limit <n>.\n`
+              : ""),
+        );        return 1;
+      }
+
+      // Before giving up: it may be a FILE. Models, textures, icons, sounds and
+      // animations are indexed with their own edge kind, and `refs` filtered
+      // them out -- so a texture with 221 inbound references answered 'nothing
+      // carries it as a value'.
+      const asFile = fileRefsOp(db, logicalId, args.limit ?? 40);
+      if (asFile.value.length > 0) {
+        for (const file of asFile.value) {
+          process.stdout.write(
+            `${file.path}\n` +
+              `  ${formatCount(file.assets)} asset(s) reference this file, ` +
+              `${formatCount(file.total)} time(s):\n` +
+              file.references
+                .map(
+                  (r) =>
+                    `    ${r.logicalId.padEnd(36)} ${(r.type ?? "untyped").padEnd(18)} ` +
+                    `${r.pointer ?? ""}\n`,
+                )
+                .join(""),
+          );
+        }
+        renderCaveats(asFile.caveats);
+        return 0;
       }
 
       process.stderr.write(
         `No asset '${logicalId}'${args.type ? ` of type '${args.type}'` : ""}, ` +
-          "and nothing carries it as a value.\n" +
+          "no file by that name, and nothing carries it as a value.\n" +
           `Try 'hytale-atlas search ${logicalId}'.\n`,
       );
       return 1;
@@ -820,11 +981,54 @@ export async function cmdRefs(
     // states; a heuristic one is a name that happens to collide, and 'Stone'
     // collides with a great many things.
     process.stdout.write(
-      "\nhigh   = declared by the schema, or inheritance the engine resolves itself\n" +
-        "medium = the field name follows a reference convention\n" +
+      "\nhigh   = declared by the schema AND the target is of the declared type,\n" +
+        "         or inheritance the engine resolves itself\n" +
+        "medium = declared by the schema but unverifiable (the declared target type\n" +
+        "         is not itself an asset type), or the field name follows a\n" +
+        "         reference convention\n" +
         "low    = the value merely collides with an identifier; often coincidence\n",
     );
     renderCaveats(caveats);
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Lists the asset types.
+ *
+ * `asset_types` holds 102 rows and had no reader anywhere, while `describe`
+ * and `undocumented` both require a type name you must already know and
+ * `search-schema` searches field prose rather than the type list. Every blind
+ * trial asked for this and each one reconstructed a partial list by reading
+ * the TYPE column of `search` results.
+ */
+export async function cmdTypes(args: {
+  assets?: string;
+  patchline?: string;
+  limit?: number;
+}): Promise<number> {
+  const db = await frozenDb(args.assets, args.patchline);
+  try {
+    const limit = args.limit ?? 200;
+    const all = assetTypesOp(db).value;
+    const rows = all.slice(0, limit);
+    process.stdout.write(
+      `${"TYPE".padEnd(34)} ${"ASSETS".padStart(7)} ${"FIELDS".padStart(7)}  WHERE\n\n`,
+    );
+    for (const r of rows) {
+      process.stdout.write(
+        `${r.type.padEnd(34)} ${formatCount(r.assets).padStart(7)} ` +
+          `${formatCount(r.declaredFields).padStart(7)}  ${r.path ?? ""}\n`,
+      );
+    }
+    noticeTruncated(rows.length, all.length > limit, "types");
+    process.stdout.write(
+      `\nFIELDS 0 means the generated schema declares nothing for that type, not ` +
+        `that it is empty.\nShared definitions ('common:...') are not asset types ` +
+        `and are not listed; describe accepts them.\n`,
+    );
     return 0;
   } finally {
     db.close();
@@ -842,18 +1046,40 @@ export async function cmdLang(
       process.stdout.write(
         `No localization key or value matches "${query}".\n\n` +
           "Keys are stored WITHOUT their root: an asset referencing\n" +
-          "'server.items.Foo.name' is stored as 'items.Foo.name'. Both forms are\n" +
-          "accepted here, so this is a real miss rather than a prefix problem.\n",
+          "'server.items.Foo.name' is stored as 'items.Foo.name'. Any root is\n" +
+          "accepted here, so this is unlikely to be a prefix problem.\n\n" +
+          // The one command that had no coverage hedge, while its siblings all
+          // carry one -- and the command a reader uses to ask whether a language
+          // exists at all. "This is a real miss" was a claim about the game that
+          // only the index could answer.
+          "This is evidence, not proof: it covers the locales this index holds\n" +
+          "(see 'hytale-atlas status'), and matching is literal -- a string spelt\n" +
+          "differently would not match.\n",
       );
       return 1;
     }
     for (const entry of entries) {
-      process.stdout.write(`${entry.key}\n`);
+      // Both forms. The stored key is what the table holds; the reference is
+      // what an asset must contain, and printing only the former sent modders
+      // to paste a key the game will not resolve.
+      process.stdout.write(
+        `${entry.key}\n` +
+          (entry.reference === entry.key
+            ? ""
+            : `    write this in an asset: ${entry.reference}\n`),
+      );
       for (const t of entry.translations) {
         process.stdout.write(`    ${t.locale.padEnd(7)} ${t.value}\n`);
       }
-      for (const u of entry.usedBy) {
+      const shownUsers = entry.usedBy.slice(0, args.limit ?? 20);
+      for (const u of shownUsers) {
         process.stdout.write(`    used by ${u.logicalId} ${u.pointer ?? ""}\n`);
+      }
+      if (entry.usedByTotal > shownUsers.length) {
+        process.stdout.write(
+          `    ... and ${formatCount(entry.usedByTotal - shownUsers.length)} more ` +
+            `of ${formatCount(entry.usedByTotal)}. Use --limit <n>.\n`,
+        );
       }
       // Said rather than left blank: a key with no inbound edge is normal (UI
       // text, or referenced by something the index does not type), and silence
@@ -939,11 +1165,19 @@ export async function cmdDescribe(
           near = pointersLike(db, assetType, probe);
           if (near.length === 0) probe = probe.slice(0, probe.lastIndexOf("/")) || "/";
         }
+        // A union declares no field of its own, so sending the reader to
+        // `describe X` "to list its fields" lands them on 102 branches and no
+        // fields at all. Name what they will actually get.
+        const fallback =
+          union !== undefined
+            ? `'${assetType}' is a union: its fields live on the branches, not on it.\n` +
+              `Run 'hytale-atlas describe ${assetType}' to list the branches, then describe one.\n`
+            : `Run 'hytale-atlas describe ${assetType}' to list its fields.\n`;
         process.stderr.write(
           `'${assetType}' has no field '${field}'.\n` +
             (near.length > 0
               ? `Nearest declared:\n` + near.map((p) => `  ${p}\n`).join("")
-              : `Run 'hytale-atlas describe ${assetType}' to list its fields.\n`),
+              : fallback),
         );
         return 1;
       }
@@ -952,20 +1186,26 @@ export async function cmdDescribe(
       // guessable: ItemToolSpec and CraftingRecipe do not, ItemTool and
       // BenchRequirement do. Suggestions go both ways, because both mistakes
       // happen: adding a prefix that does not belong, and omitting one that does.
-      const bare = assetType.includes(":") ? assetType.slice(assetType.indexOf(":") + 1) : null;
-      const alternatives = db
-        .prepare(
-          `SELECT DISTINCT asset_type FROM schema_fields
-            WHERE asset_type LIKE '%:' || ?1 OR asset_type = ?2
-            ORDER BY asset_type LIMIT 5`,
-        )
-        .all(assetType, bare ?? NO_SUCH_TYPE) as unknown as { asset_type: string }[];
+      const alternatives = typeAlternatives(db, assetType);
 
+      // A type with assets but no declared fields is a real type the schema is
+      // silent about, not a typo. Saying "No type" sent readers looking for a
+      // spelling mistake that does not exist.
+      const carried = assetsOfType(db, assetType);
+      if (carried > 0) {
+        process.stderr.write(
+          `'${assetType}' is a real asset type -- ${formatCount(carried)} assets carry ` +
+            `it -- but the generated schema declares no fields for it, so there is\n` +
+            `nothing to describe. Its contents are reachable per asset: ` +
+            `hytale-atlas get <id> --type ${assetType}\n`,
+        );
+        return 1;
+      }
       if (alternatives.length > 0) {
         process.stderr.write(
           `No type '${assetType}'. Did you mean:\n` +
             alternatives
-              .map((a) => `  hytale-atlas describe ${a.asset_type}${field ? ` --field ${field}` : ""}\n`)
+              .map((a) => `  hytale-atlas describe ${a}${field ? ` --field ${field}` : ""}\n`)
               .join(""),
         );
       } else {
@@ -988,6 +1228,10 @@ export async function cmdDescribe(
         d?.inheritsProperty ? "inherits" : null,
         d?.mergesProperties ? "merges" : null,
         d?.referenceTarget ? `-> ${d.referenceTarget}` : null,
+        // 2 064 fields across 724 types declare a default, it was decoded into
+        // the row being rendered, and no branch printed it -- while "what
+        // happens if I omit this field" is the commonest schema question.
+        d?.defaultValue != null ? `default ${clip(d.defaultValue, 40)}` : null,
         d === null ? "UNDECLARED" : null,
         o === null ? (container ? "(container)" : "unused") : null,
       ].filter(Boolean);
@@ -1005,7 +1249,45 @@ export async function cmdDescribe(
       }
       // Declared enums are the complete legal set; observed values are only what
       // vanilla happens to use. Labelled differently on purpose.
-      if (d?.enumValues) {
+      // A value link is the only kind of legal-value set JSON Schema cannot
+      // express, so `describe` had nothing to say about the very fields whose
+      // values are hardest to guess.
+      // Values this field declares a target for that resolve to nothing. The
+      // marker existed, was overwritten before it could be used, and no query
+      // read the column: `describe BlockType --field HitboxType` printed
+      // '-> BlockBoundingBoxes' and 214 distinct values without mentioning that
+      // one of them names nothing, 256 times.
+      for (const broken of brokenRefsFor(db, assetType, f.pointer)) {
+        process.stdout.write(
+          `    BROKEN: '${broken.value}' names no ${d?.referenceTarget ?? "asset"} ` +
+            `(${formatCount(broken.occurrences)} occurrence(s))\n`,
+        );
+      }
+      const link = valueLinkFor(db, assetType, f.pointer);
+      if (link !== null) {
+        process.stdout.write(
+          `    value link '${link.link}': this field ${link.role} the value.\n` +
+            `    ${formatCount(link.declared.length)} value(s) are declared: ` +
+            `${link.declared.join(", ")}\n` +
+            `    declared by ${formatCount(link.declaredByTotal)} asset(s), ` +
+            `e.g. ${link.declaredBy.map((d2) => d2.logicalId).join(", ")}\n` +
+            (link.unresolved.length > 0
+              ? `    referenced but declared nowhere: ${link.unresolved.join(", ")}\n`
+              : ""),
+        );
+      }
+      if (d?.typeConstant) {
+        // A discriminator's own legal set is one value. The union's full list
+        // sat here instead, one line under the sentence saying so, and
+        // following it selects a different branch of the schema.
+        process.stdout.write(`    legal here: "${d.typeConstant}" (this branch only)\n`);
+        if (d.enumValues) {
+          process.stdout.write(
+            `    the union allows ${d.enumValues.join(", ")} -- each selects a ` +
+              `different shape\n`,
+          );
+        }
+      } else if (d?.enumValues) {
         process.stdout.write(`    legal: ${d.enumValues.join(", ")}\n`);
       } else if (o?.values) {
         // Says how many of how many. The list was cut at 14 in silence, so a
@@ -1026,6 +1308,33 @@ export async function cmdDescribe(
           `    used in ${formatCount(o.assets)} assets` +
             (o.targetTypes ? `, points at ${o.targetTypes.join("/")}` : "") + "\n",
         );
+        // An UNDECLARED field is named to its sources, because a few of them are
+        // not evidence of a capability at all.
+        //
+        // Asset type comes from the file's PATH. When a file sits in the wrong
+        // directory the mismatch is silent, and its fields surface as observed
+        // properties of a type they have nothing to do with:
+        // `Food_EffectCondition_Buff_Medium` and `_Small` live under
+        // Server/Entity/Effects/Food/Buff/_Deprecated/ and are therefore typed
+        // EntityEffect, while their content is a plain EffectConditionInteraction
+        // -- so /Match, /Next and /EntityEffectIds appeared as EntityEffect
+        // capabilities. Byte-identical siblings one directory over are typed
+        // correctly, which is how it stayed invisible.
+        if (d === null && o.assets > 0 && o.assets <= 5) {
+          const sources = db
+            .prepare(
+              `SELECT DISTINCT a.logical_id, a.path FROM candidates c
+                 JOIN assets a ON a.id = c.asset_id
+                WHERE c.schema_scope = ? AND c.schema_pointer = ? LIMIT 3`,
+            )
+            .all(f.assetType, f.pointer) as unknown as {
+            logical_id: string;
+            path: string;
+          }[];
+          for (const s of sources) {
+            process.stdout.write(`      from ${s.logical_id}  ${s.path}\n`);
+          }
+        }
         // Above the enum threshold the values are not stored, so the line simply
         // vanished -- no list, no count, no caveat, while a neighbouring field
         // with 33 values printed all of them. Two agents independently read the
@@ -1033,13 +1342,53 @@ export async function cmdDescribe(
         // most to them: MaterialQuantity/ItemId (1,194 uses) and
         // ApplyEffectInteraction/EffectId (123 uses).
         if (o.values === null && o.cardinality > 0 && d?.enumValues == null) {
+          // Says that --limit cannot help, because it cannot: values above the
+          // enum threshold are never stored, so there is nothing for a larger
+          // limit to reveal. An agent tested --limit 10, 500 and 1000 and got
+          // identical output, reasonably reading that as the flag being ignored.
           process.stdout.write(
-            `    ${formatCount(o.cardinality)} distinct values -- too many to list. ` +
-              `Use 'refs <id>' to ask the\n    reverse question: which assets name a ` +
-              `particular one.\n`,
+            `    ${formatCount(o.cardinality)} distinct values -- more than this index\n` +
+              `    keeps. They are not stored, so --limit cannot show them. To ask the\n` +
+              `    reverse question -- which assets name a particular one -- use\n` +
+              `    'refs <id>'.\n`,
           );
         }
       } else if (container && args.field !== undefined) {
+        // A union FIELD gets the same treatment a union TYPE does. `describe
+        // Interaction` lists its 102 branches and the value selecting each, but
+        // `describe ItemDropList --field Container` said only "(container)" and
+        // never mentioned that `Type` picks Single or Multiple -- structure that
+        // was recoverable only by fetching a real asset.
+        const branches = db
+          .prepare(
+            `SELECT ref_scope, discriminator_property, discriminator_values
+               FROM schema_fields WHERE asset_type = ? AND json_pointer = ?
+                AND ref_scope IS NOT NULL`,
+          )
+          .get(assetType, f.pointer) as Record<string, unknown> | undefined;
+        // A SINGLE-target crossing gets named too. `describe BlockType --field
+        // Farming` printed a bare "(container)" and never mentioned
+        // common:FarmingData, so the only way across that boundary was to guess
+        // the type name from a lexical search and notice the resemblance.
+        const targets = scopes((branches?.["ref_scope"] as string | null) ?? null);
+        if (targets.length === 1) {
+          process.stdout.write(
+            `    continues in ${targets[0]} -- hytale-atlas describe ${targets[0]}\n`,
+          );
+        } else if (targets.length > 1) {
+          // Only a real union gets the branch table. Printing it for a single
+          // target produced "one of 1 shapes, chosen by 'Type'" above one row
+          // whose discriminator column read '?' -- a choice that does not exist.
+          const values = String(branches?.["discriminator_values"] ?? "")
+            .split(" ")
+            .filter(Boolean);
+          const property = (branches?.["discriminator_property"] as string | null) ?? "Type";
+          process.stdout.write(`    one of ${targets.length} shapes, chosen by '${property}':\n`);
+          const width = Math.max(...values.map((v) => v.length), 8);
+          for (const [i, target] of targets.entries()) {
+            process.stdout.write(`      ${(values[i] ?? "?").padEnd(width)}  ${target}\n`);
+          }
+        }
         // Absence here means nothing, and saying nothing invited the opposite
         // reading: a sibling container that HAD been used as a string reference
         // showed usage, so this one looked genuinely unused, and
@@ -1134,27 +1483,28 @@ export async function cmdUndocumented(args: {
     // sentence and exited 0, and `search-schema` sends people here specifically
     // to firm up a negative -- so a typo returned a confident, wrong answer.
     if (args.type !== undefined) {
-      const declared = Number(
-        (
-          db
-            .prepare("SELECT count(*) AS n FROM schema_fields WHERE asset_type = ?")
-            .get(args.type) as Record<string, unknown>
-        )["n"],
-      );
+      // From the shared operation, not a second inline copy of the query. The
+      // copy that used to live here counted the empty-pointer TYPE row, so this
+      // header said "declares 9 fields" above a `describe` listing 8 -- the exact
+      // drift the api layer exists to prevent, reintroduced by hand.
+      const declared = declaredCount(db, args.type);
+      const extra = undeclaredObserved(db, args.type);
       if (declared === 0) {
-        const bare = args.type.includes(":") ? args.type.slice(args.type.indexOf(":") + 1) : null;
-        const alternatives = (
-          db
-            .prepare(
-              `SELECT DISTINCT asset_type FROM schema_fields
-                WHERE asset_type LIKE '%:' || ?1 OR asset_type = ?2
-                ORDER BY asset_type LIMIT 5`,
-            )
-            .all(args.type, bare ?? " none") as unknown as { asset_type: string }[]
-        ).map((a) => a.asset_type);
+        // The shared suggester, not a third inline copy of half of it. This one
+        // kept only the exact-respelling half, so `undocumented FarmingBlock`
+        // gave up where `describe FarmingBlock` reaches common:FarmingData.
+        const alternatives = typeAlternatives(db, args.type);
+        const carriedByType = assetsOfType(db, args.type);
         process.stderr.write(
-          `No type '${args.type}' in the schema.\n` +
-            (alternatives.length > 0
+          (carriedByType > 0
+            ? `'${args.type}' is a real asset type (${formatCount(carriedByType)} assets) ` +
+              `but the schema declares no fields for it, so nothing here can be\n` +
+              `unused or documented.\n`
+            : `No type '${args.type}' in the schema.\n`) +
+            // Suggestions only when the name really did not resolve. Offering
+            // "did you mean" under a sentence that just confirmed the type is
+            // real invites the reader to correct a spelling that was right.
+            (carriedByType === 0 && alternatives.length > 0
               ? `Did you mean:\n` + alternatives.map((a) => `  ${a}\n`).join("")
               : `Try: hytale-atlas search-schema "${args.type}"\n`),
         );
@@ -1166,7 +1516,15 @@ export async function cmdUndocumented(args: {
           `'${args.type}' declares ${formatCount(declared)} fields and every one of ` +
             `them appears in at least one vanilla asset.\n` +
             `Nothing here is unused. (The type exists -- this is a real negative, ` +
-            `not a name that failed to resolve.)\n`,
+            `not a name that failed to resolve.)\n` +
+            // Both numbers are right and the pair still read as an off-by-one,
+            // which is how a blind trial filed it. `describe` unions the observed
+            // layer; this command counts only what the schema declares.
+            (extra > 0
+              ? `'describe ${args.type}' lists ${formatCount(declared + extra)} rows: ` +
+                `${formatCount(extra)} more that the corpus uses but the schema never ` +
+                `declares.\n`
+              : ""),
         );
         return 0;
       }

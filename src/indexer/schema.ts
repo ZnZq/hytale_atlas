@@ -1,5 +1,6 @@
 import type { Database } from "../db/open.ts";
 import { setMeta } from "../db/open.ts";
+import { joinValues } from "../db/values.ts";
 import type { AssetTypeInfo, GeneratedSchemaSet } from "../sources/schema-doc.ts";
 import { expandIdentifiers, normalizeSearchText } from "../util/text.ts";
 
@@ -181,7 +182,9 @@ export function ingestSchemas(db: Database, set: GeneratedSchemaSet): SchemaInge
     let ftsRows = 0;
 
     for (const field of set.fields) {
-      const enumValues = field.enumValues === null ? null : field.enumValues.join(" ");
+      // A declared enum can contain spaces too, so it uses the same encoding
+      // as the observed lists rather than a second, space-joined convention.
+      const enumValues = field.enumValues === null ? null : joinValues(field.enumValues);
       insField.run(
         field.assetType,
         field.pointer,

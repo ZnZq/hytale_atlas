@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { looksMangled, normalizeFieldPointer } from "../query/schema.ts";
 import { detectInstallation, detectProject } from "../sources/detect.ts";
 import {
   cmdBench,
@@ -11,6 +12,7 @@ import {
   cmdIndex,
   cmdSearch,
   cmdSearchSchema,
+  cmdTypes,
   cmdUndocumented,
   indexSummary,
 } from "./commands.ts";
@@ -45,13 +47,17 @@ const USAGE = `hytale-atlas — unofficial local index of Hytale assets
   hytale-atlas index           Build the corpus index (cached globally, ~40s)
   hytale-atlas search <query>  Search assets in any indexed locale
   hytale-atlas get <id>        Effective definition, with the parent chain resolved
-                               (the only high-token command). Identifiers are NOT
+                               (high-token, though undocumented is larger). IDs are NOT
                                unique across types -- add --type <Type> to choose.
+  hytale-atlas types           Every asset type, how many assets carry it, how
+                               many fields the schema declares, and where its
+                               files live
   hytale-atlas describe <Type> Schema for a type: declared and observed layers.
                                Shared types need their namespace: 'common:ItemTool',
                                not 'ItemTool'. Add --field <pointer> for one field,
-                               which also prints its full description and every
-                               observed value.
+                               which also prints its full description, and its observed
+                               values when the index kept them -- above 40 distinct it
+                               stores the count only, and says so.
   hytale-atlas search-schema <q>  Where a capability lives. A miss is reported as
                                evidence, not proof: the index is lexical.
   hytale-atlas bench [id]      Crafting benches; with an id, what it crafts
@@ -80,14 +86,20 @@ Options
   --dry-run                    Print the command that would run, and exit
   --keep <path>                Keep generated schema files instead of discarding
   --schema <path>              Use an already-generated schema directory
-  --field <pointer>            Single field for describe, e.g. --field /Tool/Speed
+  --field <pointer>            Single field for describe, e.g. --field /Quality.
+                               It does not cross a $ref: /Tool is a crossing into
+                               common:ItemTool, so ask describe common:ItemTool
+                               --field Speed instead
                                (the leading slash is optional, and helps: some
                                shells rewrite a leading slash into a path)
-  --type <Type>                Disambiguate 'get' when several assets share a name
+  --type <Type>                Narrow to one asset type. Works on 'get', 'search'
+                               and 'refs'; identifiers are not unique across types
   --raw                        'get' prints the effective JSON and nothing else
   --limit <n>                  Result cap. Defaults: search 20, search-schema 20,
-                               describe 60, undocumented 40, bench 200. Every one
-                               of them says so when it truncates.
+                               describe 60, refs 40, undocumented 40, bench 200.
+                               Every one says so when it truncates. It does NOT
+                               lift the ceiling on a field's observed values --
+                               those are not stored above it.
   --set <path>                 Evaluation set (default docs/evaluation/search-phrases.json)
   -h, --help                   This message
 `;
@@ -258,7 +270,15 @@ async function cmdStatus(args: Args): Promise<number> {
   const tier3 = project.kind !== "none";
 
   const tiers = [tier1 && "1", tier2 && "2", tier3 && "3"].filter(Boolean).join(" + ");
-  lines.push(`Tier:        ${tiers || "none — no sources found"}`);
+  // Spelled out. A bare "Tier: 1 + 2" was reported by three blind trials as
+  // undefined anywhere in the tool, and one read it as partial coverage -- the
+  // most plausible place a missing locale could have been hiding. It is about
+  // which SOURCES are available, not about how much of the corpus was read.
+  lines.push(`Tier:        ${tiers || "none — no sources found"}  (which sources are available)`);
+  lines.push(
+    `             1 = Assets.zip  2 = + the game's schema generator  ` +
+      `3 = + a project here`,
+  );
   if (tier1 && !tier2) {
     lines.push("             schema answers unavailable; pass --jar to enable tier 2");
   }
@@ -294,8 +314,12 @@ function main(): number | Promise<number> {
   if (args.flags.has("mcp")) {
     process.stderr.write(
       "The MCP server is not implemented yet, and --mcp does nothing.\n" +
+        // The list omitted search-lang and refs, which between them answered
+        // half of every blind trial -- an under-report of the tool's own surface
+        // printed as though it were the whole of it.
         "Everything it would expose is reachable from this CLI meanwhile:\n" +
-        "  search, get, describe, search-schema, bench, undocumented\n",
+        "  status, search, search-lang, get, refs, describe, search-schema,\n" +
+        "  bench, undocumented, eval\n",
     );
     return 2;
   }
@@ -344,6 +368,19 @@ function main(): number | Promise<number> {
         process.stderr.write("usage: hytale-atlas search-schema <query>\n");
         return 2;
       }
+      // The same shell rewriting that mangles `--field /Foo` mangles a positional
+      // `/Foo` too, and only the flag was checked. `search-schema "/Set"` arrived
+      // as `C:/Program Files/Git/Set` and was reported as a genuine miss, with the
+      // hazard documented only for --field.
+      if (looksMangled(query)) {
+        const repaired = normalizeFieldPointer(query);
+        process.stderr.write(
+          `note: your shell rewrote "${query}".\n` +
+            `      Searching for "${repaired.replace(/^\//, "")}" instead. ` +
+            `Quote it or drop the leading slash.\n`,
+        );
+        return cmdSearchSchema(repaired.replace(/^\//, ""), opts(args));
+      }
       return cmdSearchSchema(query, opts(args));
     }
     case "bench":
@@ -368,6 +405,8 @@ function main(): number | Promise<number> {
       // The positional was accepted and then dropped, so `undocumented ItemToolSpec`
       // returned the whole unscoped corpus and looked like an answer.
       return cmdUndocumented({ ...opts(args), ...(args.rest[0] ? { type: args.rest[0] } : {}) });
+    case "types":
+      return cmdTypes(opts(args));
     case "eval":
       return cmdEval(opts(args));
     case "generate-schema":
@@ -377,10 +416,17 @@ function main(): number | Promise<number> {
       // Non-zero on purpose: a caller scripting against this must not read
       // "not implemented" as success, and --help lists both under the same
       // heading so the two agree.
+      // Each gets its OWN remediation. Both shared `clean`'s, so every one of
+      // five blind trials asked "is my pack valid?" and was told how to delete a
+      // cache -- advice for a different question, printed with full confidence.
       process.stderr.write(
         `'${args.command}' is not implemented yet -- see 'hytale-atlas --help'.\n` +
-          `The index lives under the path 'hytale-atlas status' prints; ` +
-          `deleting that directory is the manual equivalent of 'clean'.\n`,
+          (args.command === "validate"
+            ? `Nothing checks a pack yet. What exists meanwhile: 'describe <Type>' for what a\n` +
+              `field may legally hold, and 'refs <id>' for whether an id you wrote resolves\n` +
+              `to anything at all.\n`
+            : `The index lives under the path 'hytale-atlas status' prints; ` +
+              `deleting that directory is the manual equivalent of 'clean'.\n`),
       );
       return 2;
     default:
@@ -423,6 +469,17 @@ function opts(args: Args) {
     ...(args.flags.has("dry-run") ? { dryRun: true } : {}),
     ...(args.flags.has("raw") ? { raw: true } : {}),
   };
+}
+
+// Piping into a reader that closes early -- `| head`, `| grep -q` -- makes the
+// next write fail with EPIPE, which Node reports as an unhandled crash complete
+// with a stack trace. Exiting quietly is what every other CLI does, and a stack
+// trace where a shell pipeline ended reads as a bug in the tool.
+for (const stream of [process.stdout, process.stderr]) {
+  stream.on("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EPIPE") process.exit(0);
+    throw err;
+  });
 }
 
 /** Usage errors exit 2 and print only their message; anything else is a fault. */

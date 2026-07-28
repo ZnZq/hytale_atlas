@@ -144,7 +144,7 @@ Probed with questions a pack author would actually ask.
 | ~~"How is field X normally used?"~~ | **Answered** — `describe_schema` has its observed layer: occurrences, distinct assets, cardinality, resolved target types. |
 | "Which animation plays for X?" | 6 736 `.blockyanim` files are indexed as opaque files. No type declares them, and nothing parses them. |
 | "What does this UI screen contain?" | 135 `.ui` files are a bespoke DSL (`@ColorDefault = #ffffff;`, `$Sounds = "Sounds.ui";`), not JSON. Unparsed. |
-| "What does this *interaction* do?" | `RootInteraction./Interactions/*` is a union whose branches are inline objects rather than `$ref`s, so the reader does not see it and 1 689 observations sit unjoined. Blocks right-click behaviour questions — `OPEN-QUESTIONS.md` **Q20**. |
+| ~~"What does this *interaction* do?"~~ | **Answered** — `RootInteraction./Interactions/*` declares `-> Interaction` and is used in 1 230 assets; `Interaction` itself is a 102-branch union and `describe Interaction` names every branch with the `Type` value that selects it. What unblocked it: the root-union hop, the declared `hytaleSchemaTypeField` discriminator, and following `/Parent` for the 152 assets that inherit their `Type`. |
 | Anything about worldgen | 20 202 assets remain untyped — `Server/World` and `Server/Prefabs` have no codec-backed type, in the JAR either. |
 
 ---
@@ -251,12 +251,36 @@ Two rules that look right and are not:
   `Multip`. Longest-**prefix** matching, shortest name first, is correct in both
   directions.
 
-Current state: **630 of 2 005 observed pointers** join a declared field, across
-**247 types** (was 108). The remaining tail is characterised in
-`OPEN-QUESTIONS.md` **Q20** — inline (non-`$ref`) union branches in
-`RootInteraction`, a 56-branch union with no `Type` in `ScriptedBrushAsset`, and
-543 rows of genuine recursion in `common:DensityTerrainAsset` that will never join
-at a fixed depth.
+### Declared/observed join: 31.4 % → **89 %**
+
+Three further mechanisms, each found only because a blind agent asked a question
+the index could not answer:
+
+**The discriminator is declared, not inferred.** `hytaleSchemaTypeField` —
+`{property, values[]}`, positionally aligned with the `anyOf` branches — appears
+244 times across 35 files. The property is `Type` (229), `Id` (14) or `Op` (1).
+Two heuristics were built to reconstruct what the schema states outright; both
+were deleted. The marker is easy to miss for the same reason `hytaleAssetRef` was
+missed twice: it is a *sibling* of the `hytale` block, not a member of it.
+
+**Root-level unions get a hop.** `Interaction.json` is 102 branches and no fields
+of its own, so a corpus pointer under it rebases onto the branch first and only
+then matches. Applied at the start of alignment and again after each rebase.
+
+**Discriminators are inherited.** 152 of 1 341 `Interaction` assets declare only
+`/Parent`; their `Type` lives in the parent, up to 8 hops away.
+
+Current state: **2 457 of 2 774 observed fields** join a declared one (**89 %**).
+The remaining tail is characterised in `OPEN-QUESTIONS.md` **Q20** — a 56-branch
+union with no `Type` in `ScriptedBrushAsset`, and 543 rows of genuine recursion in
+`common:DensityTerrainAsset` that will never join at a fixed depth.
+
+One class of bug is worth recording on its own. The discriminator map was keyed by
+a concatenation built with `\0` on the write side and read with a space on the
+read side: **all 21 439 lookups missed while both maps were correctly populated**,
+and the only symptom was a counter reading zero. A named `discriminatorKey()`
+builder used by both sides is the fix. Invisible characters do not survive review
+by eye.
 
 ### Blind-agent trial: the whole surface, exercised by someone who knows nothing
 

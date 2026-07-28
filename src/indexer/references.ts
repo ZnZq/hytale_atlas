@@ -208,6 +208,7 @@ export function resolveCandidates(db: Database): ResolveResult {
          AND c.json_pointer = '/Parent' AND a.id <> c.asset_id
     `);
 
+
     // Localization: the reference is an explicit field naming a real key, so this
     // is observed rather than derived.
     // `role` (name/description/...) is the pointer's last segment. Deriving it in
@@ -271,13 +272,18 @@ export function resolveCandidates(db: Database): ResolveResult {
     db.exec(`
       INSERT INTO edges (src, dst, dst_kind, kind, json_pointer, confidence)
       SELECT c.asset_id, a.id, 'asset', 'REFERENCES', c.json_pointer,
+             -- GLOB, not LIKE. SQLite's LIKE folds ASCII case, so '%Id' also
+             -- matched /Solid, /Fluid, /TransformFluid and /SpreadFluid: 5 292
+             -- edges were promoted to 'medium' under a legend that reads "the
+             -- field name follows a reference convention". /Material/Solid
+             -- follows no such convention -- it is the word 'solid'.
              CASE
-               WHEN c.json_pointer LIKE '%Id'
-                 OR c.json_pointer LIKE '%/Set'
-                 OR c.json_pointer LIKE '%/Model'
-                 OR c.json_pointer LIKE '%/BlockType'
-                 OR c.json_pointer LIKE '%/BlockTypes/%'
-                 OR c.json_pointer LIKE '%/BlockSets/%' THEN 'medium'
+               WHEN c.json_pointer GLOB '*Id'
+                 OR c.json_pointer GLOB '*/Set'
+                 OR c.json_pointer GLOB '*/Model'
+                 OR c.json_pointer GLOB '*/BlockType'
+                 OR c.json_pointer GLOB '*/BlockTypes/*'
+                 OR c.json_pointer GLOB '*/BlockSets/*' THEN 'medium'
                ELSE 'low'
              END
         FROM candidates c
@@ -313,8 +319,12 @@ export function resolveCandidates(db: Database): ResolveResult {
 
     // Mark candidates that named something identifier-shaped but matched nothing.
     db.exec(`
+      -- Never over the stronger marker. This UPDATE had no guard, so it
+      -- overwrote every dangling = 2 row set moments earlier and the count of
+      -- 'the schema says this points at an X named N, and no X is named N'
+      -- came out as 1.
       UPDATE candidates SET dangling = 1
-       WHERE value_kind = 'string' AND lower(raw_value) NOT IN ('none','default','null','true','false','any','all') AND raw_value GLOB '[A-Za-z]*[_A-Za-z0-9]*'
+       WHERE dangling = 0 AND value_kind = 'string' AND lower(raw_value) NOT IN ('none','default','null','true','false','any','all') AND raw_value GLOB '[A-Za-z]*[_A-Za-z0-9]*'
          AND raw_value NOT LIKE '% %'
          AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.logical_id = candidates.raw_value)
          AND NOT EXISTS (SELECT 1 FROM lang_keys l WHERE l.key = candidates.raw_value)

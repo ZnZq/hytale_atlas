@@ -1,4 +1,5 @@
 import type { Database } from "../db/open.ts";
+import { splitValues } from "../db/values.ts";
 import { buildRelaxedMatchExpressions } from "../util/text.ts";
 
 /**
@@ -93,6 +94,16 @@ export interface DeclaredLayer {
   readonly defaultValue: string | null;
   /** The default was a non-finite literal, meaning *unset* rather than null. */
   readonly defaultUnset: boolean;
+  /**
+   * The single value this field must hold, for a union branch's discriminator.
+   *
+   * Distinct from `enumValues`, which on those fields lists every value the
+   * union as a whole allows. Printing the union's list as `legal:` directly
+   * under "must be set to the constant value 'Crafting'" invited the reader to
+   * pick any of the four -- and picking another selects a different schema
+   * shape, so the very next field they set would be wrong.
+   */
+  readonly typeConstant: string | null;
   /** Complete legal set, when the schema declares one. */
   readonly enumValues: readonly string[] | null;
   readonly title: string | null;
@@ -128,9 +139,8 @@ export interface FieldDescription {
   readonly observed: ObservedLayer | null;
 }
 
-function splitList(value: unknown): string[] | null {
-  return typeof value === "string" && value.length > 0 ? value.split(" ").filter(Boolean) : null;
-}
+/** One decoder for both writers, so the two cannot drift apart again. */
+const splitList = splitValues;
 
 interface FieldRow {
   asset_type: string;
@@ -140,6 +150,7 @@ interface FieldRow {
   default_value: string | null;
   default_unset: number | null;
   enum_values: string | null;
+  type_constant: string | null;
   observed_values: string | null;
   title: string | null;
   description: string | null;
@@ -158,6 +169,7 @@ function toDescription(row: FieldRow): FieldDescription {
     row.title === null &&
     row.description === null &&
     row.enum_values === null &&
+    row.type_constant === null &&
     row.reference_target === null
       ? null
       : {
@@ -165,6 +177,7 @@ function toDescription(row: FieldRow): FieldDescription {
           optional: row.optional === 1,
           defaultValue: row.default_value,
           defaultUnset: row.default_unset === 1,
+          typeConstant: row.type_constant,
           enumValues: splitList(row.enum_values),
           title: row.title,
           description: row.description,
@@ -209,13 +222,19 @@ export function describeSchema(
   const rows = db
     .prepare(
       `WITH p(json_pointer) AS (
-              SELECT json_pointer FROM schema_fields WHERE asset_type = ?1
+              -- The empty pointer is the TYPE row, not a field: it carries the
+              -- root union branches and the type-level mergesProperties marker.
+              -- Once those rows existed for every type, describe printed a
+              -- nameless leading row and its count ran one ahead of
+              -- undocumented for 996 types.
+              SELECT json_pointer FROM schema_fields
+               WHERE asset_type = ?1 AND json_pointer <> ''
               UNION
               SELECT json_pointer FROM field_stats   WHERE asset_type = ?2
             )
        SELECT ?1 AS asset_type, p.json_pointer,
               sf.declared_type, sf.optional, sf.default_value, sf.default_unset,
-              sf.enum_values, coalesce(sf.observed_values, fs.observed_values) AS observed_values,
+              sf.enum_values, sf.type_constant, coalesce(sf.observed_values, fs.observed_values) AS observed_values,
               sf.title, sf.description,
               sf.reference_target, sf.inherits_property, sf.merges_properties,
               fs.count, fs.of_total, fs.cardinality, fs.target_types

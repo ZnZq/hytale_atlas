@@ -146,7 +146,12 @@ export function assetIdFromPath(path: string): string {
 export interface LoadedLang {
   readonly catalog: LangCatalog;
   /** Per-file parsed entries, kept so the caller can persist them without re-reading. */
-  readonly files: readonly { locale: string; entries: ReadonlyMap<string, string> }[];
+  readonly files: readonly {
+    locale: string;
+    /** The file's stem, which is the root an asset prefixes when referencing. */
+    root: string;
+    entries: ReadonlyMap<string, string>;
+  }[];
 }
 
 /** Reads every `.lang` file in the archive exactly once. */
@@ -159,14 +164,14 @@ export async function loadLangCatalog(archive: AssetArchive): Promise<LoadedLang
     : new Map<string, string>();
 
   const catalog = new LangCatalog({ fallbacks });
-  const files: { locale: string; entries: ReadonlyMap<string, string> }[] = [];
+  const files: { locale: string; root: string; entries: ReadonlyMap<string, string> }[] = [];
 
   for (const entry of langEntries) {
     const locale = localeFromPath(entry.path);
     if (locale === null) continue; // fallback.lang is a locale map, not a locale
     const entries = parseLang(await archive.readText(entry.path));
     catalog.add(locale, entries);
-    files.push({ locale, entries });
+    files.push({ locale, root: basename(entry.path, extname(entry.path)), entries });
   }
   return { catalog, files };
 }
@@ -197,12 +202,12 @@ export async function buildSearchIndex(
 
     let langKeys = 0;
     const insLang = db.prepare(
-      "INSERT INTO lang_keys (pack_id, key, locale, value) VALUES (1,?,?,?)" +
+      "INSERT INTO lang_keys (pack_id, key, locale, value, root) VALUES (1,?,?,?,?)" +
         " ON CONFLICT (pack_id, key, locale) DO UPDATE SET value = excluded.value",
     );
-    for (const { locale, entries } of langFiles) {
+    for (const { locale, root, entries } of langFiles) {
       for (const [key, value] of entries) {
-        insLang.run(key, locale, value);
+        insLang.run(key, locale, value, root);
         langKeys++;
       }
     }
