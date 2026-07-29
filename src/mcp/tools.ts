@@ -4,6 +4,8 @@ import {
   typesOp,
   assetsDeclaringField,
   countAssetsDeclaringField,
+  packDefinitions,
+  declarerSampleSize,
   assetsOfType,
   benchIdExists,
   benchOp,
@@ -247,6 +249,17 @@ export async function callTool(
   args: Record<string, unknown>,
 ): Promise<Result<unknown>> {
   const { db } = ctx;
+  // A malformed `limit` is REPORTED, not swallowed. `count` maps anything
+  // invalid to undefined, which the operations then replace with their default,
+  // so `limit: 0` returned a full page and `limit: "20"` returned the default --
+  // in both cases indistinguishable from a request that named no limit at all.
+  // The CLI has rejected exactly these since the day `--limit 0` printed
+  // "No matches." for a query with dozens; the lesson never crossed to MCP.
+  if (args["limit"] !== undefined && count(args, "limit") === undefined) {
+    return miss(
+      `'limit' takes a positive whole number, not ${JSON.stringify(args["limit"])}.`,
+    );
+  }
   const limit = count(args, "limit");
 
   switch (name) {
@@ -305,7 +318,28 @@ export async function callTool(
       const needsChoice = resolved.caveats.some(
         (c) => c.code === "shadowed" || c.code === "contested-packs",
       );
-      if (resolved.value === null && !needsChoice) {
+      // The pack names a client must choose between belong in the payload, not
+      // only in a sentence. This branch returned `value: null` with the choices
+      // spelled out in prose and in CLI syntax -- `--pack "Endgame&QoL"` -- so an
+      // MCP client following this project's own advice ("the machine-actionable
+      // form is value and the caveat codes") had to regex a shell command out of
+      // an English paragraph to learn what to pass. Enrichment by composition,
+      // the same shape `missOf` uses.
+      if (needsChoice) {
+        return {
+          ...resolved,
+          value: {
+            found: false,
+            reason: `'${id}' is defined by more than one pack -- pass 'pack' to choose.`,
+            packs: packDefinitions(db, id, type).map((d) => ({
+              pack: d.pack,
+              vanilla: d.kind === "vanilla",
+              path: d.path,
+            })),
+          },
+        };
+      }
+      if (resolved.value === null) {
         return missOf(resolved, {
           reason: benchIdExists(db, id)
             ? `'${id}' is a bench id, not an asset. Call 'bench' with it.`
@@ -358,7 +392,8 @@ export async function callTool(
       // agent trying to establish whether ANY vanilla item emits light while
       // worn was handed "7 of 93" with no way to page -- it said so, and gave up
       // on the question. A sample nobody can widen is a wall, not a sample.
-      const rows = limit ?? 7;
+      // The same rule the rendered text uses, not a second one.
+      const rows = declarerSampleSize(limit);
       let clipped = 0;
       const enriched = described.value.fields.map((f) => {
         const broken = brokenRefsFor(db, type, f.pointer);

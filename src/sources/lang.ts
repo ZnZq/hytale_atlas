@@ -42,7 +42,30 @@ const REFERENCE_ROOTS: readonly string[] = ["server", "common"];
  * `SubtitleKey`, `NameTranslationKey` — so an allowlist of fields would miss most
  * of them.
  */
-const REFERENCE_PATTERN = /^(?:server|common)\.[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$/;
+const REFERENCE_PATTERN = new RegExp(
+  // `[.]` rather than an escaped dot: this is a template literal, where a
+  // lone backslash is dropped silently. Written the usual way, the dots
+  // became "any character" and `serverXitemsYname` passed as a translation
+  // reference. A character class needs no escape and cannot be mangled.
+  `^(?:${REFERENCE_ROOTS.join("|")})[.][A-Za-z0-9_]+(?:[.][A-Za-z0-9_]+)+$`,
+);
+
+/**
+ * The same prefix rule in SQL, for the LOCALIZED_BY edge join.
+ *
+ * Built from `REFERENCE_ROOTS` rather than written out again. The hand-written
+ * twin used `substr(value, 8)` for both roots -- correct only because "server"
+ * and "common" happen to be the same length, so a root of any other length would
+ * have silently cut the key in the wrong place. The comment above notes that
+ * "common" is accepted on an assumption that is NOT verified; a rule flagged as
+ * uncertain is the last one that should exist in two places.
+ */
+export function referenceKeySql(column: string): string {
+  const arms = REFERENCE_ROOTS.map(
+    (root) => `WHEN ${column} LIKE '${root}.%' THEN substr(${column}, ${root.length + 2})`,
+  );
+  return `CASE ${arms.join(" ")} ELSE ${column} END`;
+}
 
 export function isTranslationReference(value: string): boolean {
   return REFERENCE_PATTERN.test(value);

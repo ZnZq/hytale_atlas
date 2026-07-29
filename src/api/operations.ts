@@ -7,7 +7,9 @@ import {
   type FieldDescription,
   describeSchema,
   findUndocumented,
+  containerSql,
   isContainer,
+  scalarSql,
   looksMangled,
   normalizeFieldPointer,
   pointersLike,
@@ -56,7 +58,12 @@ export interface OpenOptions {
 }
 
 /** Resolves and opens the frozen index, or explains precisely why it cannot. */
-export async function openIndex(options: OpenOptions = {}): Promise<Database> {
+export async function openIndex(
+  options: OpenOptions = {},
+  // `status` reports ON a broken index, so it must be able to open one. Nothing
+  // that ANSWERS questions should.
+  allowIncomplete = false,
+): Promise<Database> {
   const { path: dbPath } = await resolveDbPath(options);
   if (dbPath === null) {
     throw new Error("Assets.zip not found. Set HYTALE_ROOT, or pass an explicit path.");
@@ -64,7 +71,25 @@ export async function openIndex(options: OpenOptions = {}): Promise<Database> {
   if (!existsSync(dbPath)) {
     throw new Error(`No index yet. Build it first.\n  expected: ${dbPath}`);
   }
-  return openDatabase(dbPath, { readOnly: true });
+  const db = openDatabase(dbPath, { readOnly: true });
+  if (allowIncomplete) return db;
+  // The readiness check existed and guarded only `status` and the MCP bootstrap
+  // -- never the path that answers questions. An interrupted `index` leaves
+  // assets with zero edges, and `search`, `get`, `refs` and `describe` all read
+  // that happily and answer with confidence. Detecting a half-built index is
+  // worth nothing if the commands that would be wrong about it never ask.
+  const state = pipelineState(db);
+  if (state !== "ready") {
+    db.close();
+    throw new Error(
+      (state === "incomplete"
+        ? "The index is INCOMPLETE -- a previous 'index' run did not finish."
+        : "The index was built by an older pipeline and is STALE.") +
+        `\nAnswers from it would be wrong in ways nothing here can flag.` +
+        `\nRun: hytale-atlas index --force\n  database: ${dbPath}`,
+    );
+  }
+  return db;
 }
 
 function count(db: Database, sql: string, ...params: unknown[]): number {
@@ -715,16 +740,6 @@ export function packLookup(db: Database): (logicalId: string) => AssetPack | nul
   return (logicalId) => (stmt.get(logicalId) as AssetPack | undefined) ?? null;
 }
 
-/** The third-party packs among a set of identifiers, for the caveat. */
-export function thirdPartyPacks(db: Database, ids: readonly string[]): string[] {
-  const of = packLookup(db);
-  const names = new Set<string>();
-  for (const id of ids) {
-    const pack = of(id);
-    if (pack !== null && pack.kind !== "vanilla") names.add(pack.name);
-  }
-  return [...names].sort();
-}
 
 export async function getAssetOp(
   db: Database,
@@ -1014,7 +1029,7 @@ export function unionOf(db: Database, assetType: string, pointer = ""): UnionTyp
     )
     .get(assetType, pointer) as Record<string, unknown> | undefined;
   if (row === undefined) return null;
-  const split = (v: unknown): string[] => String(v ?? "").split(" ").filter(Boolean);
+  const split = (v: unknown): string[] => scopes(v == null ? null : String(v));
   const branches = split(row["ref_scope"]);
   if (branches.length < 2) return null;
   return {
@@ -1130,6 +1145,24 @@ const MAX_CROSSING_HOPS = 8;
  * the markers this answer used, so it can only be complete if the rows and the
  * legend are produced together.
  */
+/** The limit `describe` applies when the caller names none. */
+export const DESCRIBE_LIMIT = 60;
+
+/**
+ * How many declaring assets a `describe` answer shows.
+ *
+ * One rule, because there were two. The rendered text sized this list from the
+ * RESOLVED limit (60 by default) while the MCP layer sized its structured
+ * `declaredBy.shown` from the RAW argument (7 when absent) -- so one response
+ * listed 59 assets in prose, reported 7 in data, and attached a truncation
+ * caveat that was false for the prose it shipped with. A client trusting the
+ * structured half, which is what this project tells clients to do, undercounted
+ * a list already in front of it.
+ */
+export function declarerSampleSize(limit?: number): number {
+  return Math.max((limit ?? DESCRIBE_LIMIT) - 1, 6);
+}
+
 function describeField(
   db: Database,
   assetType: string,
@@ -1209,9 +1242,10 @@ function describeField(
     // Widened by the caller's limit, like every other list here. The fixed seven
     // could not be raised at all, so "which assets actually do this" -- the one
     // question a single-field view exists to answer -- had a ceiling of six.
-    const declarers = assetsDeclaringField(db, assetType, f.pointer, Math.max(limit, 7));
+    const size = declarerSampleSize(limit);
+    const declarers = assetsDeclaringField(db, assetType, f.pointer, size + 1);
     if (declarers.length > 0) {
-      const shown = declarers.slice(0, Math.max(limit - 1, 6));
+      const shown = declarers.slice(0, size);
       // The TOTAL is counted, not inferred from the observed-value count: a
       // container has no observed values, so `observed.assets` reported zero
       // declarers for fields 67 assets plainly declare.
@@ -1353,7 +1387,7 @@ function describeField(
       // Only a real union gets the branch table. Printing it for a single target
       // produced "one of 1 shapes, chosen by 'Type'" above one row whose
       // discriminator column read '?' -- a choice that does not exist.
-      const values = String(branches?.["discriminator_values"] ?? "").split(" ").filter(Boolean);
+      const values = scopes((branches?.["discriminator_values"] as string | null) ?? null);
       const property = (branches?.["discriminator_property"] as string | null) ?? "Type";
       out += `    one of ${targets.length} shapes, chosen by '${property}':\n`;
       const width = Math.max(...values.map((v) => v.length), 8);
@@ -1386,10 +1420,7 @@ function describeLegend(db: Database, markers: Set<string>): string {
   // lines up says can NEVER appear in the observed layer, so counting them as
   // unmatched inflates the doubt roughly forty-fold. A blind trial discounted a
   // load-bearing `unused` field on the strength of it.
-  const SCALAR = `ifnull(declared_type,'') NOT LIKE '%object%'
-        AND ifnull(declared_type,'') NOT LIKE '%array%'
-        AND ifnull(declared_type,'') NOT LIKE '$ref%'
-        AND ifnull(declared_type,'') NOT IN ('anyOf','oneOf')`;
+  const SCALAR = scalarSql("declared_type");
   const joined = markers.has("unused")
     ? one(`SELECT count(*) AS n FROM schema_fields sf
             WHERE sf.json_pointer <> '' AND ${SCALAR}
@@ -1450,7 +1481,7 @@ export function describeOp(db: Database, request: DescribeRequest): Result<Descr
   // returns a wall of UNDECLARED observations -- 213 of them for `Interaction`,
   // every one with `declared === null`. The CLI intercepts this and prints the
   // branches; this copy did not, and `unionOf` sat thirty lines above it unused.
-  const limit = request.limit ?? 60;
+  const limit = request.limit ?? DESCRIBE_LIMIT;
   const field = request.field === undefined ? undefined : normalizeFieldPointer(request.field);
   // A union at the TYPE when no field was asked for, at the FIELD when one was.
   // The field case returned null unconditionally, so the legal operands of a
@@ -1941,10 +1972,7 @@ export function undocumentedOp(db: Database, type: string | undefined, limit = 4
     db,
     `SELECT count(*) AS n FROM schema_fields sf
       WHERE sf.json_pointer <> ''
-        AND (ifnull(sf.declared_type,'') LIKE '%object%'
-          OR ifnull(sf.declared_type,'') LIKE '%array%'
-          OR ifnull(sf.declared_type,'') LIKE '$ref%'
-          OR ifnull(sf.declared_type,'') IN ('anyOf','oneOf'))
+        AND ${containerSql("sf.declared_type")}
         ${type === undefined ? "" : "AND sf.asset_type = ?"}`,
     ...(type === undefined ? [] : [type]),
   );

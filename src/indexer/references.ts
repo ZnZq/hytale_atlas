@@ -1,4 +1,6 @@
 import type { Database } from "../db/open.ts";
+import { referenceKeySql } from "../sources/lang.ts";
+import { escapeSegment } from "../util/json.ts";
 
 /**
  * Pass 2 — candidate extraction and reference resolution.
@@ -102,10 +104,6 @@ const MAX_PATH_CANDIDATE_LENGTH = 192;
  */
 function isPathLike(value: string): boolean {
   return value.includes("/") && value.includes(".") && !value.includes(" ");
-}
-
-function escapeSegment(segment: string): string {
-  return segment.replace(/~/g, "~0").replace(/\//g, "~1");
 }
 
 /**
@@ -268,10 +266,7 @@ export function resolveCandidates(db: Database): ResolveResult {
       SELECT c.asset_id, l.id, 'lang_key', 'LOCALIZED_BY', c.json_pointer, 'high'
         FROM candidates c
         JOIN lang_keys l
-          ON l.key = CASE
-               WHEN c.raw_value LIKE 'server.%' THEN substr(c.raw_value, 8)
-               WHEN c.raw_value LIKE 'common.%' THEN substr(c.raw_value, 8)
-               ELSE c.raw_value END
+          ON l.key = ${referenceKeySql("c.raw_value")}
        WHERE c.value_kind = 'string' AND ${NOT_NOISE}
          AND c.raw_value LIKE '%.%.%' AND l.locale = 'en-US'
     `);

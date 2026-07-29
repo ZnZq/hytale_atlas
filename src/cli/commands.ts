@@ -24,6 +24,7 @@ import {
   declaredCount,
   describeOp,
   getAssetOp,
+  openIndex,
   undeclaredObserved,
   langOp,
   refsAnyOp,
@@ -335,14 +336,17 @@ export async function cmdInit(args: InitArgs = {}): Promise<number> {
   ];
   for (const problem of problems) lines.push(`PROBLEM: ${problem}`);
   if (problems.length > 0) lines.push("");
-  // Mods are selected here but not yet indexed, and saying so is the difference
-  // between a file that looks broken and one that is simply ahead of the
-  // indexer. Removing this line is part of landing multi-pack indexing.
+  // Multi-pack indexing has landed, so the note that used to sit here -- "selected
+  // but not yet part of the index" -- became a false statement about the tool the
+  // moment `openPacks` started feeding these archives to `buildSearchIndex`. It
+  // survived the landing because nothing fails when prose goes stale. What a
+  // reader needs now is the consequence, not a status report.
   if (selection.packs.length > 0) {
     lines.push(
-      "Note: mod packs are selected but not yet part of the index -- the indexer",
-      "      still reads the vanilla archive only. The cache key already accounts",
-      "      for them, so no stale index will be served once that lands.",
+      `Note: ${selection.packs.length} mod pack(s) will be indexed alongside the game.`,
+      "      Answers will include their assets, and where a pack overrides a",
+      "      vanilla asset the pack's version is the one you get. No pack code",
+      "      is executed -- the archives are read as zip files.",
       "",
     );
   }
@@ -772,103 +776,19 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
   return 0;
 }
 
-function openFrozen(assets: string | undefined, patchline: string | undefined) {
-  const archivePath = assets ?? detectInstallation(patchline)?.assetsZip;
-  if (!archivePath) throw new Error("Assets.zip not found; run with --assets <path>.");
-  return archivePath;
-}
-
-async function frozenDb(assets: string | undefined, patchline: string | undefined) {
-  const { path: dbPath } = await resolveDbPath({
-    ...(assets === undefined ? {} : { assets }),
-    ...(patchline === undefined ? {} : { patchline }),
-  });
-  if (dbPath === null) {
-    throw new Error("Assets.zip not found. Set HYTALE_ROOT, or pass --assets <path>.");
-  }
-  if (!existsSync(dbPath)) {
-    throw new Error(`No index yet. Run 'hytale-atlas index' first.\n  expected: ${dbPath}`);
-  }
-  return openDatabase(dbPath, { readOnly: true });
-}
-
 /**
- * One line describing the cached index, read from the cache itself.
- *
- * `status` used to print a constant -- "not built (indexing is not implemented
- * yet)" -- which stayed there long after indexing worked. Every other command
- * contradicted it, so the first thing a new user saw was the tool calling itself
- * broken. Never state capability from a literal when the artifact can be read.
+ * Delegates rather than repeating. This used to be a second copy of `openIndex`
+ * -- same resolve, same existence check, different error wording -- and it drifted
+ * in the way that matters: `openIndex` grew a readiness gate and this one did not,
+ * so every CLI read command would answer from a half-built index.
  */
-export async function indexSummary(
-  assets: string | undefined,
-  patchline: string | undefined,
-): Promise<string> {
-  const { path: dbPath } = await resolveDbPath({
+async function frozenDb(assets: string | undefined, patchline: string | undefined) {
+  return openIndex({
     ...(assets === undefined ? {} : { assets }),
     ...(patchline === undefined ? {} : { patchline }),
   });
-  if (dbPath === null) return "no Assets.zip, nothing to index";
-  if (!existsSync(dbPath)) return "not built — run 'hytale-atlas index'";
-
-  const db = openDatabase(dbPath, { readOnly: true });
-  try {
-    const one = (sql: string): number =>
-      Number((db.prepare(sql).get() as Record<string, unknown> | undefined)?.["n"] ?? 0);
-    const assets = one("SELECT count(*) AS n FROM assets");
-    const typed = one("SELECT count(*) AS n FROM assets WHERE type IS NOT NULL");
-    // Excludes the empty-pointer TYPE rows, like every other count in the
-    // project. `status` said 18,396 while `undocumented` said 17,400 about the
-    // same thing, and the 996 difference is types, not fields.
-    const declared = one(
-      "SELECT count(*) AS n FROM schema_fields WHERE json_pointer <> ''",
-    );
-    const joined = one(
-      `SELECT count(*) AS n FROM field_stats fs
-        JOIN schema_fields sf ON sf.asset_type = fs.asset_type
-                             AND sf.json_pointer = fs.json_pointer`,
-    );
-    const observed = one("SELECT count(*) AS n FROM field_stats");
-    // Coverage is stated because --help promised it and the line did not carry
-    // it, and because both numbers are the honest caveat on every negative this
-    // tool gives: an unjoined field reads as unused when it may only be unmatched.
-    return (
-      `${formatCount(assets)} assets ` +
-      `(${formatCount(typed)} typed, ${Math.round((typed / Math.max(assets, 1)) * 100)}%), ` +
-      `${formatCount(declared)} schema fields, ` +
-      `${formatCount(one("SELECT count(*) AS n FROM edges"))} edges` +
-      // Named, not counted. "5 locales" led an agent to work out which ones by
-      // inference and conclude Ukrainian was absent -- it is not. The tool said
-      // nothing false; its silence produced a false belief, which is the same
-      // failure wearing a different hat.
-      // ...and attributed. Naming them was not enough: an unlabelled list of five
-      // codes on a counts line reads as the set of languages the GAME ships, and
-      // a blind trial asked to support "every language the game ships" could
-      // neither confirm nor refute it. These are the locales found in the
-      // archive that was indexed -- which is a fact about this archive.
-      `\n             locales in this Assets.zip: ${(
-        db.prepare("SELECT DISTINCT locale FROM lang_keys ORDER BY locale").all() as unknown as {
-          locale: string;
-        }[]
-      )
-        .map((r) => r.locale)
-        .join(", ")}\n` +
-      `             observed/declared join: ${formatCount(joined)} of ` +
-      `${formatCount(observed)} observed fields match a declared one ` +
-      `(${Math.round((joined / Math.max(observed, 1)) * 100)}%)\n` +
-      // Named, not just numbered. `epoch 1` appeared beside a path with nothing
-      // saying what it counts -- a reader deciding whether their index is stale
-      // had to guess between rebuild generation, cache format and schema version.
-      `             epoch ${one("SELECT CAST(ifnull(value,'0') AS INTEGER) AS n FROM meta WHERE key = 'epoch'")}` +
-      ` -- one per index build; rebuild with 'index --force'\n` +
-      `             ${dbPath}`
-    );
-  } catch (err) {
-    return `unreadable (${err instanceof Error ? err.message : String(err)})`;
-  } finally {
-    db.close();
-  }
 }
+
 
 export async function cmdSearch(
   query: string,
@@ -897,7 +817,10 @@ export async function cmdGet(
   logicalId: string,
   args: { assets?: string; patchline?: string; raw?: boolean; type?: string; pack?: string },
 ): Promise<number> {
-  const archivePath = openFrozen(args.assets, args.patchline);
+  // One resolver, one wording. This used to call a near-copy of `resolveArchive`
+  // that threw a differently-phrased error for the same condition, so fixing the
+  // message in one place left the other stale.
+  const archivePath = await resolveArchive(args.assets, args.patchline);
   const db = await frozenDb(args.assets, args.patchline);
   const archive = await AssetArchive.open(archivePath);
 

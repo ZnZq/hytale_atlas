@@ -502,7 +502,6 @@ function opts(args: Args) {
     ...(args.flags.has("force") ? { force: true } : {}),
     ...(args.flags.has("yes") ? { yes: true } : {}),
     ...(args.flags.has("dry-run") ? { dryRun: true } : {}),
-    ...(args.flags.has("yes") ? { yes: true } : {}),
     ...(args.flags.has("raw") ? { raw: true } : {}),
   };
 }
