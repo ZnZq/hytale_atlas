@@ -166,6 +166,8 @@ export interface LoadedLang {
     locale: string;
     /** The file's stem, which is the root an asset prefixes when referencing. */
     root: string;
+    /** The archive path, which is the file a modder actually edits. */
+    path: string;
     entries: ReadonlyMap<string, string>;
   }[];
 }
@@ -180,14 +182,24 @@ export async function loadLangCatalog(archive: AssetArchive): Promise<LoadedLang
     : new Map<string, string>();
 
   const catalog = new LangCatalog({ fallbacks });
-  const files: { locale: string; root: string; entries: ReadonlyMap<string, string> }[] = [];
+  const files: {
+    locale: string;
+    root: string;
+    path: string;
+    entries: ReadonlyMap<string, string>;
+  }[] = [];
 
   for (const entry of langEntries) {
     const locale = localeFromPath(entry.path);
     if (locale === null) continue; // fallback.lang is a locale map, not a locale
     const entries = parseLang(await archive.readText(entry.path));
     catalog.add(locale, entries);
-    files.push({ locale, root: basename(entry.path, extname(entry.path)), entries });
+    files.push({
+      locale,
+      root: basename(entry.path, extname(entry.path)),
+      path: entry.path,
+      entries,
+    });
   }
   return { catalog, files };
 }
@@ -235,12 +247,14 @@ export async function buildSearchIndex(
 
     let langKeys = 0;
     const insLang = db.prepare(
-      "INSERT INTO lang_keys (pack_id, key, locale, value, root) VALUES (1,?,?,?,?)" +
-        " ON CONFLICT (pack_id, key, locale) DO UPDATE SET value = excluded.value",
+      "INSERT INTO lang_keys (pack_id, key, locale, value, root, source_path) " +
+        "VALUES (1,?,?,?,?,?)" +
+        " ON CONFLICT (pack_id, key, locale) DO UPDATE SET value = excluded.value, " +
+        "source_path = excluded.source_path",
     );
-    for (const { locale, root, entries } of langFiles) {
+    for (const { locale, root, path, entries } of langFiles) {
       for (const [key, value] of entries) {
-        insLang.run(key, locale, value, root);
+        insLang.run(key, locale, value, root, path);
         langKeys++;
       }
     }

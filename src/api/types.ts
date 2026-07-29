@@ -48,7 +48,13 @@ export type CaveatCode =
   /** This index stores identifiers and names, not field values. */
   | "names-not-values"
   /** Found by identifier only: these rows are not in the search index. */
-  | "identifier-only";
+  | "identifier-only"
+  /** The pointer misses here because the schema tree continues in another type. */
+  | "crosses-into"
+  /** Recipes require this bench id, but no asset provides a station carrying it. */
+  | "bench-undeclared"
+  /** The caller's pointer was rewritten before it arrived; this is what was read. */
+  | "pointer-repaired";
 
 /**
  * Every operation returns its answer alongside what qualifies it.
@@ -74,6 +80,39 @@ export interface Result<T> {
 
 export function ok<T>(value: T, caveats: readonly Caveat[] = []): Result<T> {
   return { value, caveats };
+}
+
+/**
+ * The caveat lines that close a rendered answer.
+ *
+ * `text` is SELF-CONTAINED: it ends with these, so a front end writes one string
+ * and cannot forget the qualifications. The CLI used to render them from its own
+ * copy of this loop, and `status` -- the first command moved across -- silently
+ * stopped printing its join ratio because the new path wrote `text` and the old
+ * loop was where the caveats had lived.
+ *
+ * The structured `caveats` travel alongside regardless: a model reads codes, a
+ * person reads lines.
+ */
+export function caveatBlock(caveats: readonly Caveat[]): string {
+  if (caveats.length === 0) return "";
+  return `\n${caveats
+    .map((c) => `${c.code === "truncated" ? "... " : "note: "}${c.message}\n`)
+    .join("")}`;
+}
+
+/**
+ * Shortens a description to fit one line, visibly.
+ *
+ * Silent truncation is the failure this surface keeps making in different
+ * costumes: this cut a field description mid-word with no ellipsis, and the cut
+ * sentence was the one that would have settled whether an area-mining primitive
+ * exists. Lives here rather than in the CLI because the operations render now,
+ * and a second copy is how the two front ends drifted in the first place.
+ */
+export function clip(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
 
 /** Builds a result that carries its own rendering. */
@@ -161,17 +200,33 @@ export const caveat = {
   // times in a single sentence; and comparing `total` -- a count of assets --
   // against the length of a list of types put ", and more" after a complete
   // list whenever several assets shared one type.
+  // `chosen` and the hidden COUNT were both CLI-only prose. The command printed
+  // "Showing the Item one" and "... and 453 more; add --type <Type> to choose",
+  // while the caveat -- the half that reaches a model -- said only "and more".
+  // Which asset you are actually looking at is the entire point of the sentence.
   ambiguousIdentifier: (
     id: string,
     types: readonly string[],
     total = types.length,
     distinctTypes = types.length,
+    chosen?: string,
   ): Caveat => ({
     code: "ambiguous-identifier",
     message:
       `${total} assets are named '${id}' (${types.join(", ")}` +
-      (distinctTypes > types.length ? ", and more" : "") +
-      ").",
+      (distinctTypes > types.length ? `, and ${distinctTypes - types.length} more type(s)` : "") +
+      ")." +
+      (chosen === undefined ? "" : ` Showing the ${chosen} one.`) +
+      // The remedy has to fit the case. `Entry.node` names 461 assets and every
+      // one is untyped, so "add --type <Type> to choose" -- printed unconditionally
+      // -- was advice that cannot work, offered at the exact moment a reader most
+      // needs a way forward.
+      (distinctTypes > 1
+        ? ` Add --type <Type> to choose (the 'type' argument over MCP).`
+        : total > 1
+          ? ` All ${total} are ${chosen ?? types[0] ?? "the same type"}, so a type filter ` +
+            `cannot narrow this -- tell them apart by path.`
+          : ""),
   }),
   /**
    * Stated over the side the reader's question is on.
@@ -186,14 +241,50 @@ export const caveat = {
   // join puts a field INTO the results -- it is presence that the ratio
   // undermines, not absence. `status` reports the ratio itself, where the
   // reader's risk is trusting the observed layer to be complete.
+  /**
+   * What the tool actually READ, when that is not what the caller typed.
+   *
+   * A JSON Pointer starts with '/', which MSYS rewrites into a Windows path, so
+   * `--field /BlockType` arrives as `C:/Program Files/Git/BlockType` and an agent
+   * concluded the flag was entirely broken. The CLI printed this on stderr and
+   * the served value carried a bare `repairedFrom` with nothing to say what it
+   * meant -- a field a blind trial listed among the markers it had to guess at.
+   */
+  pointerRepaired: (asTyped: string, asRead: string): Caveat => ({
+    code: "pointer-repaired",
+    message:
+      `The pointer arrived as '${asTyped}' -- your shell rewrote it -- and was read ` +
+      `as '${asRead}'. Under Git Bash, write it without the leading slash.`,
+  }),
+  /**
+   * The one sentence that turns a dead end into a route.
+   *
+   * Not "no such field": the field tree crosses into another type at a `$ref`,
+   * and the remainder is declared THERE. Every agent of round 22 hit this on a
+   * different pointer and four of the five concluded the capability was absent
+   * from the game.
+   */
+  crossesInto: (pointer: string, into: string, continueAt: string): Caveat => ({
+    code: "crosses-into",
+    message:
+      `'${pointer}' is a reference, so the tree continues in '${into}' -- the rest of ` +
+      `your pointer is declared there, not here. Describe '${into}' with field ` +
+      `'${continueAt}'.`,
+  }),
+  // Each side qualifies absence from the OTHER one, and the two were crossed:
+  // `status` quoted 2 457 of 2 875 observed fields -- 85% -- under a sentence
+  // about absence from the observed layer, whose real ratio is 2 457 of 17 400
+  // declared, 14%. The number read as high confidence while the sentence it
+  // qualified was six times shakier than that.
   joinIncomplete: (joined: number, total: number, side: "observed" | "declared"): Caveat => ({
     code: "join-incomplete",
     message:
       `Only ${joined} of ${total} ${side} fields are matched by the other layer` +
       (side === "declared"
-        ? ", so a field can appear here because the join missed it rather than because " +
-          "vanilla never uses it."
-        : ", so absence from the observed layer is weaker evidence than it reads as."),
+        ? ", so a field can be missing from the observed layer because the join missed it " +
+          "rather than because vanilla never uses it."
+        : ", so a field vanilla uses can be missing from the declared layer, and absence " +
+          "there is weaker evidence than it reads as."),
   }),
   // `unsearchable` is measured, not written down. A hard-coded 497 was true of
   // one archive on one day, and this file has already had to correct several

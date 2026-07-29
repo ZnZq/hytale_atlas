@@ -21,7 +21,7 @@
  * makes a bump orphan old databases rather than silently reusing one whose shape
  * no longer matches.
  */
-export const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION = 17;
 
 /**
  * Version of the indexing PIPELINE, written to `meta.pipeline` only after every
@@ -163,6 +163,13 @@ CREATE TABLE IF NOT EXISTS lang_keys (
   -- -- and 'wordlists.runes.algas', whose root is 'wordlists', was declared a
   -- 'real miss' while server.runes.algas wrongly resolved.
   root    TEXT,
+  -- The archive path the key was read from. Derivable from root only for
+  -- Server/Languages/<locale>/server.lang; the avatar files live at
+  -- Common/Languages/<locale>/avatarCustomization/capes.lang, so a rule would be
+  -- wrong for most of them. A blind trial asked "where do the display names live
+  -- so I can add my own" and this tool could answer every half of that question
+  -- except the file, which is the half you have to edit.
+  source_path TEXT,
   UNIQUE (pack_id, key, locale)
 ) STRICT;
 

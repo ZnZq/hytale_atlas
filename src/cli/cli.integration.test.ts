@@ -195,7 +195,10 @@ test("a pointer mangled by the shell is recovered and explained", opts, () => {
   // and the flag could never work. An agent concluded it was entirely broken.
   const { out, code } = run("describe", "Item", "--field", "C:/Program Files/Git/BlockType");
   assert.equal(code, 0);
-  assert.match(out, /shell rewrote the pointer/);
+  // The explanation is a CAVEAT now, not a bespoke stderr note, so the served
+  // answer carries it too -- `repairedFrom` used to arrive as a bare field a
+  // blind trial listed among the markers it had to guess at.
+  assert.match(out, /your shell rewrote it/);
   assert.match(out, /^\/BlockType/m);
 });
 
@@ -791,7 +794,9 @@ test("bench reports the true total and says when it truncated", opts, () => {
     Number(/([\d,]+) craftable here/.exec(out)?.[1]?.replace(/,/g, "") ?? "0");
   assert.ok(total(capped.out) > 200, `still reporting the cap: ${total(capped.out)}`);
   assert.equal(total(capped.out), total(full.out), "the total moved with the limit");
-  assert.match(capped.out, /showing the first 200 recipes/);
+  // Wording is the shared `truncated` caveat's, which now carries the total as
+  // well -- the point of the assertion is that the cap is announced at all.
+  assert.match(capped.out, /showing the first 200 of \d+ recipes/i);
   assert.doesNotMatch(full.out, /showing the first/);
 });
 
@@ -1532,7 +1537,7 @@ test("the bench list honours --limit", opts, () => {
     out.split("\n").filter((l) => /^\S+ +\S+ +\d+/.test(l)).length;
   const capped = run("bench", "--limit", "3");
   assert.equal(rows(capped.out), 3, `--limit ignored:\n${capped.out}`);
-  assert.match(capped.out, /showing the first 3 benches/);
+  assert.match(capped.out, /showing the first 3 of \d+ benches/i);
   assert.ok(rows(run("bench", "--limit", "100").out) > 3);
 });
 
@@ -1628,7 +1633,10 @@ test("an ambiguity note counts assets, not the sample it prints", opts, () => {
     Number(note[1]!.replace(/,/g, "")) > 8,
     "still reporting the sample size: " + note[1],
   );
-  assert.match(out, /and [\d,]+ more; add --type/);
+  // The remedy must FIT: `Entry.node` names 461 assets and every one is untyped,
+  // so "add --type to choose" is advice that cannot work. Asserted as "there is
+  // a way forward", which is what the sentence is for.
+  assert.match(out, /add --type <Type> to choose|cannot narrow this/);
 });
 
 test("the refs total counts the same rows the list shows", opts, () => {
@@ -1760,6 +1768,17 @@ test("a --field miss names the crossing when the nearest pointer has one", opts,
   // ...and the command it hands back actually answers.
   const followed = run("describe", crossing[2]!, "--field", crossing[3]!);
   assert.equal(followed.code, 0, `the suggested command failed: ${followed.out}`);
+
+  // A CHAINED crossing, because the case above resolves in one hop and so could
+  // not see the general defect: `/Tool/Specs/*/Power` -- the example in the tool's
+  // own documentation -- goes Item -> common:ItemTool -> ItemToolSpec, and a
+  // suggestion that stopped at the first hop failed when followed.
+  const deep = run("describe", "Item", "--field", "Tool/Specs/*/Power");
+  assert.equal(deep.code, 1);
+  const chained = /continues in (\S+) -- hytale-atlas describe (\S+) --field (\S+)/.exec(deep.out);
+  assert.ok(chained !== null, "a two-hop crossing named no continuation");
+  const arrived = run("describe", chained[2]!, "--field", chained[3]!);
+  assert.equal(arrived.code, 0, `the suggested command failed: ${arrived.out}`);
 });
 
 test("an enum field says which of its legal values vanilla uses", opts, () => {
@@ -2303,9 +2322,12 @@ test("the ambiguity note lists distinct types, not one entry per asset", async (
     const r = ops.refsOp(db, "Entry.node", undefined, 2);
     const note = r.caveats.find((c) => c.code === "ambiguous-identifier");
     assert.ok(note !== undefined, "no ambiguity caveat");
+    // Bounded, not exactly one: the sentence now also states the remedy, and when
+    // every candidate shares a type it names that type again to say a type filter
+    // cannot narrow the list. What this guards is the ONE-PER-ASSET blowup.
     const untyped = note.message.match(/untyped/g) ?? [];
-    assert.equal(untyped.length, 1, `type repeated ${untyped.length} times: ${note.message}`);
-    assert.ok(note.message.length < 200, `note is ${note.message.length} chars long`);
+    assert.ok(untyped.length <= 2, `type repeated ${untyped.length} times: ${note.message}`);
+    assert.ok(note.message.length < 300, `note is ${note.message.length} chars long`);
   } finally {
     db.close();
   }

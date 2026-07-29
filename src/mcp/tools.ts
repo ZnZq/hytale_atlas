@@ -2,24 +2,20 @@ import type { Database } from "../db/open.ts";
 import { AssetArchive } from "../sources/archive.ts";
 import type { AssetLoader } from "../query/asset.ts";
 import {
-  assetTypesOp,
   typesOp,
   assetsDeclaringField,
+  countAssetsDeclaringField,
   assetsOfType,
-  assetsOfTypeList,
-  benchDeclaredBy,
   benchIdExists,
   benchOp,
   benchesOp,
   brokenRefsFor,
   declaredCount,
   describeOp,
-  fileRefsOp,
   getAssetOp,
   identify,
   langOp,
-  nearestFields,
-  refsOp,
+  refsAnyOp,
   searchAssetsOp,
   searchSchemaOp,
   statusOp,
@@ -28,11 +24,9 @@ import {
   undeclaredObserved,
   undocumentedOp,
   valueLinkFor,
-  valueOccurrencesWithoutEdges,
-  valueUsage,
 } from "../api/operations.ts";
 import { isContainer, normalizeFieldPointer } from "../query/schema.ts";
-import type { Caveat, Result } from "../api/types.ts";
+import { type Caveat, type Result, caveat } from "../api/types.ts";
 
 /**
  * The MCP surface: one tool per question, each returning an operation's own
@@ -82,8 +76,19 @@ const object = (
   additionalProperties: false,
 });
 
+// Two arguments, because one description was wrong on four of the five tools
+// that carried it. A shared definition is not an asset type: nothing carries
+// `common:ItemTool`, so offering it as the example here invited a call that
+// cannot return anything -- `types(type: 'common:ItemTool')` answers "the schema
+// declares this type but no vanilla asset carries it", which reads as a fact
+// about vanilla when it is structural. Only `describe` reads the schema and so
+// only `describe` accepts them.
 const TYPE_ARG = str(
-  "Asset type, e.g. 'Item'. Shared definitions need their namespace: 'common:ItemTool'.",
+  "Asset type, e.g. 'Item'. This is the type an ASSET carries; shared definitions " +
+    "('common:...') name no asset and belong to `describe` instead.",
+);
+const SCHEMA_TYPE_ARG = str(
+  "Asset type, e.g. 'Item', or a shared definition with its namespace: 'common:ItemTool'.",
 );
 const LIMIT_ARG = int("Maximum rows. The answer says so when it truncates.");
 
@@ -131,7 +136,7 @@ export const TOOLS: readonly ToolDefinition[] = [
       "accepts) and OBSERVED (what vanilla actually does). Pass `field` for one pointer, " +
       "which also returns its broken references, value link and declaring assets.",
     inputSchema: object(
-      { type: TYPE_ARG, field: str("JSON pointer, e.g. '/Tool/Specs/*/Power'."), limit: LIMIT_ARG },
+      { type: SCHEMA_TYPE_ARG, field: str("JSON pointer, e.g. '/Tool/Specs/*/Power'."), limit: LIMIT_ARG },
       ["type"],
     ),
   },
@@ -169,7 +174,7 @@ export const TOOLS: readonly ToolDefinition[] = [
     description:
       "Fields the schema declares that appear in zero vanilla assets. A negative, and " +
       "qualified as one: the result carries the declared-side join ratio.",
-    inputSchema: object({ type: TYPE_ARG, limit: LIMIT_ARG }),
+    inputSchema: object({ type: SCHEMA_TYPE_ARG, limit: LIMIT_ARG }),
   },
 ];
 
@@ -193,6 +198,26 @@ function count(args: Record<string, unknown>, key: string): number | undefined {
  */
 function miss(reason: string, next?: Record<string, unknown>): Result<Record<string, unknown>> {
   return { value: { found: false, reason, ...(next ?? {}) }, caveats: [] };
+}
+
+/**
+ * A miss that KEEPS the operation's own rendering and caveats.
+ *
+ * Every miss here used to be re-worded locally, and every re-wording lost
+ * something the CLI said: the route across a `$ref` crossing, the reason a bench
+ * id with no station is still a bench, the rule about localization roots. The
+ * structured fields are what a model acts on; `text` is the same sentence a
+ * person would have read.
+ */
+function missOf(
+  result: Result<unknown>,
+  fields: Record<string, unknown>,
+): Result<Record<string, unknown>> {
+  return {
+    value: { found: false, ...fields },
+    caveats: result.caveats,
+    ...(result.text === undefined ? {} : { text: result.text }),
+  };
 }
 
 export interface ToolContext {
@@ -229,12 +254,12 @@ export async function callTool(
         ...(limit === undefined ? {} : { limit }),
       });
       if (result.value.kind === "miss") {
-        return miss(result.value.reason, {
+        return missOf(result, {
+          reason: result.value.reason,
           type: result.value.type,
           didYouMean: typeExists(db, result.value.type)
             ? []
             : typeAlternatives(db, result.value.type),
-          rendered: result.text,
         });
       }
       return result;
@@ -275,12 +300,12 @@ export async function callTool(
       };
       const resolved = await getAssetOp(db, id, load, type);
       if (resolved.value === null) {
-        return miss(
-          benchIdExists(db, id)
+        return missOf(resolved, {
+          reason: benchIdExists(db, id)
             ? `'${id}' is a bench id, not an asset. Call 'bench' with it.`
             : `No asset '${id}'${type === undefined ? "" : ` of type '${type}'`}.`,
-          { alsoKnownAs: identify(db, id) },
-        );
+          alsoKnownAs: identify(db, id),
+        });
       }
       return resolved;
     }
@@ -299,26 +324,53 @@ export async function callTool(
       if (described.value.fields.length === 0 && described.value.union === null) {
         const carried = assetsOfType(db, type);
         if (!typeExists(db, type) && carried === 0) {
-          return miss(`No type '${type}' in the schema.`, {
+          return missOf(described, {
+            reason: `No type '${type}' in the schema.`,
             didYouMean: typeAlternatives(db, type),
           });
         }
         if (field !== undefined) {
-          return miss(`'${type}' has no field '${normalizeFieldPointer(field)}'.`, {
-            nearestDeclared: nearestFields(db, type, normalizeFieldPointer(field)),
+          // The route out, not just the denial. `nearestDeclared` alone reads as
+          // "the field tree stops here"; `continuesIn` names the type the pointer
+          // actually continues in, and the operation's caveat says it in words.
+          return missOf(described, {
+            reason: `'${type}' has no field '${normalizeFieldPointer(field)}'.`,
+            nearestDeclared: described.value.nearestDeclared,
+            continuesIn: described.value.continuesIn,
           });
         }
-        return miss(
-          `'${type}' is a real asset type (${carried} assets) but the schema declares ` +
+        return missOf(described, {
+          reason:
+            `'${type}' is a real asset type (${carried} assets) but the schema declares ` +
             `no fields for it.`,
-        );
+        });
       }
 
       // Enrichment by COMPOSITION -- the same operations the CLI calls, not a
       // second implementation of them.
+      const rows = 7;
+      let clipped = 0;
       const enriched = described.value.fields.map((f) => {
         const broken = brokenRefsFor(db, type, f.pointer);
-        const container = isContainer(f.declared?.type ?? null);
+        // A field that HOLDS other fields, which is not the same as a field whose
+        // declared type is a union. `isContainer` answers the broader question --
+        // it is what puts the CLI's `(container)` marker on `anyOf` rows, and that
+        // marker is right -- but the note below asserts an IMPOSSIBILITY, and an
+        // `anyOf` of scalars can and does carry values: `/EffectId` arrived
+        // flagged beside its own `observed.count: 147`, and on
+        // `common:AOECircleSelector./Range` the note told a reader to disregard
+        // the seven observed values that were the only evidence of its units.
+        const container = isContainer(f.declared?.type ?? null) && f.observed === null;
+        const declarers =
+          field === undefined
+            ? null
+            : {
+                shown: assetsDeclaringField(db, type, f.pointer, rows),
+                total: countAssetsDeclaringField(db, type, f.pointer),
+              };
+        if (declarers !== null && declarers.shown.length < declarers.total) {
+          clipped = Math.max(clipped, declarers.total);
+        }
         return {
           ...f,
           // Per FIELD, because the caveat is per call. In bulk mode a container
@@ -337,7 +389,7 @@ export async function callTool(
               }
             : {}),
           ...(broken.distinct > 0 ? { brokenReferences: broken } : {}),
-          ...(field === undefined
+          ...(declarers === null
             ? {}
             : {
                 valueLink: valueLinkFor(db, type, f.pointer),
@@ -345,10 +397,7 @@ export async function callTool(
                 // against `observed.assets: 11` looked like the whole set to
                 // anything counting array lengths -- which is exactly what a
                 // machine-readable payload invites.
-                declaredBy: {
-                  shown: assetsDeclaringField(db, type, f.pointer, 7),
-                  total: f.observed?.assets ?? 0,
-                },
+                declaredBy: declarers,
               }),
         };
       });
@@ -359,48 +408,26 @@ export async function callTool(
           declaredFieldCount: declaredCount(db, type),
           observedOnlyFieldCount: undeclaredObserved(db, type),
         },
-        caveats: described.caveats,
+        // The sample is capped at seven rows and `limit` does not reach it, so
+        // the cap has to be SAID. Four agents in one round re-ran with a larger
+        // limit, got the identical seven rows, and had no way to tell a clipped
+        // list from a whole one -- one of them needed the four assets that were
+        // missing and could reach them by no call at all.
+        caveats:
+          clipped > 0
+            ? [...described.caveats, caveat.truncated(rows, "declaring assets", clipped)]
+            : described.caveats,
+        ...(described.text === undefined ? {} : { text: described.text }),
       };
     }
 
     case "refs": {
       const id = text(args, "id");
       if (id === undefined) return miss("An 'id' is required.");
-      const type = text(args, "type");
-      const asAsset = refsOp(db, id, type, limit ?? 40);
-      if (asAsset.value.targets.length > 0) {
-        const beyond = valueOccurrencesWithoutEdges(
-          db,
-          id,
-          asAsset.value.targets.map((t) => t.id),
-        );
-        return {
-          value: {
-            kind: "asset",
-            ...asAsset.value,
-            ...(beyond.occurrences > 0 ? { alsoAValueElsewhere: beyond } : {}),
-            ...(benchDeclaredBy(db, id) === null
-              ? {}
-              : { declaresBenchId: benchDeclaredBy(db, id) }),
-          },
-          caveats: asAsset.caveats,
-        };
-      }
-
-      const usage = valueUsage(db, id, limit ?? 40);
-      if (usage.occurrences > 0) {
-        return { value: { kind: "value", ...usage }, caveats: [] };
-      }
-
-      const asFile = fileRefsOp(db, id, limit ?? 40);
-      if (asFile.value.length > 0) {
-        return { value: { kind: "file", files: asFile.value }, caveats: asFile.caveats };
-      }
-      return miss(
-        `'${id}' is not an asset, carries no value, and no referenced file has that name. ` +
-          `Asset documents themselves are not in the file index.`,
-        { alsoKnownAs: identify(db, id) },
-      );
+      // Every branch -- asset, wrong type, value, file, miss -- comes from one
+      // operation now. Assembled here, each one diverged: the value branch was
+      // served with `caveats: []` and one row more than the limit asked for.
+      return refsAnyOp(db, id, text(args, "type"), limit ?? 40) as Result<unknown>;
     }
 
     case "search_schema": {
@@ -413,44 +440,21 @@ export async function callTool(
       const query = text(args, "query");
       if (query === undefined) return miss("A 'query' is required.");
       const found = langOp(db, query, limit ?? 20);
-      if (found.value.length === 0) {
-        return miss(
-          `No localization key or value matches '${query}'. Keys are stored without their ` +
-            `root: 'server.' and 'common.' are stripped automatically, any other first ` +
-            `segment is tried as a literal root. This covers the locales this index holds, ` +
-            `and matching is literal.`,
-        );
-      }
-      return found;
+      // The operation's own miss text, which explains root stripping and the
+      // literal-matching limit. This returned a paraphrase of it.
+      return found.value.length === 0
+        ? {
+            value: { found: false, reason: found.text ?? "" },
+            caveats: found.caveats,
+            ...(found.text === undefined ? {} : { text: found.text }),
+          }
+        : found;
     }
 
     case "bench": {
       const id = text(args, "id");
-      if (id === undefined) return benchesOp(db);
-      if (!benchIdExists(db, id)) {
-        const declares = benchDeclaredBy(db, id);
-        return miss(
-          declares === null
-            ? `No bench '${id}'.`
-            : `'${id}' is the asset that declares a bench, not the bench id. Use '${declares}'.`,
-          { alsoKnownAs: identify(db, id) },
-        );
-      }
-      const one = benchOp(db, id, limit ?? 200);
-      return {
-        value: {
-          ...one.value,
-          // The list view computes this and the detail view used to drop it: a
-          // bench id nothing declares looks identical to a real station.
-          declaredByAssets: db
-            .prepare(
-              `SELECT a.logical_id AS logicalId FROM bench_declarations d
-                 JOIN assets a ON a.id = d.asset_id WHERE d.bench_id = ?`,
-            )
-            .all(id) as unknown as { logicalId: string }[],
-        },
-        caveats: one.caveats,
-      };
+      if (id === undefined) return benchesOp(db, limit ?? 200) as Result<unknown>;
+      return benchOp(db, id, limit ?? 200) as Result<unknown>;
     }
 
     case "undocumented":

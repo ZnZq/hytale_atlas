@@ -293,6 +293,30 @@ function mergeInto(
 }
 
 /**
+ * Carries attribution across a fold, so `from` names where a value ULTIMATELY
+ * came from rather than which hop handed it over.
+ *
+ * The last fold alone knows only its own ancestor: without this, every field a
+ * crop gets from `Template_Crop_Block` through `Plant_Crop_Tomato_Block` would
+ * read as coming from the tomato, which is where a modder would then go looking
+ * for it. A pointer the previous pass recorded as inherited was not the parent's
+ * either, so its source is the one to keep; a pointer the parent DECLARED is the
+ * parent's, and is left alone.
+ */
+function rebase(pass: FieldOrigin[], previous: readonly FieldOrigin[]): FieldOrigin[] {
+  if (previous.length === 0) return pass;
+  const ultimate = new Map<string, string | null>();
+  for (const row of previous) {
+    if (row.via === "inherited") ultimate.set(row.pointer, row.from);
+  }
+  return pass.map((row) =>
+    row.via === "inherited" && ultimate.has(row.pointer)
+      ? { ...row, from: ultimate.get(row.pointer) ?? null }
+      : row,
+  );
+}
+
+/**
  * The type whose rules actually apply to a document.
  *
  * A root-level union declares no field of its own -- `Interaction` is 102
@@ -378,27 +402,30 @@ export async function resolveAsset(
 
   const book = buildRuleBook(db);
   const scope = root.type === null ? null : resolveScope(db, root.type, chain);
-  const origins: FieldOrigin[] = [];
+  let origins: FieldOrigin[] = [];
 
   // Fold from the most distant ancestor down to the asset itself. An untyped
   // asset has no rules to consult, so it keeps only what it declares.
+  //
+  // One array PER FOLD, not one for all of them. Every pass describes a
+  // different intermediate document, so accumulating them put each pointer in
+  // the list once per ancestor with contradictory attribution: on a chain of two,
+  // `Plant_Crop_Tomato_Block_Eternal` returned 205 rows for 120 pointers, and
+  // `/Quality` appeared both as inherited and as declared with nothing marking
+  // which one won. "What do I write myself and what do I get free" is the
+  // question a template exists to answer, so a doubled answer is no answer.
   let effective: Json = chain[chain.length - 1]!.document;
   for (let i = chain.length - 2; i >= 0; i--) {
     const layer = chain[i]!;
     const ancestor = chain[i + 1]!;
-    effective =
-      scope === null
-        ? layer.document
-        : mergeInto(
-            effective,
-            layer.document,
-            "",
-            scope,
-            book,
-            ancestor.id,
-            origins,
-            "",
-          );
+    if (scope === null) {
+      effective = layer.document;
+      origins = [];
+      continue;
+    }
+    const pass: FieldOrigin[] = [];
+    effective = mergeInto(effective, layer.document, "", scope, book, ancestor.id, pass, "");
+    origins = rebase(pass, origins);
   }
 
   return {

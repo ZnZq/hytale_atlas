@@ -341,6 +341,51 @@ test("origins say where each field came from", async () => {
   database.close();
 });
 
+/**
+ * INVARIANT: one row per pointer, whatever the chain's length.
+ *
+ * `origins` was one array shared by every fold, and each fold describes a
+ * DIFFERENT intermediate document -- so on a chain of two, every pointer the
+ * middle ancestor touched appeared twice with opposite attribution. Measured on
+ * the corpus: `Plant_Crop_Tomato_Block_Eternal` returned 205 rows for 120
+ * pointers, `/Quality` both `inherited` and `declared`, nothing marking which
+ * won.
+ *
+ * The test above this one could not see it: it builds a Map from the rows, and a
+ * Map keeps the last write. That is why this asserts on the ARRAY.
+ */
+test("a longer chain does not duplicate origins, and attribution reaches past the parent", async () => {
+  const database = db();
+  const r = await resolveAsset(
+    database,
+    "Child",
+    loader({
+      Child: { Parent: "Middle", Icon: "child.png" },
+      Middle: { Parent: "Root", MaxDurability: 250 },
+      Root: { Icon: "root.png", MaxDurability: 100, Recipe: { Input: [] } },
+    }),
+  );
+  assert.deepEqual(r!.parentChain, ["Middle", "Root"]);
+
+  const pointers = r!.origins.map((o) => o.pointer);
+  assert.equal(
+    pointers.length,
+    new Set(pointers).size,
+    `a pointer is attributed twice: ${pointers.join(", ")}`,
+  );
+
+  const at = (p: string) => r!.origins.find((o) => o.pointer === p)!;
+  // Declared by the asset itself, and it wins -- the value proves which row is real.
+  assert.equal(at("/Icon").via, "declared");
+  assert.equal((r!.effective as Record<string, unknown>)["Icon"], "child.png");
+  // Handed over by the parent, which declared it.
+  assert.equal(at("/MaxDurability").from, "Middle");
+  // Handed over by the parent, which did NOT declare it. Naming the middle here
+  // would send a modder to a file that does not contain the field.
+  assert.equal(at("/Recipe").from, "Root");
+  database.close();
+});
+
 test("a missing parent is reported, not thrown", async () => {
   const database = db();
   const r = await resolveAsset(database, "Child", loader({ Child: { Parent: "Gone" } }));
