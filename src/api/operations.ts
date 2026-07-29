@@ -14,7 +14,7 @@ import {
   searchSchemaDetailed,
 } from "../query/schema.ts";
 import { type SearchHit, searchAssets } from "../query/search.ts";
-import { sourceStamp } from "../sources/archive.ts";
+import { AssetArchive, sourceStamp } from "../sources/archive.ts";
 import { detectInstallation, detectProject } from "../sources/detect.ts";
 import {
   type AtlasConfig,
@@ -364,6 +364,66 @@ export function sameNamedTypes(db: Database, logicalId: string): string[] {
       .prepare("SELECT DISTINCT type FROM assets WHERE logical_id = ? ORDER BY type")
       .all(logicalId) as unknown as { type: string | null }[]
   ).map((r) => r.type ?? "untyped");
+}
+
+/**
+ * Reads an asset's document from whichever pack actually contains it.
+ *
+ * With one archive the loader could assume it; with twenty-seven it cannot. The
+ * index knew `Cape_Master` existed and that it was an `Item`, and `get` still
+ * read the vanilla archive and found nothing -- the asset was catalogued and
+ * unreachable, which is worse than absent because every count includes it.
+ *
+ * Archives open lazily and stay open for the call: a pack's central directory
+ * costs real time on the vanilla archive, and a parent chain can cross packs
+ * (a mod's item inheriting a vanilla template is the common case).
+ *
+ * `is_effective DESC` picks the override when several packs define one id --
+ * the same row the rest of the index counts.
+ */
+export function packAssetLoader(
+  db: Database,
+  fallbackType?: string,
+): { load: AssetLoader; close: () => void } {
+  const byId = db.prepare(
+    `SELECT a.path, a.type, a.pack_id AS packId, p.path AS packPath
+       FROM assets a JOIN packs p ON p.id = a.pack_id
+      WHERE a.logical_id = ?1 AND (?2 IS NULL OR a.type = ?2)
+      ORDER BY a.is_effective DESC, a.type LIMIT 1`,
+  );
+  const open = new Map<number, Promise<AssetArchive>>();
+
+  const load: AssetLoader = async (logicalId, forType) => {
+    const row = byId.get(logicalId, forType ?? fallbackType ?? null) as
+      | { path: string; type: string | null; packId: number; packPath: string }
+      | undefined;
+    if (row === undefined) return null;
+    let pending = open.get(row.packId);
+    if (pending === undefined) {
+      pending = AssetArchive.open(row.packPath);
+      open.set(row.packId, pending);
+    }
+    try {
+      const archive = await pending;
+      return {
+        path: row.path,
+        type: row.type,
+        document: JSON.parse(await archive.readText(row.path)) as unknown,
+      };
+    } catch {
+      // A pack that vanished between indexing and reading, or a malformed
+      // document. Both are "no effective definition", which is what the caller
+      // already knows how to report.
+      return null;
+    }
+  };
+
+  return {
+    load,
+    close: () => {
+      for (const pending of open.values()) void pending.then((a) => a.close()).catch(() => {});
+    },
+  };
 }
 
 export async function getAssetOp(
@@ -2869,14 +2929,19 @@ export interface ResolvedSources {
   readonly assets: string | null;
   readonly serverJar: string | null;
   readonly patchline: string | null;
+  /** Generated schema directory, or null to fall back to the relative default. */
+  readonly schema: string | null;
   /** Where the built index lives. Null means the per-user cache directory. */
   readonly cacheDir: string | null;
   /** Third-party packs the config selects. Empty until a config asks for some. */
   readonly mods: readonly ResolvedMod[];
+  /** Standing consents the config grants. Both default to false. */
+  readonly consent: AtlasConfig["consent"];
   readonly origin: {
     readonly assets: SourceOrigin;
     readonly serverJar: SourceOrigin;
     readonly patchline: SourceOrigin;
+    readonly schema: SourceOrigin;
   };
   /** Everything wrong with the config or the paths it names. */
   readonly problems: readonly string[];
@@ -2895,7 +2960,7 @@ export interface ResolvedSources {
  * directory and must beat a guess; detection is the guess.
  */
 export function resolveSources(
-  options: { assets?: string; jar?: string; patchline?: string } = {},
+  options: { assets?: string; jar?: string; patchline?: string; schema?: string } = {},
   cwd: string = process.cwd(),
 ): ResolvedSources {
   const config = loadConfig(cwd);
@@ -2934,6 +2999,8 @@ export function resolveSources(
     config,
     assets: assets.value,
     serverJar: jar.value,
+    schema: options.schema ?? config.schema ?? null,
+    consent: config.consent,
     cacheDir: config.cacheDir,
     patchline:
       options.patchline ?? config.patchline ?? install?.patchline ?? null,
@@ -2941,6 +3008,8 @@ export function resolveSources(
     origin: {
       assets: assets.origin,
       serverJar: jar.origin,
+      schema:
+        options.schema !== undefined ? "flag" : config.schema !== null ? "config" : "none",
       patchline:
         options.patchline !== undefined
           ? "flag"
@@ -3125,6 +3194,16 @@ export async function statusOp(
   const present = (path: string | null): boolean => path !== null && existsSync(path);
   const tier1 = present(install.assetsZip);
   const tier2 = tier1 && present(install.serverJar) && present(install.bundledJava);
+  // Printed because its absence is what makes an index tier 1, and until now the
+  // only trace was one line during `index` that scrolled past.
+  const schemaDir = sources.schema;
+  lines.push(
+    `Schemas:     ${
+      schemaDir === null
+        ? "(not configured -- 'schema' in hytale-atlas.json, or --schema)"
+        : `${schemaDir}${existsSync(schemaDir) ? "" : "   MISSING"}`
+    }`,
+  );
   const tier3 = project.kind !== "none";
   const tiers = [tier1 ? 1 : 0, tier2 ? 2 : 0, tier3 ? 3 : 0].filter((n) => n > 0);
 

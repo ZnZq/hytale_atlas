@@ -1,6 +1,5 @@
 import type { Database } from "../db/open.ts";
 import { AssetArchive } from "../sources/archive.ts";
-import type { AssetLoader } from "../query/asset.ts";
 import {
   typesOp,
   assetsDeclaringField,
@@ -13,6 +12,7 @@ import {
   declaredCount,
   describeOp,
   getAssetOp,
+  packAssetLoader,
   identify,
   langOp,
   refsAnyOp,
@@ -275,30 +275,12 @@ export async function callTool(
       const id = text(args, "id");
       if (id === undefined) return miss("An 'id' is required.");
       const type = text(args, "type");
-      const archive = await ctx.openArchive();
-      const byId = db.prepare(
-        "SELECT path, type FROM assets WHERE logical_id = ?1 AND (?2 IS NULL OR type = ?2)" +
-          " ORDER BY is_effective DESC, type LIMIT 1",
-      );
-      // The loader is handed the type when resolving a PARENT, because
-      // inheritance is within a type -- the same rule the index enforces on
-      // edges. Without it a parent is chosen by identifier alone.
-      const load: AssetLoader = async (logicalId, forType) => {
-        const row = byId.get(logicalId, forType ?? type ?? null) as
-          | { path: string; type: string | null }
-          | undefined;
-        if (row === undefined) return null;
-        try {
-          return {
-            path: row.path,
-            type: row.type,
-            document: JSON.parse(await archive.readText(row.path)) as unknown,
-          };
-        } catch {
-          return null;
-        }
-      };
+      // Pack-aware: `get` used to read the vanilla archive alone, so a mod's
+      // asset was catalogued and unreachable -- the worst state, because every
+      // count still included it.
+      const { load, close } = packAssetLoader(db, type);
       const resolved = await getAssetOp(db, id, load, type);
+      close();
       if (resolved.value === null) {
         return missOf(resolved, {
           reason: benchIdExists(db, id)

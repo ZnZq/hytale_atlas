@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 /**
  * Drives the server's own schema generator.
@@ -41,6 +41,22 @@ export interface GenerateOptions {
    * should decide on a user's behalf.
    */
   readonly consent: true;
+  /**
+   * Plugin archives whose code the server will LOAD, or empty for none.
+   *
+   * `--bare` does not prevent plugin loading -- the server's own help says
+   * "Plugins will still be loaded which may not respect this flag" -- so every
+   * path here is third-party code that executes with the user's privileges.
+   * Measured: with none, only `Hytale:*` modules load and 105 schema files come
+   * out; with a mods directory, 22 plugins load and 161 files come out. The 56
+   * extra schemas exist BECAUSE the plugin code ran and registered its codecs,
+   * which is why there is no way to have them without running it.
+   *
+   * Passed as a staged directory rather than the user's own: the config can
+   * exclude packs, and handing the server the whole directory would run the ones
+   * they excluded.
+   */
+  readonly modPlugins?: readonly string[];
   /** Copy the generated schema set here instead of discarding it. */
   readonly keepAt?: string;
   readonly timeoutMs?: number;
@@ -129,6 +145,10 @@ async function generateSchemas(
     const { mkdirSync } = await import("node:fs");
     mkdirSync(workDir, { recursive: true });
 
+    // Staged, not the user's own directory. The config can exclude packs, and
+    // handing the server the real directory would load the excluded ones -- a
+    // consent given for one set, honoured for another.
+    const plugins = options.modPlugins ?? [];
     const args = [
       "-jar", serverJar,
       "--bare",
@@ -136,6 +156,15 @@ async function generateSchemas(
       "--assets", assetsZip,
       "--generate-asset-schema", outDir,
     ];
+    if (plugins.length > 0) {
+      const staged = join(root, "mods");
+      mkdirSync(staged, { recursive: true });
+      for (const p of plugins) copyFileSync(p, join(staged, basename(p)));
+      args.push("--mods", staged);
+      // One broken plugin otherwise aborts the whole run, and the user loses the
+      // schemas of the twenty that loaded fine.
+      args.push("--ignore-broken-mods");
+    }
 
     const exitCode = await new Promise<number | null>((resolve, reject) => {
       const child = spawn(java, args, { cwd: workDir, stdio: ["ignore", "pipe", "pipe"] });

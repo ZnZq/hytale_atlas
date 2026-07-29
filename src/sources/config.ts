@@ -40,6 +40,15 @@ export interface AtlasConfig {
   readonly serverJar: string | null;
   readonly patchline: string | null;
   /**
+   * Directory of generated asset schemas -- what `generate-schema` produced.
+   *
+   * Belongs here because it is the field the relative default gets wrong the
+   * moment the tool is run from somewhere else: `local/schema-release` resolved
+   * against the CWD, so indexing from a pack directory silently produced a
+   * tier-1 index with every asset untyped, and said so in one line among twenty.
+   */
+  readonly schema: string | null;
+  /**
    * Where to keep the built index. Null means the per-user cache directory.
    *
    * Worth overriding for a shared build machine, a fast scratch disk, or simply
@@ -48,6 +57,19 @@ export interface AtlasConfig {
    */
   readonly cacheDir: string | null;
   readonly mods: ModSources;
+  /**
+   * Standing answer to the one prompt that guards code execution.
+   *
+   * There is exactly one, on purpose. Indexing mod assets reads archives and
+   * runs nothing, so it asks for no consent at all -- a prompt that guards
+   * nothing teaches people to click through the prompt that guards something.
+   * This flag covers only the case where the game server LOADS mod plugins and
+   * their Java executes with the user's privileges.
+   */
+  readonly consent: {
+    /** Let the server LOAD mod plugins during schema generation. Code runs. */
+    readonly runModPlugins: boolean;
+  };
   /**
    * Anything wrong with the file, in the caller's words rather than a throw.
    *
@@ -64,8 +86,10 @@ const EMPTY: AtlasConfig = {
   assets: null,
   serverJar: null,
   patchline: null,
+  schema: null,
   cacheDir: null,
   mods: { dir: null, include: [], exclude: [] },
+  consent: { runModPlugins: false },
   problems: [],
 };
 
@@ -75,9 +99,12 @@ const KNOWN_KEYS = new Set([
   "assets",
   "serverJar",
   "patchline",
+  "schema",
   "cacheDir",
   "mods",
+  "consent",
 ]);
+const KNOWN_CONSENT_KEYS = new Set(["runModPlugins"]);
 const KNOWN_MOD_KEYS = new Set(["dir", "include", "exclude"]);
 
 /**
@@ -158,6 +185,7 @@ export function readConfig(file: string): AtlasConfig {
   const assets = asString(obj["assets"], "assets", problems);
   const serverJar = asString(obj["serverJar"], "serverJar", problems);
   const patchline = asString(obj["patchline"], "patchline", problems);
+  const schema = asString(obj["schema"], "schema", problems);
   const cacheDir = asString(obj["cacheDir"], "cacheDir", problems);
 
   let mods: ModSources = { dir: null, include: [], exclude: [] };
@@ -183,13 +211,44 @@ export function readConfig(file: string): AtlasConfig {
     }
   }
 
+  let consent = { runModPlugins: false };
+  const rawConsent = obj["consent"];
+  if (rawConsent !== undefined && rawConsent !== null) {
+    if (typeof rawConsent !== "object" || Array.isArray(rawConsent)) {
+      problems.push("'consent' must be an object with 'runModPlugins'.");
+    } else {
+      const c = rawConsent as Record<string, unknown>;
+      for (const key of Object.keys(c)) {
+        if (!KNOWN_CONSENT_KEYS.has(key)) {
+          problems.push(
+            `Unknown key 'consent.${key}'. Known keys: ${[...KNOWN_CONSENT_KEYS].join(", ")}.`,
+          );
+        }
+      }
+      const flag = (key: string): boolean => {
+        const v = c[key];
+        if (v === undefined) return false;
+        if (typeof v !== "boolean") {
+          // Never coerced. A consent read from a truthy string would be a grant
+          // the user did not write, which is the one mistake this must not make.
+          problems.push(`'consent.${key}' must be true or false; treating it as false.`);
+          return false;
+        }
+        return v;
+      };
+      consent = { runModPlugins: flag("runModPlugins") };
+    }
+  }
+
   return {
     path: file,
     assets: assets === null ? null : against(base, assets),
     serverJar: serverJar === null ? null : against(base, serverJar),
     patchline,
+    schema: schema === null ? null : against(base, schema),
     cacheDir: cacheDir === null ? null : against(base, cacheDir),
     mods,
+    consent,
     problems,
   };
 }

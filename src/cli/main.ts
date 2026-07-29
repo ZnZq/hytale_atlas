@@ -119,6 +119,7 @@ hytale-atlas init            Write hytale-atlas.json here, filled in from what
   --assets/--jar <path>      Override the archive or the server JAR
   --patchline <name>         Which install to read when several are present
   --cache-dir <path>         Where to keep the built index (default: user cache)
+  --schema <dir>             Generated asset schemas (from generate-schema)
   --mods-dir <path>          Directory to scan for packs
   --mod <path>               One pack, repeatable
   --exclude <pattern>        Filename to skip, repeatable, '*' wildcard
@@ -344,6 +345,7 @@ function main(): number | Promise<number> {
         ...(str("patchline") === undefined ? {} : { patchline: str("patchline")! }),
         ...(str("mods-dir") === undefined ? {} : { modsDir: str("mods-dir")! }),
         ...(str("cache-dir") === undefined ? {} : { cacheDir: str("cache-dir")! }),
+        ...(str("schema") === undefined ? {} : { schema: str("schema")! }),
         ...(args.lists.get("mod") === undefined ? {} : { mods: args.lists.get("mod")! }),
         ...(args.lists.get("exclude") === undefined
           ? {}

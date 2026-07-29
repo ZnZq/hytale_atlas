@@ -9,12 +9,12 @@ import { VALUE_LINKS, indexValueLinks } from "../indexer/value-links.ts";
 import { resolveCandidates } from "../indexer/references.ts";
 import { computeFieldStats } from "../indexer/stats.ts";
 import { TypeResolver, applyTypes, assetSuffixes, ingestSchemas } from "../indexer/schema.ts";
-import type { AssetLoader } from "../query/asset.ts";
 import { searchAssets } from "../query/search.ts";
 import { findUndocumented } from "../query/schema.ts";
 import { AssetArchive } from "../sources/archive.ts";
 import { detectInstallation } from "../sources/detect.ts";
 import { CONFIG_FILENAME, findConfigFile, resolveMods } from "../sources/config.ts";
+import { resolveSources } from "../api/operations.ts";
 import { TELEMETRY_DISCLOSURE, withGeneratedSchemas } from "../sources/schema-gen.ts";
 import { readGeneratedSchemas } from "../sources/schema-doc.ts";
 import {
@@ -27,6 +27,7 @@ import {
   undeclaredObserved,
   langOp,
   refsAnyOp,
+  packAssetLoader,
   searchAssetsOp,
   assetsOfType,
   searchSchemaOp,
@@ -193,6 +194,8 @@ export interface InitArgs {
   readonly modsDir?: string;
   /** Where the built index goes. Omitted means the per-user cache directory. */
   readonly cacheDir?: string;
+  /** Generated schema directory. Detected from the default when it exists. */
+  readonly schema?: string;
   readonly mods?: readonly string[];
   readonly exclude?: readonly string[];
   readonly force?: boolean;
@@ -257,6 +260,15 @@ export async function cmdInit(args: InitArgs = {}): Promise<number> {
   // location into every config file, so a later change to where caches live
   // would silently not apply to anyone who ran `init`.
   if (args.cacheDir !== undefined) config["cacheDir"] = resolve(cwd, args.cacheDir);
+  // Written ABSOLUTE whenever it can be found, because the relative default is
+  // the thing that breaks as soon as the tool runs from anywhere else.
+  const schemaDir =
+    args.schema !== undefined
+      ? resolve(cwd, args.schema)
+      : existsSync(resolve(cwd, DEFAULT_SCHEMA_DIR))
+        ? resolve(cwd, DEFAULT_SCHEMA_DIR)
+        : null;
+  if (schemaDir !== null) config["schema"] = schemaDir;
 
   const mods: Record<string, unknown> = {};
   if (modsDir !== null && existsSync(modsDir)) mods["dir"] = modsDir;
@@ -301,6 +313,7 @@ export async function cmdInit(args: InitArgs = {}): Promise<number> {
     `  Assets.zip  ${assets ?? "(none)"}`,
     `  Server JAR  ${jar ?? "(none)"}`,
     `  Patchline   ${patchline ?? "(none)"}`,
+    `  Schemas     ${schemaDir ?? "(none found -- assets will be untyped)"}`,
     `  Index at    ${
       args.cacheDir === undefined ? "(per-user cache directory)" : resolve(cwd, args.cacheDir)
     }`,
@@ -404,6 +417,58 @@ export async function cmdGenerateSchema(args: GenerateSchemaArgs): Promise<numbe
     return 1;
   }
 
+  // The mod plugins whose code the server would load. Only .jar files: a .zip
+  // pack carries assets and no code, and passing them changes nothing --
+  // measured, 9 zips produced exactly the vanilla 105 schema files and loaded
+  // zero plugins. Naming only the archives that actually execute keeps the
+  // disclosure honest about its own scope.
+  const sourcesForSchema = resolveSources({
+    ...(args.assets === undefined ? {} : { assets: args.assets }),
+    ...(args.patchline === undefined ? {} : { patchline: args.patchline }),
+    ...(args.jar === undefined ? {} : { jar: args.jar }),
+  });
+  const modPlugins = sourcesForSchema.mods
+    .map((m) => m.path)
+    .filter((p) => p.toLowerCase().endsWith(".jar"));
+
+  if (modPlugins.length > 0) {
+    // A SECOND consent, separate from the telemetry one above, because it is a
+    // different act with a different blast radius. Telemetry is data leaving the
+    // machine; this is arbitrary third-party code running on it with the user's
+    // own privileges. `--yes` does not cover it -- only an explicit
+    // `consent.runModPlugins` or an interactive yes does.
+    const consentedToRun = await askConsent({
+      ...(sourcesForSchema.consent.runModPlugins ? { granted: true } : {}),
+      disclosure: [
+        "SCHEMAS FOR MOD-DEFINED TYPES REQUIRE RUNNING THE MODS.",
+        "",
+        `The server will LOAD and EXECUTE ${modPlugins.length} plugin JAR(s):`,
+        ...modPlugins.slice(0, 10).map((p) => `  ${basename(p)}`),
+        ...(modPlugins.length > 10 ? [`  ... and ${modPlugins.length - 10} more`] : []),
+        "",
+        "This is not the same as indexing them. Indexing reads archives; this",
+        "runs their Java with your account's privileges -- filesystem, network,",
+        "everything you can do. `--bare` does NOT prevent it: the server's own",
+        "help says plugins are still loaded.",
+        "",
+        "There is no way to have these schemas without it. The extra types exist",
+        "because the plugin code registers them at runtime; nothing is sitting in",
+        "the archives waiting to be read.",
+        "",
+        "The bundled JRE is Java 25, where the in-process SecurityManager has been",
+        "removed, so there is no sandbox inside the JVM. If you do not trust every",
+        "JAR above, run this in a container or a throwaway account instead.",
+      ].join("\n"),
+      question: `Execute ${modPlugins.length} third-party plugin(s) to generate their schemas?`,
+    });
+    if (!consentedToRun) {
+      process.stdout.write(
+        "Declined. Generating vanilla schemas only -- mod-defined types will be absent.\n",
+      );
+      modPlugins.length = 0;
+    }
+  }
+
   const { path: dbPath } = await resolveDbPath({ assets: assetsZip });
   if (dbPath === null) {
     process.stderr.write("Assets.zip not found; nowhere to ingest the schemas.\n");
@@ -419,6 +484,7 @@ export async function cmdGenerateSchema(args: GenerateSchemaArgs): Promise<numbe
         assetsZip,
         java,
         consent: true,
+        ...(modPlugins.length > 0 ? { modPlugins } : {}),
         ...(args.keep !== undefined ? { keepAt: args.keep } : {}),
         // The generator emits hundreds of routine warnings -- 437 of 444 lines on
         // the release corpus -- so echoing anything matching /WARN/ buries the
@@ -479,8 +545,6 @@ export interface IndexArgs {
   /** Directory produced by `--generate-asset-schema`. */
   readonly schema?: string;
   readonly dryRun?: boolean;
-  /** Pre-grants the third-party pack disclosure, e.g. for CI. */
-  readonly yes?: boolean;
 }
 
 /**
@@ -501,6 +565,7 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
   const { path: dbPath, sources: selected } = await resolveDbPath({
     ...(args.assets === undefined ? {} : { assets: args.assets }),
     ...(args.patchline === undefined ? {} : { patchline: args.patchline }),
+    ...(args.schema === undefined ? {} : { schema: args.schema }),
   });
   if (dbPath === null) {
     process.stderr.write("Assets.zip not found. Set HYTALE_ROOT, or pass --assets <path>.\n");
@@ -543,27 +608,25 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
   // Third-party packs the config selected. None without a config, so the plain
   // `npx hytale-atlas` path is untouched.
   if (selected.mods.length > 0) {
-    // Consent, because the index stops describing the GAME and starts describing
-    // the game plus whatever these archives say. No third-party code runs -- they
-    // are read as zip files, never executed -- and the disclosure says so,
-    // because "indexing mods" and "running mods" are what a cautious reader will
-    // conflate, and only one of them is happening here.
-    const consented = await askConsent({
-      ...(args.yes === true ? { granted: true } : {}),
-      disclosure:
-        `${selected.mods.length} third-party pack(s) will be READ and indexed:\n` +
-        selected.mods.slice(0, 10).map((m) => `  ${basename(m.path)}`).join("\n") +
-        (selected.mods.length > 10 ? `\n  ... and ${selected.mods.length - 10} more` : "") +
-        "\n\nThey are opened as archives and their JSON is read. No plugin code is\n" +
-        "executed -- the game server is not involved at any point. Their assets\n" +
-        "will appear in every answer, and where a pack overrides a vanilla asset\n" +
-        "the pack's version wins, which is what the game does too.",
-      question: "Index these packs?",
-    });
-    if (!consented) {
-      process.stdout.write("Cancelled. Nothing was indexed.\n");
-      return 1;
-    }
+    // A NOTICE, not a prompt. Indexing opens archives and reads JSON; no
+    // third-party code runs, so there is nothing here to consent to -- the
+    // consent this tool asks for guards code execution, and asking for one that
+    // guards nothing teaches people to click through the one that does.
+    //
+    // Still said out loud: these packs change every answer the index gives, and
+    // where one overrides a vanilla asset the pack wins.
+    process.stdout.write(
+      `
+  Including ${selected.mods.length} third-party pack(s) from ${CONFIG_FILENAME}:
+` +
+        selected.mods.slice(0, 6).map((m) => `    ${basename(m.path)}
+`).join("") +
+        (selected.mods.length > 6 ? `    ... and ${selected.mods.length - 6} more
+` : "") +
+        `  Read as archives -- no plugin code is executed.
+
+`,
+    );
   }
 
   const db = openDatabase(dbPath);
@@ -590,7 +653,10 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
     // a type cannot later be told apart from a worldgen prefab or an animation.
     let resolver: TypeResolver | undefined;
     let suffixes: string[] | undefined;
-    const schemaDir = args.schema ?? DEFAULT_SCHEMA_DIR;
+    // Flag, then config, then the relative default. The default is relative to
+    // the CWD, which is exactly why it belongs in the config: run from a pack
+    // directory it resolves to nothing, and the whole index comes out tier 1.
+    const schemaDir = selected.schema ?? DEFAULT_SCHEMA_DIR;
     if (existsSync(schemaDir)) {
       const set = readGeneratedSchemas(schemaDir);
       const ingested = ingestSchemas(db, set);
@@ -834,32 +900,11 @@ export async function cmdGet(
     // leaving SQLite to break the tie by rowid. So `get Plant_Bush` announced
     // "Showing the Item one" and then printed the ItemDropList -- handing over the
     // wrong file while stating the right one.
-    const byId = db.prepare(
-      "SELECT path, type FROM assets WHERE logical_id = ?1" +
-        " AND (?2 IS NULL OR type = ?2) ORDER BY is_effective DESC, type LIMIT 1",
-    );
-    // `forType` is the child's type when resolving a parent, and the caller's
-    // --type (or nothing) for the asset itself. Passing `args.type` for every
-    // lookup meant that without --type a parent was chosen by identifier alone:
-    // `get Eggsac` merged the BlockBoundingBoxes named Cocoon into a
-    // BlockSoundSet and printed `Boxes` in place of `SoundEvents`.
-    const load: AssetLoader = async (id, forType) => {
-      const row = byId.get(id, forType ?? args.type ?? null) as
-        | { path: string; type: string | null }
-        | undefined;
-      if (row === undefined) return null;
-      try {
-        return {
-          path: row.path,
-          type: row.type,
-          document: JSON.parse(await archive.readText(row.path)),
-        };
-      } catch {
-        return null;
-      }
-    };
-
+    // Pack-aware: an asset can live in any indexed archive now, and a parent
+    // chain routinely crosses from a mod into vanilla.
+    const { load, close } = packAssetLoader(db, args.type);
     const result = await getAssetOp(db, logicalId, load, args.type, args.raw === true);
+    close();
     const miss = result.value === null;
     (miss ? process.stderr : process.stdout).write(result.text ?? "");
     // `--raw` promises parseable stdout, so its qualifications go to stderr --
