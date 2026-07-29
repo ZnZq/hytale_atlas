@@ -14,8 +14,15 @@ import {
   searchSchemaDetailed,
 } from "../query/schema.ts";
 import { type SearchHit, searchAssets } from "../query/search.ts";
-import { archiveStamp } from "../sources/archive.ts";
+import { sourceStamp } from "../sources/archive.ts";
 import { detectInstallation, detectProject } from "../sources/detect.ts";
+import {
+  type AtlasConfig,
+  CONFIG_FILENAME,
+  type ResolvedMod,
+  loadConfig,
+  resolveMods,
+} from "../sources/config.ts";
 import { referenceToKey } from "../sources/lang.ts";
 import { scopes } from "../sources/schema-doc.ts";
 import { formatCount, frozenDbPath, frozenKey } from "../util/paths.ts";
@@ -50,11 +57,10 @@ export interface OpenOptions {
 
 /** Resolves and opens the frozen index, or explains precisely why it cannot. */
 export async function openIndex(options: OpenOptions = {}): Promise<Database> {
-  const archivePath = options.assets ?? detectInstallation(options.patchline)?.assetsZip;
-  if (archivePath == null) {
+  const { path: dbPath } = await resolveDbPath(options);
+  if (dbPath === null) {
     throw new Error("Assets.zip not found. Set HYTALE_ROOT, or pass an explicit path.");
   }
-  const dbPath = frozenDbPath(frozenKey(archivePath, await archiveStamp(archivePath)));
   if (!existsSync(dbPath)) {
     throw new Error(`No index yet. Build it first.\n  expected: ${dbPath}`);
   }
@@ -632,6 +638,7 @@ function describeField(
   f: FieldDescription,
   single: boolean,
   markers: Set<string>,
+  limit: number,
 ): string {
   const d = f.declared;
   const o = f.observed;
@@ -694,9 +701,12 @@ function describeField(
   // for "what makes a tool faster" (common:ItemTool./Speed, used by one asset of
   // 35 074).
   if (single && o !== null && o.assets > 0) {
-    const declarers = assetsDeclaringField(db, assetType, f.pointer, 7);
+    // Widened by the caller's limit, like every other list here. The fixed seven
+    // could not be raised at all, so "which assets actually do this" -- the one
+    // question a single-field view exists to answer -- had a ceiling of six.
+    const declarers = assetsDeclaringField(db, assetType, f.pointer, Math.max(limit, 7));
     if (declarers.length > 0) {
-      const shown = declarers.slice(0, 6);
+      const shown = declarers.slice(0, Math.max(limit - 1, 6));
       // The TOTAL is counted, not inferred from the observed-value count: a
       // container has no observed values, so `observed.assets` reported zero
       // declarers for fields 67 assets plainly declare.
@@ -1083,7 +1093,7 @@ export function describeOp(db: Database, request: DescribeRequest): Result<Descr
 
   const markers = new Set<string>();
   const rows = fields
-    .map((f) => describeField(db, type, f, field !== undefined, markers))
+    .map((f) => describeField(db, type, f, field !== undefined, markers, limit))
     .join("");
 
   return rendered(
@@ -2851,6 +2861,133 @@ export interface IndexStats {
   readonly epoch: number;
 }
 
+/** Where a resolved path came from, so `status` can explain a surprise. */
+export type SourceOrigin = "flag" | "config" | "detected" | "none";
+
+export interface ResolvedSources {
+  readonly config: AtlasConfig;
+  readonly assets: string | null;
+  readonly serverJar: string | null;
+  readonly patchline: string | null;
+  /** Where the built index lives. Null means the per-user cache directory. */
+  readonly cacheDir: string | null;
+  /** Third-party packs the config selects. Empty until a config asks for some. */
+  readonly mods: readonly ResolvedMod[];
+  readonly origin: {
+    readonly assets: SourceOrigin;
+    readonly serverJar: SourceOrigin;
+    readonly patchline: SourceOrigin;
+  };
+  /** Everything wrong with the config or the paths it names. */
+  readonly problems: readonly string[];
+}
+
+/**
+ * The one place that decides which sources this run reads.
+ *
+ * Six call sites used to answer this independently with `options.assets ??
+ * detectInstallation(...)?.assetsZip`, which was fine while there were two
+ * layers and stops being fine the moment a config file is a third: a divergence
+ * here means `status` describes one install and `index` builds another.
+ *
+ * **Precedence: flag, then config, then detection.** A flag is the most explicit
+ * thing a person can do and must win; a config is a committed decision about a
+ * directory and must beat a guess; detection is the guess.
+ */
+export function resolveSources(
+  options: { assets?: string; jar?: string; patchline?: string } = {},
+  cwd: string = process.cwd(),
+): ResolvedSources {
+  const config = loadConfig(cwd);
+  const patchline = options.patchline ?? config.patchline ?? null;
+  const install = detectInstallation(patchline ?? undefined);
+  const mods = resolveMods(config.mods);
+
+  const pick = (
+    flag: string | undefined,
+    fromConfig: string | null,
+    detected: string | null,
+  ): { value: string | null; origin: SourceOrigin } => {
+    if (flag !== undefined) return { value: flag, origin: "flag" };
+    if (fromConfig !== null) return { value: fromConfig, origin: "config" };
+    if (detected !== null) return { value: detected, origin: "detected" };
+    return { value: null, origin: "none" };
+  };
+
+  const assets = pick(options.assets, config.assets, install?.assetsZip ?? null);
+  const jar = pick(options.jar, config.serverJar, install?.serverJar ?? null);
+
+  // A path the config names but that is not there is a problem, not a silent
+  // fallback. Falling back to detection here would answer questions about a
+  // different install than the one the file asked for, and say nothing.
+  const problems = [...config.problems, ...mods.problems];
+  for (const [label, chosen] of [
+    ["assets", assets],
+    ["serverJar", jar],
+  ] as const) {
+    if (chosen.origin === "config" && chosen.value !== null && !existsSync(chosen.value)) {
+      problems.push(`${CONFIG_FILENAME} points '${label}' at a path that does not exist: ${chosen.value}`);
+    }
+  }
+
+  return {
+    config,
+    assets: assets.value,
+    serverJar: jar.value,
+    cacheDir: config.cacheDir,
+    patchline:
+      options.patchline ?? config.patchline ?? install?.patchline ?? null,
+    mods: mods.packs,
+    origin: {
+      assets: assets.origin,
+      serverJar: jar.origin,
+      patchline:
+        options.patchline !== undefined
+          ? "flag"
+          : config.patchline !== null
+            ? "config"
+            : install !== null
+              ? "detected"
+              : "none",
+    },
+    problems,
+  };
+}
+
+/**
+ * The index file this run should read or write.
+ *
+ * Seven call sites used to compose this by hand -- resolve the archive, stamp it,
+ * hash it, join the cache root -- and every one of them had to be found and
+ * changed when the key stopped being about a single archive. Composing it once
+ * is what lets the cache directory become configurable without auditing them
+ * again.
+ */
+export async function resolveDbPath(
+  options: { assets?: string; jar?: string; patchline?: string } = {},
+  cwd: string = process.cwd(),
+): Promise<{ path: string | null; sources: ResolvedSources }> {
+  const sources = resolveSources(options, cwd);
+  if (sources.assets === null || !existsSync(sources.assets)) {
+    return { path: null, sources };
+  }
+  // Every source the index will contain, so a different mod set lands on a
+  // different directory. Missing this would serve an index built without a pack
+  // as though it had one -- consistent, complete-looking, and about a world the
+  // user is no longer in.
+  const stamps = [await sourceStamp(sources.assets)];
+  for (const mod of sources.mods) {
+    try {
+      stamps.push(await sourceStamp(mod.path));
+    } catch {
+      // A pack named but unreadable is reported by `resolveSources`; leaving it
+      // out of the key is right, because it will not be in the index either.
+    }
+  }
+  const key = frozenKey(...stamps);
+  return { path: frozenDbPath(key, sources.cacheDir), sources };
+}
+
 export interface StatusValue {
   readonly project: { kind: string; root: string };
   readonly install: {
@@ -2897,22 +3034,50 @@ export interface StatusValue {
 export async function statusOp(
   options: { assets?: string; patchline?: string; jar?: string } = {},
 ): Promise<Result<StatusValue>> {
-  const detected = detectInstallation(options.patchline);
+  // Through the shared resolver, so what `status` reports and what `index`
+  // builds cannot come apart. A config file that silently failed to take effect
+  // would be this project's oldest defect class in its newest costume.
+  const sources = resolveSources(options);
+  const detected = detectInstallation(sources.patchline ?? undefined);
   const project = detectProject();
   const overridden = [
-    ...(options.assets === undefined ? [] : ["assetsZip"]),
-    ...(options.jar === undefined ? [] : ["serverJar"]),
+    ...(sources.origin.assets === "detected" || sources.origin.assets === "none"
+      ? []
+      : ["assetsZip"]),
+    ...(sources.origin.serverJar === "detected" || sources.origin.serverJar === "none"
+      ? []
+      : ["serverJar"]),
   ];
   const install =
     detected === null
       ? null
       : {
           ...detected,
-          ...(options.assets === undefined ? {} : { assetsZip: options.assets }),
-          ...(options.jar === undefined ? {} : { serverJar: options.jar }),
+          ...(sources.assets === null ? {} : { assetsZip: sources.assets }),
+          ...(sources.serverJar === null ? {} : { serverJar: sources.serverJar }),
         };
 
   const lines: string[] = [`Project:     ${project.kind}  (${project.root})`];
+  // The config comes FIRST, above the install, because it is what decides the
+  // install. A reader puzzled by the paths below needs to know a file changed
+  // them before they read them, not after.
+  if (sources.config.path !== null) {
+    lines.push(`Config:      ${sources.config.path}`);
+    const overrides = (
+      [
+        ["assets", sources.origin.assets],
+        ["serverJar", sources.origin.serverJar],
+        ["patchline", sources.origin.patchline],
+      ] as const
+    )
+      .filter(([, origin]) => origin === "config")
+      .map(([name]) => name);
+    lines.push(
+      `             overrides: ${overrides.length > 0 ? overrides.join(", ") : "none"}` +
+        `  ·  mods selected: ${sources.mods.length}`,
+    );
+  }
+  for (const problem of sources.problems) lines.push(`             PROBLEM: ${problem}`);
   if (install === null) {
     lines.push(
       "Hytale:      not found",
@@ -2979,9 +3144,9 @@ export async function statusOp(
   let dbPath: string | null = null;
   let summary = "no Assets.zip, nothing to index";
 
-  const archivePath = options.assets ?? install.assetsZip;
-  if (archivePath !== null && existsSync(archivePath)) {
-    dbPath = frozenDbPath(frozenKey(archivePath, await archiveStamp(archivePath)));
+  const resolved = await resolveDbPath(options);
+  dbPath = resolved.path;
+  if (dbPath !== null) {
     if (!existsSync(dbPath)) {
       state = "not-built";
       summary = "not built — run 'hytale-atlas index'";

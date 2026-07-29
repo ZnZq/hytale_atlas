@@ -348,7 +348,11 @@ export async function callTool(
 
       // Enrichment by COMPOSITION -- the same operations the CLI calls, not a
       // second implementation of them.
-      const rows = 7;
+      // The sample honours the caller's `limit`. It was a hard seven, and an
+      // agent trying to establish whether ANY vanilla item emits light while
+      // worn was handed "7 of 93" with no way to page -- it said so, and gave up
+      // on the question. A sample nobody can widen is a wall, not a sample.
+      const rows = limit ?? 7;
       let clipped = 0;
       const enriched = described.value.fields.map((f) => {
         const broken = brokenRefsFor(db, type, f.pointer);

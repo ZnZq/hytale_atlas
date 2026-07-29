@@ -44,15 +44,39 @@ export function cacheRoot(): string {
  * them apart. Size and mtime stand in for the full content hash: hashing 3.4 GB
  * costs seconds on every startup, and a stamp mismatch simply triggers a rebuild.
  */
-export function frozenKey(path: string, stamp: { size: number; mtimeMs: number }): string {
-  return createHash("sha256")
-    .update(path)
-    .update("\0")
-    .update(String(stamp.size))
-    .update("\0")
-    .update(String(Math.trunc(stamp.mtimeMs)))
-    .digest("hex")
-    .slice(0, 16);
+export interface SourceStamp {
+  readonly path: string;
+  readonly size: number;
+  readonly mtimeMs: number;
+}
+
+/**
+ * Identity of a whole SET of sources, not of one archive.
+ *
+ * The moment third-party packs join the index, keying on Assets.zip alone is
+ * actively wrong: two different mod sets hash to the same directory, so adding a
+ * mod silently reuses the index built without it. That is the worst failure this
+ * cache can have, because nothing about it looks broken -- every answer is
+ * internally consistent and simply describes a world the user is no longer in.
+ *
+ * Sources are sorted before hashing, so the order they were discovered in cannot
+ * change the key. A single source produces exactly the digest the one-archive
+ * version produced, which is deliberate: existing caches stay valid and nobody
+ * pays for a rebuild they gain nothing from.
+ */
+export function frozenKey(...sources: SourceStamp[]): string {
+  const hash = createHash("sha256");
+  const ordered = [...sources].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  for (const [i, s] of ordered.entries()) {
+    if (i > 0) hash.update("\x1e");
+    hash
+      .update(s.path)
+      .update("\0")
+      .update(String(s.size))
+      .update("\0")
+      .update(String(Math.trunc(s.mtimeMs)));
+  }
+  return hash.digest("hex").slice(0, 16);
 }
 
 /**
@@ -62,6 +86,6 @@ export function frozenKey(path: string, stamp: { size: number; mtimeMs: number }
  * instead of reusing one whose shape no longer matches. There is no migration
  * path by design — rebuilding a derived artifact is cheaper than migrating it.
  */
-export function frozenDbPath(key: string): string {
-  return join(cacheRoot(), "frozen", `v${SCHEMA_VERSION}`, key, "corpus.db");
+export function frozenDbPath(key: string, root: string | null = null): string {
+  return join(root ?? cacheRoot(), "frozen", `v${SCHEMA_VERSION}`, key, "corpus.db");
 }

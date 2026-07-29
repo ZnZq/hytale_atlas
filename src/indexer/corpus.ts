@@ -168,17 +168,26 @@ export interface LoadedLang {
     root: string;
     /** The archive path, which is the file a modder actually edits. */
     path: string;
+    /** Index into the archives array this came from, so rows carry a pack. */
+    archiveIndex: number;
     entries: ReadonlyMap<string, string>;
   }[];
 }
 
 /** Reads every `.lang` file in the archive exactly once. */
-export async function loadLangCatalog(archive: AssetArchive): Promise<LoadedLang> {
-  const langEntries = archive.entries.filter((e) => e.path.endsWith(".lang"));
+export async function loadLangCatalog(
+  archives: readonly AssetArchive[],
+): Promise<LoadedLang> {
+  // Merged across every pack, later packs last so their strings win. A mod that
+  // renames a vanilla item does it here, and reading only the first archive
+  // would leave the index showing the old name beside the mod's new asset.
+  const langEntries = archives.flatMap((a) =>
+    a.entries.filter((e) => e.path.endsWith(".lang")).map((e) => ({ e, a })),
+  );
 
-  const fallbackEntry = langEntries.find((e) => e.path.endsWith("/fallback.lang"));
+  const fallbackEntry = langEntries.find((x) => x.e.path.endsWith("/fallback.lang"));
   const fallbacks = fallbackEntry
-    ? parseFallbacks(await archive.readText(fallbackEntry.path))
+    ? parseFallbacks(await fallbackEntry.a.readText(fallbackEntry.e.path))
     : new Map<string, string>();
 
   const catalog = new LangCatalog({ fallbacks });
@@ -186,26 +195,41 @@ export async function loadLangCatalog(archive: AssetArchive): Promise<LoadedLang
     locale: string;
     root: string;
     path: string;
+    archiveIndex: number;
     entries: ReadonlyMap<string, string>;
   }[] = [];
 
-  for (const entry of langEntries) {
+  for (const { e: entry, a: from } of langEntries) {
     const locale = localeFromPath(entry.path);
     if (locale === null) continue; // fallback.lang is a locale map, not a locale
-    const entries = parseLang(await archive.readText(entry.path));
+    const entries = parseLang(await from.readText(entry.path));
     catalog.add(locale, entries);
     files.push({
       locale,
       root: basename(entry.path, extname(entry.path)),
       path: entry.path,
+      archiveIndex: archives.indexOf(from),
       entries,
     });
   }
   return { catalog, files };
 }
 
+/** One archive and the `packs` row it belongs to. */
+export interface PackSource {
+  readonly archive: AssetArchive;
+  readonly packId: number;
+}
+
+/**
+ * Walks every pack into one index.
+ *
+ * Vanilla is just the first pack. That was always the schema's intent -- `packs`
+ * carries a priority and `assets` an `is_effective` flag -- but the walk hardcoded
+ * `pack_id = 1`, so the design existed and the code could not use it.
+ */
 export async function buildSearchIndex(
-  archive: AssetArchive,
+  sources: readonly PackSource[],
   db: Database,
   options: BuildOptions = {},
 ): Promise<BuildResult> {
@@ -219,7 +243,8 @@ export async function buildSearchIndex(
   } = options;
   const started = Date.now();
 
-  const { catalog, files: langFiles } = await loadLangCatalog(archive);
+  const archives = sources.map((s) => s.archive);
+  const { catalog, files: langFiles } = await loadLangCatalog(archives);
 
   /**
    * The same question `LOCALIZED_BY` asks, so the two cannot disagree: either the
@@ -240,139 +265,141 @@ export async function buildSearchIndex(
     db.exec("DELETE FROM candidates");
     db.exec("DELETE FROM assets_fts");
 
-    db.prepare(
-      "INSERT INTO packs (id, group_name, name, path, kind, priority) VALUES (1,'Hytale','Hytale',?,'vanilla',3)" +
-        " ON CONFLICT (path) DO NOTHING",
-    ).run(archive.path);
-
     let langKeys = 0;
     const insLang = db.prepare(
       "INSERT INTO lang_keys (pack_id, key, locale, value, root, source_path) " +
-        "VALUES (1,?,?,?,?,?)" +
+        "VALUES (?,?,?,?,?,?)" +
         " ON CONFLICT (pack_id, key, locale) DO UPDATE SET value = excluded.value, " +
         "source_path = excluded.source_path",
     );
-    for (const { locale, root, path, entries } of langFiles) {
+    for (const { locale, root, path, entries, archiveIndex } of langFiles) {
+      const packId = sources[archiveIndex]?.packId ?? sources[0]!.packId;
       for (const [key, value] of entries) {
-        insLang.run(key, locale, value, root, path);
+        insLang.run(packId, key, locale, value, root, path);
         langKeys++;
       }
     }
 
     // Non-JSON entries become File nodes, so that a reference to
     // "Icons/ItemsGenerated/X.png" can be told from a dangling one.
-    const insFile = db.prepare(
-      "INSERT INTO files (pack_id, path, kind) VALUES (1,?,?)" +
-        " ON CONFLICT (pack_id, path) DO NOTHING",
-    );
     let files = 0;
-    for (const entry of archive.entries) {
-      if (entry.path.endsWith(".lang")) continue;
-      if (assetSuffixes.some((s) => entry.path.endsWith(s))) continue;
-      insFile.run(entry.path, fileKind(entry.path));
-      files++;
-    }
-
-    const insAsset = db.prepare(
-      "INSERT INTO assets (pack_id, logical_id, type, path, last_changed_epoch) VALUES (1,?,?,?,0)" +
-        " ON CONFLICT (pack_id, path) DO NOTHING",
-    );
-    const insCandidate = db.prepare(
-      "INSERT INTO candidates (asset_id, json_pointer, schema_pointer, raw_value, value_kind)" +
-        " VALUES (?,?,?,?,?)",
-    );
-    const assetIdOf = db.prepare("SELECT id FROM assets WHERE pack_id = 1 AND path = ?");
-    const insFts = db.prepare(
-      "INSERT INTO assets_fts (logical_id, type, locale, display_name, description) VALUES (?,?,?,?,?)",
-    );
-
-    const assetEntries = archive.entries.filter(
-      (e) =>
-        assetSuffixes.some((s) => e.path.endsWith(s)) &&
-        roots.some((r) => e.path.startsWith(r)),
-    );
-
     let assets = 0;
     let typed = 0;
     let localized = 0;
     let ftsRows = 0;
     let candidates = 0;
 
-    for (const entry of assetEntries) {
-      const id = assetIdFromPath(entry.path);
-      const assetType = types?.resolve(entry.path) ?? null;
-      if (assetType !== null) typed++;
-      insAsset.run(id, assetType, entry.path);
-      assets++;
-
-      let doc: unknown;
-      try {
-        doc = JSON.parse(await archive.readText(entry.path));
-      } catch {
-        continue; // malformed asset: still indexed by id, just not localized
+    // One pass per pack, in priority order. Everything above this line is
+    // global -- the merged language catalogue, the shared statement cache --
+    // and everything inside belongs to exactly one archive.
+    for (const { archive, packId } of sources) {
+      const insFile = db.prepare(
+        "INSERT INTO files (pack_id, path, kind) VALUES (?,?,?)" +
+          " ON CONFLICT (pack_id, path) DO NOTHING",
+      );
+      for (const entry of archive.entries) {
+        if (entry.path.endsWith(".lang")) continue;
+        if (assetSuffixes.some((s) => entry.path.endsWith(s))) continue;
+        insFile.run(packId, entry.path, fileKind(entry.path));
+        files++;
       }
 
-      // Pass 2: every string scalar becomes a candidate, resolved later by an
-      // indexed join rather than by a second walk over the archive.
-      //
-      // Voxel roots are skipped -- see skipCandidatesIn. They stay searchable and
-      // typed; they contribute no edges.
-      if (!skipCandidatesIn.some((prefix) => entry.path.startsWith(prefix))) {
-        const row = assetIdOf.get(entry.path) as { id: number } | undefined;
-        if (row !== undefined) {
-          for (const candidate of collectCandidates(doc)) {
-            insCandidate.run(
-              row.id,
-              candidate.pointer,
-              candidate.schemaPointer,
-              candidate.value,
-              candidate.kind,
-            );
-            candidates++;
+      const insAsset = db.prepare(
+        "INSERT INTO assets (pack_id, logical_id, type, path, last_changed_epoch) VALUES (?,?,?,?,0)" +
+          " ON CONFLICT (pack_id, path) DO NOTHING",
+      );
+      const insCandidate = db.prepare(
+        "INSERT INTO candidates (asset_id, json_pointer, schema_pointer, raw_value, value_kind)" +
+          " VALUES (?,?,?,?,?)",
+      );
+      const assetIdOf = db.prepare("SELECT id FROM assets WHERE pack_id = ? AND path = ?");
+      const insFts = db.prepare(
+        "INSERT INTO assets_fts (logical_id, type, locale, display_name, description) VALUES (?,?,?,?,?)",
+      );
+
+      const assetEntries = archive.entries.filter(
+        (e) =>
+          assetSuffixes.some((s) => e.path.endsWith(s)) &&
+          roots.some((r) => e.path.startsWith(r)),
+      );
+
+
+      for (const entry of assetEntries) {
+        const id = assetIdFromPath(entry.path);
+        const assetType = types?.resolve(entry.path) ?? null;
+        if (assetType !== null) typed++;
+        insAsset.run(packId, id, assetType, entry.path);
+        assets++;
+
+        let doc: unknown;
+        try {
+          doc = JSON.parse(await archive.readText(entry.path));
+        } catch {
+          continue; // malformed asset: still indexed by id, just not localized
+        }
+
+        // Pass 2: every string scalar becomes a candidate, resolved later by an
+        // indexed join rather than by a second walk over the archive.
+        //
+        // Voxel roots are skipped -- see skipCandidatesIn. They stay searchable and
+        // typed; they contribute no edges.
+        if (!skipCandidatesIn.some((prefix) => entry.path.startsWith(prefix))) {
+          const row = assetIdOf.get(packId, entry.path) as { id: number } | undefined;
+          if (row !== undefined) {
+            for (const candidate of collectCandidates(doc)) {
+              insCandidate.run(
+                row.id,
+                candidate.pointer,
+                candidate.schemaPointer,
+                candidate.value,
+                candidate.kind,
+              );
+              candidates++;
+            }
           }
         }
-      }
 
-      const refs = collectReferences(doc, "", [], isReference);
-      if (refs.length === 0) {
-        // No display name anywhere. Index the identifier alone so the asset is at
-        // least reachable -- this is the population validate_pack will flag.
-        insFts.run(id, assetType ?? "", "", normalizeSearchText(id.replace(/_/g, " ")), "");
-        ftsRows++;
-        continue;
-      }
-      localized++;
-
-      // Group resolved strings per locale so one row carries a locale's name and
-      // description together, which is how ranking should see them.
-      const perLocale = new Map<string, { name: string; description: string }>();
-      for (const ref of refs) {
-        const slot = ref.role.toLowerCase().includes("desc") ? "description" : "name";
-        for (const { locale, value } of catalog.resolveAll(ref.reference)) {
-          const bucket = perLocale.get(locale) ?? { name: "", description: "" };
-          bucket[slot] = bucket[slot] ? `${bucket[slot]} ${value}` : value;
-          perLocale.set(locale, bucket);
+        const refs = collectReferences(doc, "", [], isReference);
+        if (refs.length === 0) {
+          // No display name anywhere. Index the identifier alone so the asset is at
+          // least reachable -- this is the population validate_pack will flag.
+          insFts.run(id, assetType ?? "", "", normalizeSearchText(id.replace(/_/g, " ")), "");
+          ftsRows++;
+          continue;
         }
-      }
+        localized++;
 
-      for (const [locale, { name, description }] of perLocale) {
-        // The TRANSLATION alone. The identifier used to be folded in here so a
-        // query could match either -- but `logical_id` is an indexed FTS column
-        // in its own right and `unicode61` splits it on underscores, so the fold
-        // bought nothing for search and cost the display: this column is printed
-        // verbatim under a heading that says `name`, and it read as
-        // `Burn You burned to death!` (identifier + the DeathMessageKey
-        // translation) and `Weapon Sword Adamantite Adamantite Sword`. One
-        // column cannot be both the search text and the label; the search half
-        // was already covered elsewhere.
-        insFts.run(id, assetType ?? "", locale, normalizeSearchText(name), normalizeSearchText(description));
-        ftsRows++;
-      }
+        // Group resolved strings per locale so one row carries a locale's name and
+        // description together, which is how ranking should see them.
+        const perLocale = new Map<string, { name: string; description: string }>();
+        for (const ref of refs) {
+          const slot = ref.role.toLowerCase().includes("desc") ? "description" : "name";
+          for (const { locale, value } of catalog.resolveAll(ref.reference)) {
+            const bucket = perLocale.get(locale) ?? { name: "", description: "" };
+            bucket[slot] = bucket[slot] ? `${bucket[slot]} ${value}` : value;
+            perLocale.set(locale, bucket);
+          }
+        }
 
-      if (onProgress && assets % progressEvery === 0) onProgress(assets, assetEntries.length);
+        for (const [locale, { name, description }] of perLocale) {
+          // The TRANSLATION alone. The identifier used to be folded in here so a
+          // query could match either -- but `logical_id` is an indexed FTS column
+          // in its own right and `unicode61` splits it on underscores, so the fold
+          // bought nothing for search and cost the display: this column is printed
+          // verbatim under a heading that says `name`, and it read as
+          // `Burn You burned to death!` (identifier + the DeathMessageKey
+          // translation) and `Weapon Sword Adamantite Adamantite Sword`. One
+          // column cannot be both the search text and the label; the search half
+          // was already covered elsewhere.
+          insFts.run(id, assetType ?? "", locale, normalizeSearchText(name), normalizeSearchText(description));
+          ftsRows++;
+        }
+
+        if (onProgress && assets % progressEvery === 0) onProgress(assets, assetEntries.length);
+      }
     }
 
-    setMeta(db, "source_archive", archive.path);
+    setMeta(db, "source_archive", sources.map((x) => x.archive.path).join(""));
     setMeta(db, "locales", catalog.locales.join(","));
     bumpEpoch(db);
     db.exec("COMMIT");

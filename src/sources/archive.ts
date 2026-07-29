@@ -1,3 +1,4 @@
+import type { SourceStamp } from "../util/paths.ts";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
@@ -180,4 +181,15 @@ export async function archiveStamp(
 ): Promise<{ size: number; mtimeMs: number }> {
   const s = await stat(path);
   return { size: s.size, mtimeMs: s.mtimeMs };
+}
+
+/**
+ * The same stamp, carrying its own path -- what `frozenKey` keys a source SET by.
+ *
+ * Separate from `archiveStamp` because the path belongs to the identity, not to
+ * the file metadata, and every caller was already passing both.
+ */
+export async function sourceStamp(path: string): Promise<SourceStamp> {
+  const s = await stat(path);
+  return { path, size: s.size, mtimeMs: s.mtimeMs };
 }
