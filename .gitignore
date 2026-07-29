@@ -11,6 +11,9 @@
 # and stay there.
 # ---------------------------------------------------------------------------
 local/
+# Dev-local source config. In a USER's pack this file is meant to be committed;
+# in the tool's own repository it only names paths on one machine.
+hytale-atlas.json
 *.hytale-cache/
 Assets.zip
 HytaleServer.jar

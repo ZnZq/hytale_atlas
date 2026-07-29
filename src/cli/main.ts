@@ -102,6 +102,8 @@ Options
                                --field Speed instead
                                (the leading slash is optional, and helps: some
                                shells rewrite a leading slash into a path)
+  --pack <Name>                Read one pack's version of an identifier, including
+                               a shadowed one the game does not load. 'get' only.
   --type <Type>                Narrow to one asset type. Works on 'get', 'search'
                                and 'refs'; identifiers are not unique across types
   --raw                        'get' prints the effective JSON and nothing else
@@ -166,6 +168,7 @@ const VALUE_FLAGS = new Set([
   "cache-dir",
   "mod",
   "exclude",
+  "pack",
 ]);
 
 /** Value flags that accumulate instead of overwriting. */
@@ -495,6 +498,7 @@ function opts(args: Args) {
     ...(str("keep") !== undefined ? { keep: str("keep")! } : {}),
     ...(str("field") !== undefined ? { field: str("field")! } : {}),
     ...(str("type") !== undefined ? { type: str("type")! } : {}),
+    ...(str("pack") !== undefined ? { pack: str("pack")! } : {}),
     ...(args.flags.has("force") ? { force: true } : {}),
     ...(args.flags.has("yes") ? { yes: true } : {}),
     ...(args.flags.has("dry-run") ? { dryRun: true } : {}),

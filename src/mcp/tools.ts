@@ -126,8 +126,21 @@ export const TOOLS: readonly ToolDefinition[] = [
     description:
       "The effective definition of one asset, with its parent chain folded in -- what the " +
       "engine sees, not what the file says. Identifiers are not unique across types; pass " +
-      "`type` to choose.",
-    inputSchema: object({ id: str("Asset identifier, e.g. 'Tool_Pickaxe_Iron'."), type: TYPE_ARG }, ["id"]),
+      "`type` to choose. When several packs define one identifier this returns the LIST of " +
+      "packs instead of a document -- the engine keeps whichever pack loaded last and that " +
+      "order is not in this index, so call again with `pack` to say which one you want.",
+    inputSchema: object(
+      {
+        id: str("Asset identifier, e.g. 'Tool_Pickaxe_Iron'."),
+        type: TYPE_ARG,
+        pack: str(
+          "Which pack's version to read, e.g. 'Hytale' for the base game. Required " +
+            "once a previous call reported several definitions; it also reads a version " +
+            "the game does not load.",
+        ),
+      },
+      ["id"],
+    ),
   },
   {
     name: "describe",
@@ -278,10 +291,21 @@ export async function callTool(
       // Pack-aware: `get` used to read the vanilla archive alone, so a mod's
       // asset was catalogued and unreachable -- the worst state, because every
       // count still included it.
-      const { load, close } = packAssetLoader(db, type);
-      const resolved = await getAssetOp(db, id, load, type);
+      const pack = text(args, "pack");
+      const { load, close } = packAssetLoader(
+        db,
+        type,
+        ...(pack === undefined ? [] : [{ logicalId: id, pack }]),
+      );
+      const resolved = await getAssetOp(db, id, load, type, false, pack);
       close();
-      if (resolved.value === null) {
+      // A multi-pack identifier also comes back with no value, and it is NOT a
+      // miss -- the asset exists and is waiting on a choice. Reporting "No asset"
+      // there would deny something the very same result is listing.
+      const needsChoice = resolved.caveats.some(
+        (c) => c.code === "shadowed" || c.code === "contested-packs",
+      );
+      if (resolved.value === null && !needsChoice) {
         return missOf(resolved, {
           reason: benchIdExists(db, id)
             ? `'${id}' is a bench id, not an asset. Call 'bench' with it.`

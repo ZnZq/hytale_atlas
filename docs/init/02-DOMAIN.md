@@ -528,9 +528,112 @@ case of two mods both under `MODS`. That tiebreak lives elsewhere (registration
 order, manifest `LoadBefore`, or dependency topology) and is still open. See
 `OPEN-QUESTIONS.md` Q5.
 
-Also still open: whether override is whole-asset replacement or field-level merge.
-`InheritCodec` and the `Parent` mechanism (Q18) prove the engine performs
-field-level merging *somewhere*; whether pack override reuses it is unverified.
+`[MEASURED]` **Override is whole-asset replacement, and the winner is the pack
+registered LAST.** Read out of `CommonAssetRegistry` in the server jar:
+
+```
+assetByNameMap : Map<String, List<PackAsset>>     // PackAsset = record(pack, asset)
+
+addCommonAsset(pack, asset):
+    list = assetByNameMap.computeIfAbsent(asset.getName())
+    scan list for an entry with the same pack()
+      found -> list.set(i, new)      // same pack re-adding: replace in place
+      else  -> list.add(new)         // APPEND. no sort, no comparator, no priority
+
+getByName(name):
+    list = assetByNameMap.get(name)
+    return list == null ? null : list.getLast().asset()      // LAST WINS
+```
+
+Every definition is kept (hence `getDuplicatedAssets()` and `duplicateAssetCount`),
+but exactly one is returned, whole. There is no field-level blending anywhere on
+this path -- `set`/`add` move entire `PackAsset` objects, and the return type is a
+single `CommonAsset`.
+
+`[MEASURED]` **The typed `AssetStore` does no ordering of its own.** Its 4 870
+lines of bytecode contain no reference to `PackSource`, `overrides`, `getLast`,
+`sort`, `compareTo` or any priority field.
+
+`[MEASURED]` **`AssetRegistryLoader.loadAssets(LoadAssetEvent, AssetPack)` takes
+one pack at a time**, so pack order is set by its CALLER, not by the loader. The
+`loadsAfter`/`loadsBefore` directives in that class (26 and 4 uses) order asset
+STORES -- which asset TYPE loads before which -- and say nothing about packs.
+
+`[MEASURED]` **`PackSource.overrides()` has nothing to do with asset conflicts.**
+A constant-pool scan of all 8 728 `com/hypixel/` classes finds exactly two that
+reference it: the enum itself and `AssetModule`. Its only call site:
+
+```java
+boolean registerPack(String name, Path path, PluginManifest m, PackSource source) {
+    AssetPack existing = getAssetPack(name);        // looked up by PACK NAME
+    if (existing != null) {
+        if (existing.getSource().overrides(source)) {
+            log("Asset pack '%s' already registered (%s), skipping %s");
+            return true;                             // the new one is DROPPED
+        }
+        if (source.overrides(existing.getSource())) {
+            log("Asset pack '%s' overriding %s with %s");
+            ...                                      // the new one REPLACES it
+```
+
+That resolves one pack registered TWICE under the same name from different
+sources -- the same pack passed on the CLI and also sitting in `mods/`. It never
+sees an asset. Two different packs both defining `Armor_Adamantite_Chest` never
+reach this code.
+
+**Consequence for `is_effective`.** There is no per-asset priority in the engine
+at all. Every asset collision is settled by load order alone, and load order is
+not visible in the archives. Our `packs.priority` column therefore models
+something the engine does not do; vanilla-loses-to-mod happens to be right, but
+because the base game registers first, not because it ranks lower. Treat the
+vanilla-vs-pack case as a safe BET and a pack-vs-pack case as unknown -- the
+difference is confidence, not mechanism.
+
+**Closed as out of scope:** who calls `loadAssets` and in what order. Load order
+decides what happens in one player's install, and a mod author controls neither
+which other mods are present nor how they are ordered. The question this tool
+answers is what EXISTS and what is safe to build on:
+
+- defined by the base game -> every player has it, build on it
+- defined by a pack -> only players with that pack have it
+- defined by two packs and not the base game -> not safe either way
+
+None of those three need the load order. Tracing it would buy a prediction about
+someone else's install, which is not a fact about how to write a mod.
+
+`[REPORTED, CONTRADICTED]` doctale.dev's asset overview lists a three-tier
+priority -- Core Assets < Plugin Assets < Override Packs. No class or code backs
+it, the same site's registry page describes last-write-wins with no tiers, and
+the only priority enum in the jar governs pack registration rather than assets.
+Do not model it.
+
+The community frameworks below are consistent with the measurement and were the
+original, weaker evidence for it:
+
+- **Hytalor** (137k+ downloads) -- "*Instead of overwriting entire JSON files*,
+  Hytalor allows smaller patches which are merged together into a final asset at
+  runtime." A patching framework is only needed because the engine replaces the
+  whole file.
+- **Zima** -- mods declare intent specs, it resolves conflicts and emits
+  *generated override assets* as a runtime pack. It works inside the replace
+  model rather than contradicting it.
+
+So `is_effective` picking exactly one winner is correct, and a shadowed
+definition is inert: it sits in its archive and is never loaded.
+
+Concrete consequence: Endgame&QoL's `Bench_Weapon` has 11 top-level keys to
+vanilla's 12, missing `PhysicalMaterialId`. Under replacement that key is simply
+gone in a game with that pack installed. It is a bug in the pack, not a quirk of
+this index.
+
+The `Parent`/`InheritCodec` merge (Q18) is a DIFFERENT axis -- within one
+asset's inheritance chain, not between packs. Conflating the two is what kept
+this question open; `hytale.mergesProperties` says nothing about pack overlay.
+
+Not resolved by the above: Zima ships its output as a "runtime pack" while
+`PackSource.RUNTIME` has the *lowest* priority of the four ordinals. Either that
+label means something other than the enum constant, or the tiebreak is subtler
+than the enum suggests. Unverified either way -- do not build on it.
 
 `[REPORTED]` A community asset-loader library processes external asset packs in
 sorted filename order. **Now known to be that library's own convention**, not the

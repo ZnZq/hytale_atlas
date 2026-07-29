@@ -156,6 +156,19 @@ export function searchAssetsOp(
   const loosened = Math.max(0, ...hits.map((h) => h.relaxation ?? 0));
   if (loosened > 0) caveats.push(caveat.relaxed(query, loosened, false));
 
+  // Which pack each hit came from. Without it a search result reads as a list of
+  // things the game has, and four agents in one round built answers on mod
+  // assets believing exactly that.
+  const packOfHit = packLookup(db);
+  const packs = new Map<string, AssetPack | null>();
+  for (const h of hits) packs.set(h.logicalId, packOfHit(h.logicalId));
+  const foreignHits = [
+    ...new Set(
+      [...packs.values()].filter((p) => p !== null && p.kind !== "vanilla").map((p) => p!.name),
+    ),
+  ].sort();
+  if (foreignHits.length > 0) caveats.push(caveat.thirdParty(foreignHits));
+
   // A miss in the FTS index is not a miss in the corpus. `assets` holds 22 734
   // distinct identifiers and `assets_fts` 22 237: 497 of them -- 4 757 rows,
   // all worldgen under Server/World -- have no FTS row at all, so
@@ -221,7 +234,7 @@ export function searchAssetsOp(
     caveats.push(caveat.namesNotValues());
     return rendered(hits, searchMiss(db, query, type, caveats), caveats);
   }
-  return rendered(hits, searchTable(hits, caveats), caveats);
+  return rendered(hits, searchTable(hits, caveats, packs), caveats);
 }
 
 /**
@@ -233,7 +246,111 @@ export function searchAssetsOp(
  * locale the match was FOUND in; `~N` means the query had to be loosened N times
  * to reach the row.
  */
-function searchTable(hits: readonly SearchHit[], caveats: readonly Caveat[]): string {
+/** `  [Pack Name]` for a third-party asset, nothing for the game's own. */
+const thirdPartyFlag = new WeakMap<Database, boolean>();
+
+/**
+ * True when the index holds any pack the game did not ship.
+ *
+ * Cached, because describe renders hundreds of field rows in one call and each
+ * would otherwise ask again. It also keeps the vanilla-only path free: with no
+ * mods installed every provenance branch below is skipped, and the output is
+ * byte-for-byte what it was before packs existed.
+ */
+export function hasThirdPartyPacks(db: Database): boolean {
+  let known = thirdPartyFlag.get(db);
+  if (known === undefined) {
+    known = db.prepare(`SELECT 1 FROM packs WHERE kind <> 'vanilla' LIMIT 1`).get() !== undefined;
+    thirdPartyFlag.set(db, known);
+  }
+  return known;
+}
+
+/**
+ * Values of a field that occur ONLY in third-party packs, mapped to the pack.
+ *
+ * The observed layer is a claim about the corpus, and once packs are indexed the
+ * corpus is no longer the game. An agent reading CraftingTimeReductionModifier
+ * reported 0.32 among "actually-observed values across vanilla content" -- 0.32
+ * is one mod's number, and copying it as a vanilla norm is how a wrong baseline
+ * spreads. A value vanilla also uses is deliberately NOT marked: a mod repeating
+ * it says nothing about whether it is safe to rely on.
+ */
+export function thirdPartyValues(
+  db: Database,
+  scope: string,
+  pointer: string,
+): Map<string, string> {
+  const rows = db
+    .prepare(
+      `SELECT c.raw_value AS value,
+              max(CASE WHEN p.kind = 'vanilla' THEN 1 ELSE 0 END) AS inVanilla,
+              min(CASE WHEN p.kind = 'vanilla' THEN NULL ELSE p.name END) AS pack
+         FROM candidates c
+         JOIN assets a ON a.id = c.asset_id
+         JOIN packs p ON p.id = a.pack_id
+        WHERE c.schema_scope = ? AND c.schema_pointer = ?
+        GROUP BY c.raw_value`,
+    )
+    .all(scope, pointer) as unknown as {
+    value: string;
+    inVanilla: number;
+    pack: string | null;
+  }[];
+  const out = new Map<string, string>();
+  // min() skips NULLs, so `pack` is a non-vanilla name whenever one contributed.
+  for (const r of rows) if (r.inVanilla === 0 && r.pack !== null) out.set(r.value, r.pack);
+  return out;
+}
+
+/** Appends the owning pack to values no vanilla asset uses. */
+function markValues(values: readonly string[], foreign: Map<string, string>): string[] {
+  return values.map((v) => {
+    const pack = foreign.get(v);
+    return pack === undefined ? v : `${v} [${pack}]`;
+  });
+}
+
+/**
+ * A pack name safe to paste into a shell.
+ *
+ * Quoting only on spaces was not enough: "Endgame&QoL" is a real pack name and
+ * bare `&` ends the command in both bash and PowerShell, so the handed-back
+ * command ran half of itself. Anything outside the plain word set gets quotes.
+ */
+function shellArg(name: string): string {
+  return /^[A-Za-z0-9._-]+$/.test(name) ? name : `"${name}"`;
+}
+
+/** How one variant differs from the shown one, at the top level. */
+function diffAgainst(shown: PackVariant | undefined, v: PackVariant): string {
+  if (v.keys === null) return "(unreadable)";
+  if (shown === undefined || v === shown || shown.keys === null) return "";
+  const missing = shown.keys.filter((k) => !v.keys!.includes(k)).map((k) => `-${k}`);
+  const extra = v.keys.filter((k) => !shown.keys!.includes(k)).map((k) => `+${k}`);
+  // Equal key sets are NOT equal assets. Reporting "same keys" invited exactly
+  // the wrong reading for the case that matters most -- two mods claiming one
+  // identifier agree on shape and disagree on the numbers.
+  const changed =
+    shown.values === null || v.values === null
+      ? []
+      : shown.keys
+          .filter((k) => v.keys!.includes(k) && shown.values![k] !== v.values![k])
+          .map((k) => `~${k}`);
+  const parts = [...missing, ...extra, ...changed];
+  if (parts.length === 0) return "(identical)";
+  return parts.slice(0, 6).join(" ") + (parts.length > 6 ? ` +${parts.length - 6} more` : "");
+}
+
+function packMark(pack: AssetPack | null | undefined): string {
+  return pack == null || pack.kind === "vanilla" ? "" : `  [${pack.name}]`;
+}
+
+function searchTable(
+  hits: readonly SearchHit[],
+  caveats: readonly Caveat[],
+  packs?: ReadonlyMap<string, AssetPack | null>,
+): string {
   // "name" was a promise the column cannot keep. Translation references are
   // recognised by SHAPE, not by an allowlist of field names -- they arrive under
   // at least eight, `Value` being the second most common -- so the text here is
@@ -255,7 +372,12 @@ function searchTable(hits: readonly SearchHit[], caveats: readonly Caveat[]): st
         // so an asset whose translation resolves to an empty string would print a
         // bare `[en-US]` with nothing after it.
         `[${hit.locale || "id"}] ${hit.displayName || hit.logicalId}` +
-        `${hit.relaxation > 0 ? `  ~${hit.relaxation}` : ""}\n`,
+        `${hit.relaxation > 0 ? `  ~${hit.relaxation}` : ""}` +
+        // The pack, on the row itself. A caveat at the foot is not enough when a
+        // reader is scanning twenty rows for the one they want -- and the reader
+        // here is usually a model that will quote the identifier and nothing else.
+        packMark(packs?.get(hit.logicalId)) +
+        `\n`,
     )
     .join("");
   const loosened = hits.some((h) => h.relaxation > 0)
@@ -336,7 +458,15 @@ const PICK_ORDER = "ORDER BY is_effective DESC, type";
 
 export function sameNamed(db: Database, logicalId: string): AssetCandidate[] {
   return db
-    .prepare(`SELECT type, path FROM assets WHERE logical_id = ? ${PICK_ORDER} LIMIT 8`)
+    // Effective rows only. The ambiguity this note exists for is one identifier
+    // naming assets of DIFFERENT TYPES; a pack override is one asset defined
+    // twice, and counting it here reported "2 assets are named
+    // Armor_Adamantite_Chest (Item)" about a single item. That reading is not
+    // just noisy, it is wrong -- and it competes with the pack list, which
+    // reports the same fact correctly.
+    .prepare(
+      `SELECT type, path FROM assets WHERE logical_id = ? AND is_effective = 1 ${PICK_ORDER} LIMIT 8`,
+    )
     .all(logicalId) as unknown as AssetCandidate[];
 }
 
@@ -348,7 +478,11 @@ export function sameNamed(db: Database, logicalId: string): AssetCandidate[] {
  * target query has no LIMIT -- disagreed with `get` on every one of them.
  */
 export function sameNamedCount(db: Database, logicalId: string): number {
-  return count(db, "SELECT count(*) AS n FROM assets WHERE logical_id = ?", logicalId);
+  return count(
+    db,
+    "SELECT count(*) AS n FROM assets WHERE logical_id = ? AND is_effective = 1",
+    logicalId,
+  );
 }
 
 /**
@@ -361,7 +495,9 @@ export function sameNamedCount(db: Database, logicalId: string): number {
 export function sameNamedTypes(db: Database, logicalId: string): string[] {
   return (
     db
-      .prepare("SELECT DISTINCT type FROM assets WHERE logical_id = ? ORDER BY type")
+      .prepare(
+        "SELECT DISTINCT type FROM assets WHERE logical_id = ? AND is_effective = 1 ORDER BY type",
+      )
       .all(logicalId) as unknown as { type: string | null }[]
   ).map((r) => r.type ?? "untyped");
 }
@@ -384,6 +520,11 @@ export function sameNamedTypes(db: Database, logicalId: string): string[] {
 export function packAssetLoader(
   db: Database,
   fallbackType?: string,
+  // Pins ONE identifier to one pack, so a shadowed definition can be read. Only
+  // the pinned id is redirected: ancestors still resolve the way the game would,
+  // because a shadowed file's `Parent` still points into the live corpus and
+  // pinning the whole chain would invent a variant of the game nobody runs.
+  pin?: { readonly logicalId: string; readonly pack: string },
 ): { load: AssetLoader; close: () => void } {
   const byId = db.prepare(
     `SELECT a.path, a.type, a.pack_id AS packId, p.path AS packPath
@@ -391,10 +532,21 @@ export function packAssetLoader(
       WHERE a.logical_id = ?1 AND (?2 IS NULL OR a.type = ?2)
       ORDER BY a.is_effective DESC, a.type LIMIT 1`,
   );
+  const byIdAndPack = db.prepare(
+    `SELECT a.path, a.type, a.pack_id AS packId, p.path AS packPath
+       FROM assets a JOIN packs p ON p.id = a.pack_id
+      WHERE a.logical_id = ?1 AND (?2 IS NULL OR a.type = ?2) AND p.name = ?3
+      ORDER BY a.type LIMIT 1`,
+  );
   const open = new Map<number, Promise<AssetArchive>>();
 
   const load: AssetLoader = async (logicalId, forType) => {
-    const row = byId.get(logicalId, forType ?? fallbackType ?? null) as
+    const stmt = pin !== undefined && pin.logicalId === logicalId ? byIdAndPack : byId;
+    const row = (
+      stmt === byIdAndPack
+        ? stmt.get(logicalId, forType ?? fallbackType ?? null, pin!.pack)
+        : stmt.get(logicalId, forType ?? fallbackType ?? null)
+    ) as
       | { path: string; type: string | null; packId: number; packPath: string }
       | undefined;
     if (row === undefined) return null;
@@ -426,13 +578,165 @@ export function packAssetLoader(
   };
 }
 
+export interface AssetPack {
+  readonly name: string;
+  /** 'vanilla' for the game's own archive, 'archive' for a third-party pack. */
+  readonly kind: string;
+}
+
+/**
+ * Which pack an identifier comes from.
+ *
+ * Not decoration. With third-party packs indexed, agents called `Multitools`,
+ * `Gravestones`, `Perfect Parries` and `WansWonderWeapon` assets "vanilla" --
+ * one concluding a mod's plugin interaction was "compiled into the engine".
+ * They got it right exactly when the pack prefixed its identifiers, so the
+ * correctness of the answer rested on someone else's naming convention.
+ *
+ * `is_effective DESC` matches the row every other query counts, so the pack
+ * named here is the pack whose file actually wins.
+ */
+export interface PackDefinition {
+  readonly pack: string;
+  readonly kind: string;
+  readonly path: string;
+  readonly effective: boolean;
+  /**
+   * OUR load-order class, not the engine's -- it has no per-asset priority
+   * (02-DOMAIN.md). Equal values mean both sides are third-party, so there is
+   * no base-game-registers-first bet to make and the winner is unknowable here.
+   */
+  readonly priority: number;
+}
+
+/**
+ * Every pack that defines an identifier, winner first.
+ *
+ * 137 identifiers in a modded index are defined more than once, and they are not
+ * exotic -- `Armor_Adamantite_Chest`, `Armor_Mithril_*` and `Bench_Weapon` are
+ * vanilla items a pack replaces wholesale. Answering from the winner alone is
+ * correct but silent, and a reader asking what the GAME does gets a mod's answer
+ * wearing a vanilla name.
+ *
+ * The losers are inert, not blended: pack override is whole-asset replacement
+ * (02-DOMAIN.md, Overlay and load order). That is why they are listed rather
+ * than merged into the answer -- presenting them as contributors would invent a
+ * mechanism the engine does not have.
+ */
+export function packDefinitions(
+  db: Database,
+  logicalId: string,
+  type?: string,
+): PackDefinition[] {
+  return db
+    .prepare(
+      `SELECT p.name AS pack, p.kind, p.priority, a.path, a.is_effective AS effective
+         FROM assets a JOIN packs p ON p.id = a.pack_id
+        WHERE a.logical_id = ?1 AND (?2 IS NULL OR a.type = ?2)
+        ORDER BY a.is_effective DESC, p.name`,
+    )
+    .all(logicalId, type ?? null)
+    .map((r) => {
+      const row = r as {
+        pack: string;
+        kind: string;
+        priority: number;
+        path: string;
+        effective: number;
+      };
+      return {
+        pack: row.pack,
+        kind: row.kind,
+        priority: row.priority,
+        path: row.path,
+        effective: row.effective === 1,
+      };
+    });
+}
+
+export interface PackVariant extends PackDefinition {
+  /** Top-level keys of THIS pack's file, or null if it could not be read. */
+  readonly keys: readonly string[] | null;
+  /** Top-level values, for comparing variants by content and not just shape. */
+  readonly values: Readonly<Record<string, string>> | null;
+}
+
+/**
+ * Every pack's own version of one identifier, with its top-level keys.
+ *
+ * `get` shows one document, but the engine keeps every definition and returns
+ * whichever pack registered LAST (02-DOMAIN.md). That order is not observable
+ * from the archives, so which file is live is genuinely not ours to state --
+ * only the alternatives are. The keys make the alternatives useful rather than
+ * decorative: what changes with the winner is exactly which keys the asset has.
+ *
+ * Reads the losing files, so it is called only when more than one pack defines
+ * the identifier -- 137 of 55 000 in a real mods folder.
+ */
+export async function packVariants(
+  db: Database,
+  logicalId: string,
+  type?: string,
+): Promise<PackVariant[]> {
+  const defs = packDefinitions(db, logicalId, type);
+  const out: PackVariant[] = [];
+  for (const d of defs) {
+    const { load, close } = packAssetLoader(db, type, { logicalId, pack: d.pack });
+    try {
+      const doc = await load(logicalId, type);
+      const value = doc?.document;
+      const record =
+        value !== null && typeof value === "object" && !Array.isArray(value)
+          ? (value as Record<string, unknown>)
+          : null;
+      out.push({
+        ...d,
+        keys: record === null ? null : Object.keys(record).sort(),
+        // Serialised per key so two variants can be compared by CONTENT. Equal
+        // key sets say nothing about equal behaviour -- two mods fighting over
+        // one identifier usually agree on shape and disagree on every number.
+        values:
+          record === null
+            ? null
+            : Object.fromEntries(Object.entries(record).map(([k, v]) => [k, JSON.stringify(v)])),
+      });
+    } finally {
+      close();
+    }
+  }
+  return out;
+}
+
+export function packLookup(db: Database): (logicalId: string) => AssetPack | null {
+  const stmt = db.prepare(
+    `SELECT p.name, p.kind FROM assets a JOIN packs p ON p.id = a.pack_id
+      WHERE a.logical_id = ? ORDER BY a.is_effective DESC LIMIT 1`,
+  );
+  return (logicalId) => (stmt.get(logicalId) as AssetPack | undefined) ?? null;
+}
+
+/** The third-party packs among a set of identifiers, for the caveat. */
+export function thirdPartyPacks(db: Database, ids: readonly string[]): string[] {
+  const of = packLookup(db);
+  const names = new Set<string>();
+  for (const id of ids) {
+    const pack = of(id);
+    if (pack !== null && pack.kind !== "vanilla") names.add(pack.name);
+  }
+  return [...names].sort();
+}
+
 export async function getAssetOp(
   db: Database,
   logicalId: string,
   load: AssetLoader,
   type?: string,
   raw = false,
-): Promise<Result<ResolvedAsset | null>> {
+  // Set when the caller pinned a shadowed definition. Without it the header
+  // would name the pack that WON while printing the file that lost -- the exact
+  // class of quiet disagreement this whole provenance pass exists to remove.
+  pinnedPack?: string,
+): Promise<Result<(ResolvedAsset & { pack: AssetPack | null }) | null>> {
   const candidates = sameNamed(db, logicalId);
   // The count comes from an unlimited query; `candidates` is the 8-row sample.
   // Deriving it here said '8 assets are named Entry.node' where 461 are -- the
@@ -484,12 +788,116 @@ export async function getAssetOp(
     return { value: null, caveats, text };
   }
 
+
+  // Provenance, stated before the content. An asset from a pack is not the
+  // game, and a modder who builds on one believing otherwise ships something
+  // that breaks for everyone without that pack -- silently, at runtime.
+  const of = packLookup(db);
+  const effectivePack = of(resolved.logicalId);
+  let pack = effectivePack;
+  if (pinnedPack !== undefined) {
+    // The pinned pack's own kind, not a guess: `--pack Hytale` reads the vanilla
+    // file and must not be labelled third-party for it.
+    const pinned = packDefinitions(db, resolved.logicalId, resolved.type ?? undefined).find(
+      (d) => d.pack === pinnedPack,
+    );
+    pack = pinned === undefined ? null : { name: pinned.pack, kind: pinned.kind };
+  }
+  const foreign = new Set<string>();
+  if (pack !== null && pack.kind !== "vanilla") foreign.add(pack.name);
+  for (const ancestor of resolved.parentChain) {
+    const p = of(ancestor);
+    if (p !== null && p.kind !== "vanilla") foreign.add(p.name);
+  }
+  if (foreign.size > 0) caveats.push(caveat.thirdParty([...foreign].sort()));
+
+  // Several packs define this identifier and the caller did not say which one it
+  // wants. Answering anyway would mean picking for them, and the pick is not
+  // ours to make: the engine keeps whichever pack registered LAST, and this
+  // index cannot see that order (02-DOMAIN.md). Returning one document with a
+  // note attached was the earlier design, and it was still an answer -- readers
+  // take the document and leave the note. So there is no document until the
+  // caller chooses. `value: null` buys the miss path for free: stderr, exit 1,
+  // and `--raw` emits nothing parseable rather than one arbitrary variant.
+  const definitions = hasThirdPartyPacks(db)
+    ? packDefinitions(db, resolved.logicalId, resolved.type ?? undefined)
+    : [];
+  if (definitions.length > 1 && pinnedPack === undefined) {
+    const variants = await packVariants(db, resolved.logicalId, resolved.type ?? undefined);
+    const width = Math.max(...variants.map((v) => v.pack.length));
+    const first = variants.find((v) => v.kind === "vanilla") ?? variants[0];
+    const tied = definitions.filter((d) => d.priority === definitions[0]!.priority);
+    const lines = [
+      `'${resolved.logicalId}' is defined by ${variants.length} packs. ` +
+        `Choose which one to show.\n`,
+    ];
+    for (const v of variants) {
+      lines.push(
+        `  ${v.pack.padEnd(width)}  ${String(v.keys?.length ?? "?").padStart(2)} keys` +
+          `  ${diffAgainst(first, v)}\n`,
+      );
+      lines.push(`  ${" ".repeat(width)}  ${v.path}\n`);
+    }
+    lines.push("\n");
+    for (const v of variants) {
+      const arg = shellArg(v.pack);
+      lines.push(
+        `  hytale-atlas get ${resolved.logicalId}` +
+          `${type === undefined ? "" : ` --type ${type}`} --pack ${arg}\n`,
+      );
+    }
+    // Identical files are a conflict on paper only. Telling someone to "read
+    // both" when the bytes match wastes the one call the disambiguation costs.
+    const allSame = variants.every(
+      (v) => v === first || (v.values !== null && diffAgainst(first, v) === "(identical)"),
+    );
+    lines.push(
+      "\n" +
+        (allSame
+          ? `All ${variants.length} definitions are identical, so which one wins\n` +
+            `does not change anything. Pick either.\n`
+          : tied.length > 1
+            ? "NEITHER of these is the base game, so neither is safe to build on:\n" +
+              "anything referencing this identifier works only for players who\n" +
+              "have the right pack. Which one a running game keeps depends on\n" +
+              "their load order, which is the player's business, not yours.\n"
+            : "Build on the base game's version -- it is the one every player\n" +
+              "has. The pack's version is what a player WITH that pack sees\n" +
+              "instead, so read it only if you are extending that pack rather\n" +
+              "than the game.\n"),
+    );
+    // The differences are on the FIRST variant's terms; say so, or a reader
+    // takes them for differences from the game.
+    if (!allSame) lines.push(`Differences are shown against ${first!.pack}.\n`);
+    caveats.push(
+      tied.length > 1
+        ? caveat.contestedPacks(
+            resolved.logicalId,
+            tied.map((d) => d.pack),
+          )
+        : caveat.shadowed(
+            resolved.logicalId,
+            definitions[0]!.pack,
+            definitions.slice(1).map((d) => d.pack),
+          ),
+    );
+    return { value: null, caveats, text: lines.join("") };
+  }
+
   if (raw) {
-    return { value: resolved, caveats, text: `${JSON.stringify(resolved.effective, null, 2)}\n` };
+    // `--raw` promises parseable stdout, so the pack goes only to the caveats --
+    // which the CLI writes to stderr for exactly this reason.
+    return {
+      value: { ...resolved, pack },
+      caveats,
+      text: `${JSON.stringify(resolved.effective, null, 2)}
+`,
+    };
   }
 
   const header = [
-    `${resolved.logicalId}   type=${resolved.type ?? "(untyped)"}`,
+    `${resolved.logicalId}   type=${resolved.type ?? "(untyped)"}` +
+      (pack === null || pack.kind === "vanilla" ? "" : `   [pack: ${pack.name}]`),
     `  ${resolved.path}`,
   ];
   if (resolved.parentChain.length > 0) {
@@ -500,6 +908,36 @@ export async function getAssetOp(
   }
   if (resolved.truncated) {
     header.push("  WARNING: parent chain is cyclic or deeper than the limit");
+  }
+
+  // Which packs also define this id. Stated even when the winner is vanilla,
+  // because "a mod also ships this and lost" and "a mod ships this and won" are
+  // both things a reader is entitled to know before building on the answer.
+  // Only the pinned path reaches here with more than one definition: the
+  // unpinned case returned above rather than choose a variant.
+  if (pinnedPack !== undefined) {
+    const defs = hasThirdPartyPacks(db)
+      ? packDefinitions(db, resolved.logicalId, resolved.type ?? undefined)
+      : [];
+    const others = defs.filter((d) => d.pack !== pinnedPack);
+    if (others.length > 0) {
+      const tied = defs.filter((d) => d.priority === defs[0]!.priority);
+      header.push(
+        tied.length > 1
+          ? `  CONTESTED: ${defs.map((d) => d.pack).join(" and ")} define this at` +
+              ` the same priority -- whether the game keeps THIS one is unknown here`
+          : `  also defined by: ${others.map((d) => d.pack).join(", ")}`,
+      );
+      caveats.push(
+        tied.length > 1
+          ? caveat.contestedPacks(
+              resolved.logicalId,
+              tied.map((d) => d.pack),
+              pinnedPack,
+            )
+          : caveat.shadowedShown(resolved.logicalId, pinnedPack, defs[0]!.pack),
+      );
+    }
   }
 
   // Both numbers, because the one-sided version was false. `origins` records
@@ -531,7 +969,7 @@ export async function getAssetOp(
     );
   }
   return {
-    value: resolved,
+    value: { ...resolved, pack },
     caveats,
     text:
       // Caveats BEFORE the document. "Which of the 461 assets am I looking at"
@@ -699,9 +1137,16 @@ function describeField(
   single: boolean,
   markers: Set<string>,
   limit: number,
+  packsSeen: Set<string> = new Set(),
 ): string {
   const d = f.declared;
   const o = f.observed;
+  // Only queried when the index actually holds a third-party pack. A vanilla-only
+  // index takes none of these branches and renders exactly as it did before.
+  const foreign = hasThirdPartyPacks(db)
+    ? thirdPartyValues(db, f.assetType, f.pointer)
+    : new Map<string, string>();
+  for (const pack of foreign.values()) packsSeen.add(pack);
   // A container holds no scalar of its own, so it can never appear in the
   // observed layer however heavily it is used. Calling that "unused" was a false
   // claim about the corpus dressed as a finding -- see isContainer().
@@ -771,8 +1216,13 @@ function describeField(
       // container has no observed values, so `observed.assets` reported zero
       // declarers for fields 67 assets plainly declare.
       const total = countAssetsDeclaringField(db, assetType, f.pointer);
+      const owner = hasThirdPartyPacks(db) ? packLookup(db) : () => null;
+      for (const decl of shown) {
+        const p = owner(decl.logicalId);
+        if (p !== null && p.kind !== "vanilla") packsSeen.add(p.name);
+      }
       out +=
-        `    declared by: ${shown.map((s) => s.logicalId).join(", ")}` +
+        `    declared by: ${shown.map((s) => s.logicalId + packMark(owner(s.logicalId))).join(", ")}` +
         (total > shown.length ? ` ... and ${formatCount(total - shown.length)} more` : "") +
         `\n    e.g. hytale-atlas get ${shown[0]!.logicalId}` +
         (shown[0]!.type ? ` --type ${shown[0]!.type}` : "") +
@@ -826,16 +1276,20 @@ function describeField(
     out += `    legal: ${d.enumValues.join(", ")}\n`;
     // ...and which of them vanilla actually uses. Only worth printing when it is
     // narrower than the legal set.
+    // "occur in vanilla" was true of a vanilla-only index and a plain untruth
+    // once packs are indexed -- the corpus it describes is no longer the game.
     if (o?.values && o.values.length < d.enumValues.length) {
       out +=
-        `    seen:  ${o.values.join(", ")}  (${o.values.length} of ` +
-        `${d.enumValues.length} legal values occur in vanilla)\n`;
+        `    seen:  ${markValues(o.values, foreign).join(", ")}  (${o.values.length} of ` +
+        `${d.enumValues.length} legal values ${foreign.size > 0 ? "occur in the indexed corpus" : "occur in vanilla"})
+`;
     }
   } else if (o?.values) {
     // Says how many of how many. The list was cut at 14 in silence, so a field
     // with 21 real bench ids showed 14 of them, ending mid-alphabet.
     const shown = single ? o.values : o.values.slice(0, 14);
-    out += `    seen:  ${shown.join(", ")}\n`;
+    out += `    seen:  ${markValues(shown, foreign).join(", ")}
+`;
     if (shown.length < o.cardinality) {
       out +=
         `           (${shown.length} of ${formatCount(o.cardinality)} distinct` +
@@ -1152,9 +1606,14 @@ export function describeOp(db: Database, request: DescribeRequest): Result<Descr
   }
 
   const markers = new Set<string>();
+  const packsSeen = new Set<string>();
   const rows = fields
-    .map((f) => describeField(db, type, f, field !== undefined, markers, limit))
+    .map((f) => describeField(db, type, f, field !== undefined, markers, limit, packsSeen))
     .join("");
+  // The observed layer is the half of describe that reads as a fact about the
+  // game, and it is the half packs silently join. A caveat here says so in the
+  // structured channel, not only as a marker someone has to notice.
+  if (packsSeen.size > 0) caveats.push(caveat.thirdParty([...packsSeen].sort()));
 
   return rendered(
     value,

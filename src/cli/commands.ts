@@ -166,8 +166,15 @@ async function openPacks(
  *
  * Without this every query would count a mod's override and the vanilla original
  * as two assets, and `get` would pick whichever the join happened to reach first.
- * Lowest priority wins; ties break on the highest pack id, i.e. the pack loaded
- * last -- the same rule the server applies to two mods claiming one id.
+ * Lowest priority wins.
+ *
+ * Ties break on the highest pack id -- an ARBITRARY rule, and callers must be
+ * told so. This comment used to claim it was "the same rule the server applies
+ * to two mods claiming one id"; that was never established, and it contradicts
+ * OPEN-QUESTIONS Q5, which records the equal-ordinal tiebreak as unknown. Pack
+ * id is the order WE opened the archives, which is a directory walk, not a game
+ * load order. Six identifiers in a real mods folder land here, so `getAssetOp`
+ * reports equal-priority collisions as CONTESTED rather than naming a winner.
  */
 function markEffective(db: Database): { overridden: number } {
   db.exec("UPDATE assets SET is_effective = 0");
@@ -888,7 +895,7 @@ export async function cmdSearch(
  */
 export async function cmdGet(
   logicalId: string,
-  args: { assets?: string; patchline?: string; raw?: boolean; type?: string },
+  args: { assets?: string; patchline?: string; raw?: boolean; type?: string; pack?: string },
 ): Promise<number> {
   const archivePath = openFrozen(args.assets, args.patchline);
   const db = await frozenDb(args.assets, args.patchline);
@@ -902,8 +909,19 @@ export async function cmdGet(
     // wrong file while stating the right one.
     // Pack-aware: an asset can live in any indexed archive now, and a parent
     // chain routinely crosses from a mod into vanilla.
-    const { load, close } = packAssetLoader(db, args.type);
-    const result = await getAssetOp(db, logicalId, load, args.type, args.raw === true);
+    const { load, close } = packAssetLoader(
+      db,
+      args.type,
+      ...(args.pack === undefined ? [] : [{ logicalId, pack: args.pack }]),
+    );
+    const result = await getAssetOp(
+      db,
+      logicalId,
+      load,
+      args.type,
+      args.raw === true,
+      args.pack,
+    );
     close();
     const miss = result.value === null;
     (miss ? process.stderr : process.stdout).write(result.text ?? "");

@@ -56,7 +56,13 @@ Two limits worth knowing before you draw a conclusion:
   contribute no references, so a reference list can be incomplete by design.
 
 Identifiers are not unique across types: 442 of them name more than eight
-assets. Pass 'type' wherever a tool offers it.`;
+assets. Pass 'type' wherever a tool offers it.
+
+THIRD-PARTY PACKS. This index may hold assets from installed mods alongside the
+game's own. They are NOT distinguishable by identifier -- some packs prefix
+theirs, most do not -- so never infer "this is vanilla" from a name. The get and
+search tools report the owning pack, and a third-party caveat names it. An
+answer built on a modded asset only works for someone who has that mod.`;
 
 /**
  * Builds the index if it is missing, stale or half-written, before serving.

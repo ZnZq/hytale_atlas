@@ -253,8 +253,20 @@ export function readConfig(file: string): AtlasConfig {
   };
 }
 
-/** Finds and reads in one step; an absent file is not a problem. */
+/**
+ * Finds and reads in one step; an absent file is not a problem.
+ *
+ * `HYTALE_ATLAS_NO_CONFIG` disables discovery entirely. The test suite sets it,
+ * and it has to exist: a config is found by walking UP, so the moment this
+ * repository gained one at its root, every integration test started asserting
+ * against whatever mods the developer happened to have installed. Eight of them
+ * failed immediately -- locale counts, union totals, observed values -- none
+ * because the code changed. A suite whose expectations depend on someone's mods
+ * directory is measuring the wrong thing, and the same trap waits for any CI job
+ * that runs inside a configured project.
+ */
 export function loadConfig(cwd: string = process.cwd()): AtlasConfig {
+  if (process.env["HYTALE_ATLAS_NO_CONFIG"] === "1") return EMPTY;
   const file = findConfigFile(cwd);
   return file === null ? EMPTY : readConfig(file);
 }
