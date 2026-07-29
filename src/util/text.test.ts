@@ -6,6 +6,7 @@ import {
   buildMatchExpression,
   buildRelaxedMatchExpressions,
   containsIdeograph,
+  expandIdentifiers,
   normalizeSearchText,
   relaxTerm,
 } from "./text.ts";
@@ -189,4 +190,23 @@ test("one asset is found by any of its locales", () => {
     assert.deepEqual(find(db, query), ["Spider_Cave"], `failed for ${query}`);
   }
   db.close();
+});
+
+test("identifier expansion keeps the original and adds the split words", () => {
+  const out = expandIdentifiers("/Gathering/Breaking/GatherType").split(" ");
+  assert.ok(out.includes("GatherType"), "exact identifier is preserved");
+  assert.ok(out.includes("Gather") && out.includes("Type"), "camelCase is split");
+  assert.ok(out.includes("Gathering") && out.includes("Breaking"));
+});
+
+test("identifier expansion splits acronym runs at the right boundary", () => {
+  const out = expandIdentifiers("UIElementID").split(" ");
+  assert.ok(out.includes("UI"), "leading acronym");
+  assert.ok(out.includes("Element"));
+  assert.ok(out.includes("ID"), "trailing acronym");
+});
+
+test("identifier expansion drops single letters rather than flooding the index", () => {
+  // `a` and `b` in `aBc` carry no search value and would match everywhere.
+  assert.equal(expandIdentifiers("aBc").split(" ").includes("a"), false);
 });

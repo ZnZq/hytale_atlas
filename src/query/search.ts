@@ -112,8 +112,18 @@ export function searchAssets(
     ) as unknown as Row[];
 
     for (const row of rows) {
-      if (seen.has(row.logical_id)) continue; // keep the strictest match
-      seen.add(row.logical_id);
+      // Keyed on identifier AND type. Deduplicating on the identifier alone
+      // silently discarded every same-named asset of a different type: searching
+      // `Pickaxe_Mine` returned one row while four assets carry that name
+      // (CameraEffect, CameraShake, Interaction, RootInteraction), and the
+      // Interaction -- the one holding the mining logic -- was invisible. Not a
+      // limit truncation, which at least prints a total: a silent choice.
+      //
+      // Relaxation levels still dedupe correctly, because a repeat at a looser
+      // level carries the same identifier and the same type.
+      const key = `${row.logical_id} :: ${row.type}`;
+      if (seen.has(key)) continue; // keep the strictest match
+      seen.add(key);
       candidates.push({
         logicalId: row.logical_id,
         type: row.type,
@@ -134,35 +144,61 @@ export function searchAssets(
 }
 
 /**
- * Round-robins across identifier families, best-first within each.
+ * Longest run of one identifier family before the rest get a turn.
+ *
+ * Three is enough to show a query is about that family and short enough that a
+ * second sense is visible within the first screen.
+ */
+const MAX_FAMILY_RUN = 3;
+
+/**
+ * Breaks up long runs of one identifier family, keeping rank order otherwise.
  *
  * An ambiguous query should surface both senses rather than twenty variants of
  * one. A search for "chest" returned twenty-odd `Armor_*_Chest` cuirasses and no
  * storage chest at all, because relevance alone has no reason to prefer variety —
  * and both senses are the same asset **type**, so type filtering cannot separate
  * them either.
+ *
+ * **This used to round-robin**, one hit per family per pass, and that inverted
+ * the failure: a query naming a family got at most one of its members per cycle,
+ * so `pickaxe` -- where every relevant asset is a `Tool_` -- pushed
+ * `Tool_Pickaxe_Iron` from rank 9 to rank 53 and off a 30-row page entirely,
+ * while `Ingredient_Bar_Adamantite` sat second. Two agents reported the same
+ * shape on different queries.
+ *
+ * Capping the RUN keeps both properties: the strongest matches stay at the top
+ * in rank order, and no family can monopolise the page. A deferred hit keeps its
+ * relative order, so nothing is lost -- only postponed.
  */
 function interleaveFamilies(hits: readonly SearchHit[]): SearchHit[] {
-  const buckets = new Map<string, SearchHit[]>();
-  for (const hit of hits) {
-    const key = family(hit.logicalId);
-    const bucket = buckets.get(key);
-    if (bucket === undefined) buckets.set(key, [hit]);
-    else bucket.push(hit);
-  }
-
+  // Rank order is kept; only a run that has gone on too long is interrupted, by
+  // pulling forward the nearest hit of another family. Nothing is demoted more
+  // than the length of that run.
+  //
+  // Two stronger reorderings were tried and both broke the case they were not
+  // aimed at. One-per-family round-robin buried `Tool_Pickaxe_Iron` at rank 53,
+  // because a family places its Nth member only on its Nth cycle. Batches of
+  // three fixed that ordering in principle but not in practice: with sixteen
+  // families competing, a family's second turn arrives forty-odd rows later.
+  // Rank is the signal worth preserving -- variety is a garnish on it, not a
+  // replacement for it.
+  const remaining = [...hits];
   const out: SearchHit[] = [];
-  const queues = [...buckets.values()];
-  let drained = false;
-  while (!drained) {
-    drained = true;
-    for (const queue of queues) {
-      const next = queue.shift();
-      if (next !== undefined) {
-        out.push(next);
-        drained = false;
-      }
+  let current: string | null = null;
+  let run = 0;
+
+  while (remaining.length > 0) {
+    let index = 0;
+    if (current !== null && run >= MAX_FAMILY_RUN) {
+      const other = remaining.findIndex((h) => family(h.logicalId) !== current);
+      if (other >= 0) index = other;
     }
+    const [hit] = remaining.splice(index, 1);
+    const key = family(hit!.logicalId);
+    run = key === current ? run + 1 : 1;
+    current = key;
+    out.push(hit!);
   }
   return out;
 }

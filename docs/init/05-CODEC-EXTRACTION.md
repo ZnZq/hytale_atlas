@@ -153,22 +153,30 @@ schema set and fails if the shape of the defect changes after a patchline update
 
 ## What it does NOT give us
 
-**Asset reference targets are not machine-marked.** This corrects an earlier claim
-in this document.
+**Asset reference targets ARE machine-marked, via `hytaleAssetRef`.** This corrects
+two earlier claims in this document, in opposite directions.
 
-`AssetKeyValidator` exposes `updateSchema(SchemaContext, Schema)`, which made it
-look as though reference-typed fields would annotate themselves with their target
-`AssetStore`. **The generated output does not bear that out.** Known reference
-fields come out bare:
+The first revision assumed `AssetKeyValidator.updateSchema(SchemaContext, Schema)`
+annotated reference fields with their target `AssetStore`. The second concluded
+from the generated output that nothing of the sort existed. Both were wrong: the
+marker is real, but it is a **sibling of the `hytale` block, not a member of it** —
+which is exactly why reading it from inside `hytale` returned null for all 932
+fields and looked like proof of absence.
 
 ```json
-"Set":  { "type": ["string", "null"] },
-"Icon": { "type": ["string", "null"], "hytale": { "type": "string", … } }
+"Icon": {
+  "type": ["string", "null"],
+  "hytaleAssetRef": "Texture",
+  "hytale": { "type": "string", … }
+}
 ```
 
-`hytale.type` is a JSON-type marker, not a pointer to an asset type.
+`hytale.type` really is a JSON-type marker, not a pointer to an asset type — that
+part stood. `hytaleAssetRef` is the pointer, and it covers 849 fields across 70
+types. `describe_schema` surfaces it as `declared.referenceTarget`, and pass 2
+resolves declared-target references before falling back to name heuristics.
 
-Partial signal does exist and is worth mining:
+Further signal, still worth mining:
 
 - **`hytale.uiEditorComponent`** (259 fields) names the editor picker and sometimes
   a path template — `Icon` carries
@@ -179,9 +187,9 @@ Partial signal does exist and is worth mining:
 - Field descriptions sometimes name the target type in prose.
 
 **Consequence for `03-ARCHITECTURE.md` §Confidence: the "High — typed by schema, not
-a heuristic at all" tier applies to a minority of fields, not the majority.**
-Reference resolution stays substantially heuristic, and the confidence tiers stay
-load-bearing. Plan pass 2 accordingly.
+a heuristic at all" tier is real but still a minority of fields** — 849 of 17 400.
+Reference resolution stays substantially heuristic outside them, and the confidence
+tiers stay load-bearing.
 
 ---
 

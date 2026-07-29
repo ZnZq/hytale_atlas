@@ -160,24 +160,86 @@ as possible false positives (see `07-PRIOR-ART.md`).
 
 Confidence tiers:
 
-- **High** — the field is covered by extracted schema and typed as a reference.
-  Not a heuristic at all. **This tier is narrower than an earlier revision of this
-  document claimed.** The generated schema does *not* mark reference targets
-  machine-readably: known reference fields emerge as bare
-  `{"type": ["string","null"]}`, and `hytale.type` is a JSON-type marker, not a
-  pointer to an asset type (`OPEN-QUESTIONS.md` Q17, `05-CODEC-EXTRACTION.md`
-  §What it does NOT give us). What *is* available: `hytale.uiEditorComponent`
-  (259 fields, naming the editor picker and sometimes a path template), `$ref`
-  structure for nested objects, and descriptions that occasionally name the target
-  in prose. **Plan for this tier covering a minority of string fields, not most of
-  them** — the tiers below carry the weight.
-- **Medium** — a fully qualified, namespaced ID string matching a known asset
+- **High** — the field carries `hytaleAssetRef`, naming the asset type it points
+  at, **and** the candidate resolves to an asset of that type. Not a heuristic at
+  all. 849 fields across 70 types are marked this way (`05-CODEC-EXTRACTION.md`
+  §What it does NOT give us, which records how this marker was twice missed: it
+  is a *sibling* of the `hytale` block, not a member of it).
+  Further signal for unmarked fields: `hytale.uiEditorComponent` (259 fields,
+  naming the editor picker and sometimes a path template), `$ref` structure for
+  nested objects, and descriptions that occasionally name the target in prose.
+  **This tier still covers a minority of string fields** — 545 of 17 400 indexed —
+  so the tiers below carry the weight.
+
+  > **Known gap, measured 2026-07-28.** The raw schemas contain 932
+  > `hytaleAssetRef` occurrences and the index records 545 across 184 types. Part
+  > of the difference is legitimate (the same property is marked at several
+  > nesting levels), but part is not: `Item./BlockType` carries
+  > `"hytaleAssetRef": "BlockType"` on the property node and the indexed row has
+  > `reference_target = NULL`. 1 116 `anyOf` rows have a `ref_scope` and no
+  > target while 264 have both, so the marker is being lost when the row is
+  > emitted from an `anyOf` branch rather than from the property.
+  >
+  > This is the fourth marker in this project found one level away from where it
+  > was read — after `hytaleAssetRef` itself (twice), `hytaleSchemaTypeField`,
+  > and `inheritsProperty`. Not yet fixed; see `OPEN-QUESTIONS.md`.
+- **Medium** — the field declares a target the index cannot check (the declared
+  type is not itself an asset type, so nothing can resolve to it), or the field
+  name follows a reference convention.
 - **Low** — a bare short string that happens to collide with a known ID
   (`Stone`, `Default`, `None` will generate noise)
 
 Filter by confidence at query time. Do not discard low-confidence edges at index
 time — they are needed for the "did I mean this?" case, and the codec schema may
 promote them later.
+
+#### Contradiction, and why it is a query-time filter
+
+An earlier draft said a declared target resolving to the wrong type is "recorded
+as broken" and left in place. That was wrong in both halves.
+
+A name-matched candidate becomes an edge to **every** asset carrying that name,
+so `Alchemy_Cauldron_Big`'s `PhysicalMaterialId: "Stone"` produced four edges —
+one per asset called Stone. Only the PhysicalMaterial one is meant. Leaving the
+other three in place did not merely add noise: it made `refs Stone --type X` sum
+to 5 087 across four types against an unscoped 2 262, so scoping a query to one
+type appeared to *widen* it.
+
+An edge is therefore dropped at query time when its field declares a target type
+**and an asset of that type exists under the same name**. That second clause is
+load-bearing. Requiring only that the declared type exist somewhere deleted
+`Seed_Place → Rock_Stone`: `BlockTypeToPlace` declares `-> BlockType`, exactly one
+asset of 35 074 carries that type, and no `Rock_Stone` does — so the declaration
+cannot be discharged and the name match remains the best evidence available. One
+round of blind trials introduced that deletion as a demotion; the next round found
+it. The tighter test keeps both cases right.
+
+Query time rather than index time for a measured reason: as a correlated `DELETE`,
+and again via a temp table, it took the build from 42 seconds past six minutes
+without finishing. As a `NOT EXISTS` in the read path it costs about 0.2 s.
+
+What survives is genuine ambiguity, not error — a field that declares no target
+cannot choose between four assets named Stone — and `refs --type` states how many
+of the references it is showing are shared that way, with the number.
+
+#### Broken declared references
+
+A field that declares a target type and whose value names no asset of that type
+is a different thing again: not ambiguity, but a fact about the corpus worth
+reporting. `candidates.dangling = 2` records it, and `describe <Type> --field <p>`
+prints a `BROKEN:` line naming the value and how often it occurs.
+
+2 674 occurrences ship in vanilla. `Item./Categories/*` names 38 `ItemCategory`
+ids that do not exist, 2 175 times; `BlockType./HitboxType` declares
+`-> BlockBoundingBoxes` and its own **default value**, `"Full"`, names none, 256
+times. These are what `validate` will report when it exists; the data is
+collected now so the command has something to read.
+
+Two mistakes are recorded here because both were silent. The marker was computed
+in pass 2, joined on a pointer that pass 3 assigns, so it matched one row — the
+same trap the nested-`Parent` rule fell into. And the generic dangling pass that
+runs immediately after had no `AND dangling = 0` guard, so it overwrote even
+that one.
 
 ---
 

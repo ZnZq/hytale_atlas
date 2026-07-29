@@ -52,6 +52,14 @@ export interface BuildOptions {
    * These roots stay searchable and typed; they simply contribute no edges.
    */
   readonly skipCandidatesIn?: readonly string[];
+  /**
+   * Filename suffixes that hold an asset document.
+   *
+   * Defaults to `.json` alone, which is wrong for any real corpus -- see
+   * `assetSuffixes()` in `./schema.ts`. Callers with a schema should pass its
+   * declared extensions.
+   */
+  readonly assetSuffixes?: readonly string[];
   /** Reports progress; called every `progressEvery` assets. */
   readonly onProgress?: (done: number, total: number) => void;
   readonly progressEvery?: number;
@@ -107,21 +115,37 @@ function escapePointer(segment: string): string {
  * measured across 1 729 asset files, keys arrive under at least eight different
  * fields, `Value` being the second most common after `Name`.
  */
-export function collectReferences(node: unknown, pointer = "", out: Reference[] = []): Reference[] {
+export function collectReferences(
+  node: unknown,
+  pointer = "",
+  out: Reference[] = [],
+  /**
+   * Whether a string is a translation reference.
+   *
+   * Defaults to the shape test, but the indexer passes one that also accepts a
+   * value the catalog actually holds a key for. Two rules described the same
+   * thing and disagreed: `LOCALIZED_BY` joins any value with two dots after
+   * stripping a `server.`/`common.` root, while this test demanded the root be
+   * present. Nine assets -- the `npcRoles.Test_Motion_*` roles, whose keys carry
+   * no root -- got a localization edge and an identifier-only search row, so the
+   * index knew their names and search could not find them by one.
+   */
+  isReference: (value: string) => boolean = isTranslationReference,
+): Reference[] {
   if (typeof node === "string") {
-    if (isTranslationReference(node)) {
+    if (isReference(node)) {
       const segments = pointer.split("/");
       out.push({ pointer, reference: node, role: segments[segments.length - 1] ?? "" });
     }
     return out;
   }
   if (Array.isArray(node)) {
-    node.forEach((v, i) => collectReferences(v, `${pointer}/${i}`, out));
+    node.forEach((v, i) => collectReferences(v, `${pointer}/${i}`, out, isReference));
     return out;
   }
   if (node !== null && typeof node === "object") {
     for (const [k, v] of Object.entries(node)) {
-      collectReferences(v, `${pointer}/${escapePointer(k)}`, out);
+      collectReferences(v, `${pointer}/${escapePointer(k)}`, out, isReference);
     }
   }
   return out;
@@ -138,7 +162,14 @@ export function assetIdFromPath(path: string): string {
 export interface LoadedLang {
   readonly catalog: LangCatalog;
   /** Per-file parsed entries, kept so the caller can persist them without re-reading. */
-  readonly files: readonly { locale: string; entries: ReadonlyMap<string, string> }[];
+  readonly files: readonly {
+    locale: string;
+    /** The file's stem, which is the root an asset prefixes when referencing. */
+    root: string;
+    /** The archive path, which is the file a modder actually edits. */
+    path: string;
+    entries: ReadonlyMap<string, string>;
+  }[];
 }
 
 /** Reads every `.lang` file in the archive exactly once. */
@@ -151,14 +182,24 @@ export async function loadLangCatalog(archive: AssetArchive): Promise<LoadedLang
     : new Map<string, string>();
 
   const catalog = new LangCatalog({ fallbacks });
-  const files: { locale: string; entries: ReadonlyMap<string, string> }[] = [];
+  const files: {
+    locale: string;
+    root: string;
+    path: string;
+    entries: ReadonlyMap<string, string>;
+  }[] = [];
 
   for (const entry of langEntries) {
     const locale = localeFromPath(entry.path);
     if (locale === null) continue; // fallback.lang is a locale map, not a locale
     const entries = parseLang(await archive.readText(entry.path));
     catalog.add(locale, entries);
-    files.push({ locale, entries });
+    files.push({
+      locale,
+      root: basename(entry.path, extname(entry.path)),
+      path: entry.path,
+      entries,
+    });
   }
   return { catalog, files };
 }
@@ -172,6 +213,7 @@ export async function buildSearchIndex(
     roots = ["Server/"],
     types,
     skipCandidatesIn = DEFAULT_CANDIDATE_EXCLUSIONS,
+    assetSuffixes = [".json"],
     onProgress,
     progressEvery = 2000,
   } = options;
@@ -179,8 +221,25 @@ export async function buildSearchIndex(
 
   const { catalog, files: langFiles } = await loadLangCatalog(archive);
 
+  /**
+   * The same question `LOCALIZED_BY` asks, so the two cannot disagree: either the
+   * value carries a known root, or the catalog holds a key by that name. The
+   * two-dot floor matches the SQL join and keeps ordinary prose out.
+   */
+  const isReference = (value: string): boolean =>
+    isTranslationReference(value) ||
+    (value.split(".").length > 2 && catalog.resolveAll(value).length > 0);
+
   db.exec("BEGIN");
   try {
+    // Rebuilt, not appended to. `assets` and `files` carry ON CONFLICT guards and
+    // `schema_fts` is cleared by schema ingestion, but `candidates` and
+    // `assets_fts` had neither, so a second run over one database silently
+    // doubled both. Nothing does that today -- `index --force` deletes the file
+    // first -- which is exactly why the hazard was invisible.
+    db.exec("DELETE FROM candidates");
+    db.exec("DELETE FROM assets_fts");
+
     db.prepare(
       "INSERT INTO packs (id, group_name, name, path, kind, priority) VALUES (1,'Hytale','Hytale',?,'vanilla',3)" +
         " ON CONFLICT (path) DO NOTHING",
@@ -188,12 +247,14 @@ export async function buildSearchIndex(
 
     let langKeys = 0;
     const insLang = db.prepare(
-      "INSERT INTO lang_keys (pack_id, key, locale, value) VALUES (1,?,?,?)" +
-        " ON CONFLICT (pack_id, key, locale) DO UPDATE SET value = excluded.value",
+      "INSERT INTO lang_keys (pack_id, key, locale, value, root, source_path) " +
+        "VALUES (1,?,?,?,?,?)" +
+        " ON CONFLICT (pack_id, key, locale) DO UPDATE SET value = excluded.value, " +
+        "source_path = excluded.source_path",
     );
-    for (const { locale, entries } of langFiles) {
+    for (const { locale, root, path, entries } of langFiles) {
       for (const [key, value] of entries) {
-        insLang.run(key, locale, value);
+        insLang.run(key, locale, value, root, path);
         langKeys++;
       }
     }
@@ -206,7 +267,8 @@ export async function buildSearchIndex(
     );
     let files = 0;
     for (const entry of archive.entries) {
-      if (entry.path.endsWith(".json") || entry.path.endsWith(".lang")) continue;
+      if (entry.path.endsWith(".lang")) continue;
+      if (assetSuffixes.some((s) => entry.path.endsWith(s))) continue;
       insFile.run(entry.path, fileKind(entry.path));
       files++;
     }
@@ -216,7 +278,8 @@ export async function buildSearchIndex(
         " ON CONFLICT (pack_id, path) DO NOTHING",
     );
     const insCandidate = db.prepare(
-      "INSERT INTO candidates (asset_id, json_pointer, schema_pointer, raw_value) VALUES (?,?,?,?)",
+      "INSERT INTO candidates (asset_id, json_pointer, schema_pointer, raw_value, value_kind)" +
+        " VALUES (?,?,?,?,?)",
     );
     const assetIdOf = db.prepare("SELECT id FROM assets WHERE pack_id = 1 AND path = ?");
     const insFts = db.prepare(
@@ -224,7 +287,9 @@ export async function buildSearchIndex(
     );
 
     const assetEntries = archive.entries.filter(
-      (e) => e.path.endsWith(".json") && roots.some((r) => e.path.startsWith(r)),
+      (e) =>
+        assetSuffixes.some((s) => e.path.endsWith(s)) &&
+        roots.some((r) => e.path.startsWith(r)),
     );
 
     let assets = 0;
@@ -256,13 +321,19 @@ export async function buildSearchIndex(
         const row = assetIdOf.get(entry.path) as { id: number } | undefined;
         if (row !== undefined) {
           for (const candidate of collectCandidates(doc)) {
-            insCandidate.run(row.id, candidate.pointer, candidate.schemaPointer, candidate.value);
+            insCandidate.run(
+              row.id,
+              candidate.pointer,
+              candidate.schemaPointer,
+              candidate.value,
+              candidate.kind,
+            );
             candidates++;
           }
         }
       }
 
-      const refs = collectReferences(doc);
+      const refs = collectReferences(doc, "", [], isReference);
       if (refs.length === 0) {
         // No display name anywhere. Index the identifier alone so the asset is at
         // least reachable -- this is the population validate_pack will flag.
@@ -285,13 +356,16 @@ export async function buildSearchIndex(
       }
 
       for (const [locale, { name, description }] of perLocale) {
-        insFts.run(
-          id,
-          assetType ?? "",
-          locale,
-          normalizeSearchText(`${id.replace(/_/g, " ")} ${name}`),
-          normalizeSearchText(description),
-        );
+        // The TRANSLATION alone. The identifier used to be folded in here so a
+        // query could match either -- but `logical_id` is an indexed FTS column
+        // in its own right and `unicode61` splits it on underscores, so the fold
+        // bought nothing for search and cost the display: this column is printed
+        // verbatim under a heading that says `name`, and it read as
+        // `Burn You burned to death!` (identifier + the DeathMessageKey
+        // translation) and `Weapon Sword Adamantite Adamantite Sword`. One
+        // column cannot be both the search text and the label; the search half
+        // was already covered elsewhere.
+        insFts.run(id, assetType ?? "", locale, normalizeSearchText(name), normalizeSearchText(description));
         ftsRows++;
       }
 

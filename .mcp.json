@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hytale-atlas": {
+      "command": "node",
+      "args": ["dist/cli/main.js", "--mcp"]
+    }
+  }
+}

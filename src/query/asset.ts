@@ -4,29 +4,38 @@ import type { Database } from "../db/open.ts";
  * Resolving an asset to its **effective** definition.
  *
  * A definition on disk is usually partial: real assets declare
- * `"Parent": "<other asset id>"` and inherit the rest. `Tool_Pickaxe_Iron` names a
- * parent and omits nine top-level fields the parent supplies. Returning the raw
- * file would show an agent an incomplete asset and invite it to conclude that
- * fields are missing which the game will happily supply — see
- * `docs/init/OPEN-QUESTIONS.md` Q18 and `04-MCP-SURFACE.md`.
+ * `"Parent": "<other asset id>"` and inherit the rest. Returning the raw file
+ * would show an agent an incomplete asset and invite it to conclude that fields
+ * are missing which the game will happily supply.
  *
- * **The merge rule is per field, and deep-merging everything would be wrong.**
- * The generated schema marks each field one of two ways, and the two are mutually
- * exclusive — measured on `Item`: 758 `inheritsProperty`, 229 `mergesProperties`,
- * **zero** carrying both:
+ * **Two markers govern this, and an earlier revision read both in the wrong
+ * place.** The schema states the rule in prose on every `Parent` field:
  *
- * | Marker | Behaviour |
- * |---|---|
- * | `inheritsProperty` | wholesale. A child that defines the field replaces the parent's value entirely, even for objects |
- * | `mergesProperties` | recursive. Child and parent are combined field by field |
+ * > the child field will simply replace the value provided by the parent, in the
+ * > case of nested structures this will apply to the fields **within** the
+ * > structure. In some cases the field may decide to act differently...
  *
- * `/Interactions` and `/InteractionVars` are objects marked `inheritsProperty`,
- * so a child defining them discards the parent's; `/Container`,
- * `/InteractionConfig` and `/ItemEntity` are objects marked `mergesProperties` and
- * combine. A blanket deep merge would silently resurrect parent interactions the
- * author meant to replace.
+ * | Marker | Where it lives | Meaning |
+ * |---|---|---|
+ * | `hytale.inheritsProperty` | on a property, OR inside one of its `anyOf` branches | this property is inherited at all |
+ * | `hytale.mergesProperties` | on a schema's ROOT, i.e. per TYPE | values of this type combine field by field instead of being replaced |
+ *
+ * Both were read as plain per-property markers on the property node. The cost of
+ * each was a false statement about the game:
+ *
+ * - `inheritsProperty` sits in an `anyOf` branch for 13 of Item's 52 marked
+ *   properties, `BlockType` among them. Missing it meant a crop's whole
+ *   `BlockType` was replaced by the child's, so every plant in the game read as
+ *   having no `Support` (the farmland restriction) and no
+ *   `BlockEntity.Components.FarmingBlock` (what makes it tick).
+ * - `mergesProperties` is a type-level marker: 141 occurrences, nearly all on a
+ *   schema root. As a property marker it was true for almost nothing, so nested
+ *   objects replaced wholesale -- `Explode_Generic_Blocks` declares one field of
+ *   `Config` and read as having no block damage at all, though it is named for it.
+ *
+ * `inheritsProperty` is recorded but NOT used as a gate -- see `mergeInto` for
+ * the corpus evidence that its absence does not mean a field is dropped.
  */
-
 /** Depth cap for the parent chain. Cycles are detected separately. */
 const MAX_CHAIN = 16;
 
@@ -57,32 +66,96 @@ export interface ResolvedAsset {
 }
 
 interface FieldRule {
-  readonly merges: boolean;
+  /** The property takes part in inheritance at all. */
+  readonly inherits: boolean;
+  /** Type this property crosses into, when it is a `$ref`. */
+  readonly scope: string | null;
 }
 
-/** Loads a raw asset document by logical id. */
+/**
+ * Per-type merge rules, loaded on demand.
+ *
+ * Lazily, because a merge descends through `$ref` crossings into other types and
+ * loading every type up front would read the whole schema for a one-field asset.
+ */
+interface RuleBook {
+  rulesFor(scope: string): ReadonlyMap<string, FieldRule>;
+  mergesType(scope: string): boolean;
+}
+
+/**
+ * Loads a raw asset document by logical id.
+ *
+ * `type` narrows the lookup and is passed when resolving a PARENT: inheritance
+ * is within a type, so a parent must be the asset of that name **of the child's
+ * type**. Without it the loader fell back to whatever the identifier ordering
+ * put first, and `get Eggsac` -- a BlockSoundSet -- merged in the
+ * BlockBoundingBoxes named `Cocoon`, answering with `Boxes` where `SoundEvents`
+ * belong. The same rule is enforced on the index side (`a.type = src.type` in
+ * `resolveCandidates`); this was the second half of it, unwritten.
+ */
 export type AssetLoader = (
   logicalId: string,
+  type?: string | null,
 ) => Promise<{ path: string; type: string | null; document: Json } | null>;
 
 /**
- * Reads the per-field merge rules for a type.
+ * Reads the per-field inheritance rules for a type.
  *
  * Keyed by schema pointer, in which array indices and dynamic map keys are `*`.
  */
 export function loadFieldRules(db: Database, type: string): Map<string, FieldRule> {
   const rows = db
     .prepare(
-      "SELECT json_pointer, merges_properties FROM schema_fields " +
-        "WHERE asset_type = ? AND (inherits_property = 1 OR merges_properties = 1)",
+      "SELECT json_pointer, inherits_property, ref_scope FROM schema_fields WHERE asset_type = ?",
     )
-    .all(type) as { json_pointer: string; merges_properties: number }[];
+    .all(type) as { json_pointer: string; inherits_property: number; ref_scope: string | null }[];
 
   const out = new Map<string, FieldRule>();
   for (const row of rows) {
-    out.set(row.json_pointer, { merges: row.merges_properties === 1 });
+    out.set(row.json_pointer, {
+      inherits: row.inherits_property === 1,
+      // A single-target crossing only. A polymorphic union names several types
+      // and which one applies depends on the data's own discriminator, so there
+      // is no one rule set to descend into.
+      scope:
+        row.ref_scope !== null && !row.ref_scope.includes(" ") ? row.ref_scope : null,
+    });
   }
   return out;
+}
+
+/** True when values of this type combine field by field rather than replace. */
+export function typeMerges(db: Database, type: string): boolean {
+  const row = db
+    .prepare(
+      "SELECT merges_properties FROM schema_fields WHERE asset_type = ? AND json_pointer = ''",
+    )
+    .get(type) as { merges_properties: number } | undefined;
+  return row?.merges_properties === 1;
+}
+
+function buildRuleBook(db: Database): RuleBook {
+  const rules = new Map<string, ReadonlyMap<string, FieldRule>>();
+  const merges = new Map<string, boolean>();
+  return {
+    rulesFor(scope) {
+      let found = rules.get(scope);
+      if (found === undefined) {
+        found = loadFieldRules(db, scope);
+        rules.set(scope, found);
+      }
+      return found;
+    },
+    mergesType(scope) {
+      let found = merges.get(scope);
+      if (found === undefined) {
+        found = typeMerges(db, scope);
+        merges.set(scope, found);
+      }
+      return found;
+    },
+  };
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -94,48 +167,192 @@ function escapeSegment(segment: string): string {
 }
 
 /**
- * Merges `child` over `parent` according to the schema's per-field rules.
+ * Looks a pointer up, falling back to the wildcard form the schema uses for
+ * array indices and dynamic map keys.
+ */
+function ruleAt(
+  rules: ReadonlyMap<string, FieldRule>,
+  pointer: string,
+): FieldRule | undefined {
+  const exact = rules.get(pointer);
+  if (exact !== undefined) return exact;
+  const cut = pointer.lastIndexOf("/");
+  return cut < 0 ? undefined : rules.get(`${pointer.slice(0, cut)}/*`);
+}
+
+/**
+ * Whether a property is carried down from a parent.
  *
- * Absent a rule the field replaces wholesale, which is the conservative choice:
- * an unmarked field is one the schema does not describe as merging, and inventing
- * a merge would fabricate a value that appears in neither document.
+ * Everything is, and `inheritsProperty` is deliberately NOT consulted here.
+ *
+ * Treating the marker as a gate was an inference, and the corpus refutes it.
+ * `common:FarmingData` marks exactly one of its five properties, so gating
+ * dropped `StageSetAfterHarvest` from 14 of the 15 crops that inherit
+ * `Template_Crop_Block` -- while every one of them still carried a `Harvested`
+ * stage set that nothing then pointed at. Dead data across fifteen files is
+ * evidence; a marker's absence is not. The same shape appears wherever the
+ * marker is sparse: 368 of common.json's 895 definitions carry it on no
+ * property at all, and 527 more on only some, while declaring
+ * `mergesProperties: true` -- which would mean nothing if their properties
+ * never merged.
+ *
+ * The schema's own prose on every `Parent` field says it plainly: "most
+ * properties will simply be copied from the parent asset to this asset". What
+ * varies is only whether a nested value REPLACES or COMBINES, and that is the
+ * type-level `mergesProperties` marker, which is used consistently.
+ *
+ * The nearest thing to counter-evidence is that `Recipe` and `Quality` are
+ * unmarked on `Item`, and inheriting a parent's recipe is a strange thing for
+ * the engine to do. That is a hypothesis about the engine, not a reading of
+ * the data, so it does not get to remove fields from an answer.
+ */
+/**
+ * Merges `child` over `parent` according to the schema's own two markers.
+ *
+ * `scope` is the type whose rules apply here; it changes at every `$ref`
+ * crossing, and the pointer restarts at the root of the new type. Merging
+ * `Item./BlockType` against `Item`'s rules found nothing, because those fields
+ * are declared on `BlockType`.
  */
 function mergeInto(
   parent: Json,
   child: Json,
   pointer: string,
-  rules: ReadonlyMap<string, FieldRule>,
+  scope: string,
+  book: RuleBook,
   parentId: string,
   origins: FieldOrigin[],
+  outPointer: string,
 ): Json {
   if (!isPlainObject(parent) || !isPlainObject(child)) return child;
 
-  const out: Record<string, unknown> = { ...parent };
+  const rules = book.rulesFor(scope);
+  const out: Record<string, unknown> = {};
 
-  for (const key of Object.keys(parent)) {
-    if (!(key in child)) {
-      origins.push({
-        pointer: `${pointer}/${escapeSegment(key)}`,
-        from: parentId,
-        via: "inherited",
-      });
-    }
+  for (const [key, parentValue] of Object.entries(parent)) {
+    if (key in child) continue;
+    // Everything the child does not restate is carried down; `inheritsProperty`
+    // is deliberately not a gate here, for the reasons above this function. The
+    // rule lookup that used to sit on this line was dead, and the comment beside
+    // it ("unmarked means not inherited") described a check that no longer runs.
+    out[key] = parentValue;
+    origins.push({
+      pointer: `${outPointer}/${escapeSegment(key)}`,
+      from: parentId,
+      via: "inherited",
+    });
   }
 
   for (const [key, childValue] of Object.entries(child)) {
-    const childPointer = `${pointer}/${escapeSegment(key)}`;
-    const rule = rules.get(childPointer);
+    const schemaPointer = `${pointer}/${escapeSegment(key)}`;
+    const docPointer = `${outPointer}/${escapeSegment(key)}`;
     const parentValue = parent[key];
+    const nested = ruleAt(rules, schemaPointer)?.scope ?? null;
 
-    if (rule?.merges === true && isPlainObject(parentValue) && isPlainObject(childValue)) {
-      out[key] = mergeInto(parentValue, childValue, childPointer, rules, parentId, origins);
-      origins.push({ pointer: childPointer, from: parentId, via: "merged" });
+    // A map is a plain object the schema describes with an `additionalProperties`
+    // entry rule, i.e. one that has a `/*` pointer: `common:StateData./Definitions`
+    // has no scope of its own, but `/Definitions/*` continues into BlockType.
+    // Descending into it keeps the current scope and extends the pointer, so the
+    // next step matches the `/*` rule. Without this a crop's `State` replaced the
+    // template's wholesale and `StageFinal.InteractionHint` -- the string that
+    // makes the last stage harvestable -- vanished from every plant.
+    //
+    // Being a map is decided by the ENTRY RULE EXISTING, not by where the entries
+    // point. Keyed on `entryScope` -- the type the entries cross into -- a map
+    // whose values are arrays or inline objects has no scope, failed the test,
+    // and was replaced wholesale: `Farming.Stages` is `{Default, Harvested}` on
+    // Template_Crop_Block and `{Starting, Harvested}` on every tomato, so
+    // `Default` disappeared from the effective definition with nothing said,
+    // while the identically-declared `State.Definitions` merged correctly in the
+    // same command. Whether the ENTRIES combine is a separate question, answered
+    // one level down by this same function.
+    const isMap = nested === null && ruleAt(rules, `${schemaPointer}/*`) !== undefined;
+
+    if (
+      isPlainObject(parentValue) &&
+      isPlainObject(childValue) &&
+      ((nested !== null && book.mergesType(nested)) || isMap)
+    ) {
+      out[key] = mergeInto(
+        parentValue,
+        childValue,
+        isMap ? schemaPointer : "",
+        isMap ? scope : nested!,
+        book,
+        parentId,
+        origins,
+        docPointer,
+      );
+      origins.push({ pointer: docPointer, from: parentId, via: "merged" });
     } else {
       out[key] = childValue;
-      origins.push({ pointer: childPointer, from: null, via: "declared" });
+      origins.push({ pointer: docPointer, from: null, via: "declared" });
     }
   }
   return out;
+}
+
+/**
+ * Carries attribution across a fold, so `from` names where a value ULTIMATELY
+ * came from rather than which hop handed it over.
+ *
+ * The last fold alone knows only its own ancestor: without this, every field a
+ * crop gets from `Template_Crop_Block` through `Plant_Crop_Tomato_Block` would
+ * read as coming from the tomato, which is where a modder would then go looking
+ * for it. A pointer the previous pass recorded as inherited was not the parent's
+ * either, so its source is the one to keep; a pointer the parent DECLARED is the
+ * parent's, and is left alone.
+ */
+function rebase(pass: FieldOrigin[], previous: readonly FieldOrigin[]): FieldOrigin[] {
+  if (previous.length === 0) return pass;
+  const ultimate = new Map<string, string | null>();
+  for (const row of previous) {
+    if (row.via === "inherited") ultimate.set(row.pointer, row.from);
+  }
+  return pass.map((row) =>
+    row.via === "inherited" && ultimate.has(row.pointer)
+      ? { ...row, from: ultimate.get(row.pointer) ?? null }
+      : row,
+  );
+}
+
+/**
+ * The type whose rules actually apply to a document.
+ *
+ * A root-level union declares no field of its own -- `Interaction` is 102
+ * branches and one root row -- so looking a pointer up in it finds nothing and
+ * every field reads as not-inherited. `Explode_Generic_Blocks` came back as
+ * `{Type, Parent, Config: {DamageEntities: false}}`, i.e. an asset named for
+ * block damage with no block damage in it. The branch is chosen by the
+ * discriminator the schema declares and the data carries.
+ */
+function resolveScope(db: Database, type: string, chain: { document: Json }[]): string {
+  const root = db
+    .prepare(
+      `SELECT ref_scope, discriminator_property, discriminator_values
+         FROM schema_fields
+        WHERE asset_type = ? AND json_pointer = '' AND ref_scope IS NOT NULL`,
+    )
+    .get(type) as
+    | { ref_scope: string; discriminator_property: string | null; discriminator_values: string | null }
+    | undefined;
+  if (root === undefined) return type;
+
+  const branches = root.ref_scope.split(" ").filter(Boolean);
+  const values = (root.discriminator_values ?? "").split(" ").filter(Boolean);
+  if (branches.length < 2 || values.length !== branches.length) return type;
+  const property = root.discriminator_property ?? "Type";
+
+  // Nearest declaration wins, then up the chain: 152 of 1 341 Interaction assets
+  // declare only a Parent and inherit their Type from it.
+  for (const layer of chain) {
+    if (!isPlainObject(layer.document)) continue;
+    const declared = layer.document[property];
+    if (typeof declared !== "string") continue;
+    const at = values.indexOf(declared);
+    if (at >= 0) return branches[at]!;
+  }
+  return type;
 }
 
 /** Reads the `Parent` field, which is how inheritance is declared. */
@@ -171,7 +388,8 @@ export async function resolveAsset(
       truncated = true; // cyclic Parent chain
       break;
     }
-    const loaded = await load(next);
+    // Within the root's type. See AssetLoader.
+    const loaded = await load(next, root.type);
     if (loaded === null) {
       missingParent = next;
       break;
@@ -182,15 +400,32 @@ export async function resolveAsset(
   }
   if (chain.length >= MAX_CHAIN && parentOf(cursor) !== null) truncated = true;
 
-  const rules = root.type === null ? new Map<string, FieldRule>() : loadFieldRules(db, root.type);
-  const origins: FieldOrigin[] = [];
+  const book = buildRuleBook(db);
+  const scope = root.type === null ? null : resolveScope(db, root.type, chain);
+  let origins: FieldOrigin[] = [];
 
-  // Fold from the most distant ancestor down to the asset itself.
+  // Fold from the most distant ancestor down to the asset itself. An untyped
+  // asset has no rules to consult, so it keeps only what it declares.
+  //
+  // One array PER FOLD, not one for all of them. Every pass describes a
+  // different intermediate document, so accumulating them put each pointer in
+  // the list once per ancestor with contradictory attribution: on a chain of two,
+  // `Plant_Crop_Tomato_Block_Eternal` returned 205 rows for 120 pointers, and
+  // `/Quality` appeared both as inherited and as declared with nothing marking
+  // which one won. "What do I write myself and what do I get free" is the
+  // question a template exists to answer, so a doubled answer is no answer.
   let effective: Json = chain[chain.length - 1]!.document;
   for (let i = chain.length - 2; i >= 0; i--) {
     const layer = chain[i]!;
     const ancestor = chain[i + 1]!;
-    effective = mergeInto(effective, layer.document, "", rules, ancestor.id, origins);
+    if (scope === null) {
+      effective = layer.document;
+      origins = [];
+      continue;
+    }
+    const pass: FieldOrigin[] = [];
+    effective = mergeInto(effective, layer.document, "", scope, book, ancestor.id, pass, "");
+    origins = rebase(pass, origins);
   }
 
   return {

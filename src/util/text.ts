@@ -56,6 +56,31 @@ export function normalizeSearchText(text: string): string {
   return out.replace(/\s+/g, " ").trim();
 }
 
+/**
+ * Splits identifiers into their constituent words, keeping the original.
+ *
+ * `/Gathering/Breaking/GatherType` yields
+ * `Gathering Breaking GatherType Gather Type`. The tokenizer already splits on
+ * `/`, but `GatherType` stays one token, so an agent asking "gather type" in the
+ * words a human would use matched nothing while the field plainly existed.
+ *
+ * Both forms are kept because both are asked: the exact identifier by anyone
+ * reading a schema, the spaced words by anyone describing a capability.
+ */
+export function expandIdentifiers(text: string): string {
+  const words = new Set<string>();
+  for (const token of text.split(/[^\p{L}\p{N}]+/u)) {
+    if (token.length === 0) continue;
+    words.add(token);
+    // Split camelCase, PascalCase and acronym runs: `GatherType` -> Gather Type,
+    // `UIElementID` -> UI Element ID.
+    for (const part of token.split(/(?<=[\p{Ll}\p{N}])(?=\p{Lu})|(?<=\p{Lu})(?=\p{Lu}\p{Ll})/u)) {
+      if (part.length > 1) words.add(part);
+    }
+  }
+  return [...words].join(" ");
+}
+
 /** True when the text contains at least one ideograph. */
 export function containsIdeograph(text: string): boolean {
   return CJK_IDEOGRAPH.test(text);

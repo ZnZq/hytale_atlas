@@ -64,8 +64,17 @@ export const TELEMETRY_DISCLOSURE = [
   "",
   "  - It starts HytaleServer.jar with --bare (no world, no ports) and exits",
   "    on its own, taking about 40 seconds.",
-  "  - It SENDS TELEMETRY to Hypixel Studios. There is no option to disable",
-  "    this; the server has no such flag.",
+  // Sentry and telemetry are two different things, and saying only "no such
+  // flag" made the disclosure contradict the command printed six lines above it:
+  // `--disable-sentry` is right there. Three blind trials across two rounds
+  // called it out, and this is the text a user's consent is given against, so
+  // the distinction is now explicit rather than implied.
+  "  - We pass --disable-sentry, which turns off crash reporting. That is NOT",
+  "    the same thing as telemetry.",
+  "  - It SENDS TELEMETRY to Hypixel Studios regardless: the run logs 'Sending",
+  "    server stop telemetry' and writes a telemetry/ directory. Of the server's",
+  "    ~50 options none disables it -- there is --disable-sentry,",
+  "    --disable-file-watcher and --disable-asset-compare, and nothing for this.",
   "  - It writes into a temporary directory that is deleted afterwards.",
   "",
   "This happens once per game version and the result is cached.",

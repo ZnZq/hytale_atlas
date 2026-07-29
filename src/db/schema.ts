@@ -21,7 +21,34 @@
  * makes a bump orphan old databases rather than silently reusing one whose shape
  * no longer matches.
  */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 17;
+
+/**
+ * Version of the indexing PIPELINE, written to `meta.pipeline` only after every
+ * stage has finished.
+ *
+ * Two problems, one marker.
+ *
+ * **A half-written index is indistinguishable from a whole one.** Stages commit
+ * separately, and `epoch` is bumped by the FIRST of them, so a build that died
+ * after the corpus walk leaves 35 074 assets, zero edges and zero field stats --
+ * a database that opens cleanly and answers "nothing references that" about the
+ * entire corpus. Presence of the file proves nothing; presence of this key
+ * proves the pipeline reached the end.
+ *
+ * **A complete index can still be out of date in CONTENT.** `SCHEMA_VERSION`
+ * guards the database's SHAPE and is part of the cache path, so changing it
+ * orphans old files. But most indexer fixes change what gets written without
+ * touching a single column: reading `hytaleAssetRef` from anyOf branches added
+ * 363 declared targets, the path-length exemption added 957 file edges, and the
+ * dangling rule stopped marking 39 320 resolved references. Every one left the
+ * shape identical, so an existing index stayed silently wrong.
+ *
+ * **Bump this whenever a change alters what indexing writes.** Not for a
+ * refactor, not for rendering, not for a query — for anything that would make a
+ * freshly built index differ from an existing one.
+ */
+export const PIPELINE_VERSION = 1;
 
 export const SCHEMA_SQL = `
 -- ---------------------------------------------------------------------------
@@ -129,6 +156,20 @@ CREATE TABLE IF NOT EXISTS lang_keys (
   key     TEXT NOT NULL,
   locale  TEXT NOT NULL,
   value   TEXT NOT NULL,
+  -- The .lang file's stem, which IS the reference root: a key stored as
+  -- 'items.Foo.name' in server.lang is referenced by an asset as
+  -- 'server.items.Foo.name'. Without it the tool printed the stored form and
+  -- a modder pasting it back got a dead key -- reported in four blind trials
+  -- -- and 'wordlists.runes.algas', whose root is 'wordlists', was declared a
+  -- 'real miss' while server.runes.algas wrongly resolved.
+  root    TEXT,
+  -- The archive path the key was read from. Derivable from root only for
+  -- Server/Languages/<locale>/server.lang; the avatar files live at
+  -- Common/Languages/<locale>/avatarCustomization/capes.lang, so a rule would be
+  -- wrong for most of them. A blind trial asked "where do the display names live
+  -- so I can add my own" and this tool could answer every half of that question
+  -- except the file, which is the half you have to edit.
+  source_path TEXT,
   UNIQUE (pack_id, key, locale)
 ) STRICT;
 
@@ -145,6 +186,16 @@ CREATE TABLE IF NOT EXISTS edges (
   id           INTEGER PRIMARY KEY,
   src          INTEGER NOT NULL,
   dst          INTEGER NOT NULL,
+  -- Which table dst points into: 'asset' | 'file' | 'lang_key'.
+  --
+  -- dst is a foreign key into a DIFFERENT table depending on kind, and SQLite
+  -- cannot express that. A query that joins assets on dst without filtering kind
+  -- silently matches lang_key row ids against asset ids and returns confident
+  -- nonsense -- which is exactly what an early diagnostic query did, reporting a
+  -- localization key as a high-confidence reference to a FlockAsset.
+  --
+  -- Always filter on dst_kind (or kind) when joining.
+  dst_kind     TEXT NOT NULL DEFAULT 'asset',
   -- DEFINED_IN | OVERRIDES | INHERITS_FROM | REFERENCES | REFERENCES_FILE
   -- | LOCALIZED_BY | INSTANCE_OF | DEPENDS_ON
   --
@@ -183,7 +234,21 @@ CREATE TABLE IF NOT EXISTS candidates (
   -- (No backticks in this file: SCHEMA_SQL is a template literal, and one here
   -- silently terminates it -- the compiler then reads the SQL as arithmetic.)
   schema_pointer   TEXT NOT NULL DEFAULT '',
+  -- Namespace schema_pointer is expressed in, after rebasing across any $ref the
+  -- path crossed. An Item pointer /BlockType/Gathering/... lands in the BlockType
+  -- namespace as /Gathering/..., because Item./BlockType is a ref, not a
+  -- container. Filled by pass 3; NULL until then.
+  schema_scope     TEXT,
   raw_value        TEXT NOT NULL,
+  -- 'string' | 'number' | 'boolean'. Only strings can be references, so edge
+  -- resolution filters on this; the observed layer counts all of them.
+  --
+  -- Collecting strings alone was a silent, systematic lie. Every numeric and
+  -- boolean field -- 1 963 of them -- was absent from field_stats and therefore
+  -- labelled 'unused' by describe_schema, including ItemLevel, which real items
+  -- plainly set. 'unused' read as a fact about the corpus while it was really a
+  -- fact about what extraction bothered to look at.
+  value_kind       TEXT NOT NULL DEFAULT 'string',
   resolved_edge_id INTEGER REFERENCES edges(id) ON DELETE SET NULL,
   dangling         INTEGER NOT NULL DEFAULT 0
 ) STRICT;
@@ -206,12 +271,37 @@ CREATE TABLE IF NOT EXISTS schema_fields (
   -- which means *unset* rather than a default of null. See util/json.ts.
   default_unset     INTEGER NOT NULL DEFAULT 0,
   enum_values       TEXT,
+  -- Values actually seen in the corpus for a field the schema gives no enum for.
+  -- 13 677 of 14 628 fields declare none -- GatherType among them -- so without
+  -- this there is no answer to "what else can I put here" for most of the schema.
+  --
+  -- Kept in a separate column from enum_values on purpose: an inferred set is
+  -- what vanilla happens to use, a declared one is what the game accepts, and
+  -- presenting the first as the second would be a lie.
+  observed_values   TEXT,
+  -- Discriminator value that selects this definition, read from the schema's own
+  -- prose. Derived from the branch NAME it would be wrong: SelectInteraction is
+  -- selected by 'Selector', which is not a prefix of it.
+  type_constant     TEXT,
+  -- Union discriminator, declared by the schema in hytaleSchemaTypeField.
+  -- The property is NOT always 'Type': 229 declarations say Type, 14 say Id and
+  -- one says Op, and hardcoding Type meant those 15 unions never resolved.
+  discriminator_property TEXT,
+  -- Space separated, positionally aligned with ref_scope. No declared value
+  -- contains a space (checked across all 244 declarations).
+  discriminator_values   TEXT,
   title             TEXT,
   description       TEXT,
   -- Asset type this field points at, from hytale.hytaleAssetRef. 932 fields carry
   -- it across 70 distinct targets. This is what turns a reference edge from a
   -- string-collision guess into a declared fact.
   reference_target  TEXT,
+  -- Namespace the pointer continues in when this field is a $ref, e.g.
+  -- Item./BlockType has ref_scope 'BlockType' and common:ItemTool for a shared
+  -- definition. Every namespace is flattened once and $refs are edges between
+  -- them, so an observed pointer is rebased across those edges rather than
+  -- matched against an inlined copy.
+  ref_scope         TEXT,
   -- Per-field inheritance semantics from hytale.inheritsProperty /
   -- hytale.mergesProperties. Answers OPEN-QUESTIONS.md Q18 at field granularity.
   inherits_property INTEGER NOT NULL DEFAULT 0,
@@ -233,6 +323,10 @@ CREATE TABLE IF NOT EXISTS schema_defs (
 -- Aggregate statistics from the corpus. Computed over inheritance-resolved
 -- assets: raw files undercount, because an inherited field never appears in the
 -- child document.
+-- Observed values live here as well as on schema_fields, because an UNDECLARED
+-- field has no schema_fields row to hang them on. common:BenchRequirement./Set is
+-- used by 69 assets and declared nowhere; describe could say it existed and
+-- nothing else, which is a dead end rather than an answer.
 CREATE TABLE IF NOT EXISTS field_stats (
   asset_type   TEXT NOT NULL,
   json_pointer TEXT NOT NULL,
@@ -241,19 +335,122 @@ CREATE TABLE IF NOT EXISTS field_stats (
   value_types  TEXT,
   target_types TEXT,
   cardinality  INTEGER,
+  -- Values seen, when few enough to enumerate. NOT the legal set.
+  observed_values TEXT,
   PRIMARY KEY (asset_type, json_pointer)
+) STRICT;
+
+-- ---------------------------------------------------------------------------
+-- Value links
+--
+-- Strings whose legal values are declared elsewhere in the corpus rather than
+-- named by the schema. JSON Schema has no vocabulary for "this field draws its
+-- values from that field", so these joins are invisible to the reference resolver
+-- however well it works: the marker it needs (hytaleAssetRef) is absent, and the
+-- values are not asset ids to fall back on.
+--
+-- Each link is ONE declared line in src/indexer/value-links.ts; the field shapes,
+-- union branches and namespaces are all read from the schema. A generic value-set
+-- containment detector was measured as a way to avoid declaring them at all and
+-- rejected: 49 pairs survived coverage >= 0.8, roughly 6 were real, and it missed
+-- benches entirely. It is a discovery tool, not a mechanism.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS value_links (
+  link         TEXT NOT NULL,
+  value        TEXT NOT NULL,
+  asset_id     INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  json_pointer TEXT NOT NULL,
+  -- 'declares' names the value; 'references' uses it.
+  role         TEXT NOT NULL,
+  -- References only: 0 when nothing declares this value. Kept rather than
+  -- dropped -- vanilla ships broken ones, so these are validate_pack findings.
+  resolved     INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (link, asset_id, json_pointer, role)
+) STRICT;
+
+-- ---------------------------------------------------------------------------
+-- Crafting benches
+--
+-- Recipe.BenchRequirement[].Id names a BENCH, not an asset: values like
+-- 'Builders' and 'Farmingbench' are declared inside Bench_* items at
+-- /BlockType/Bench/Id. Without these tables the reverse lookup ("what can I
+-- craft here") has nothing to join to. Measured: 1 957 requirements across
+-- 1 928 items, 21 distinct bench ids, 96.0% resolving to a declared bench.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS benches (
+  id         TEXT PRIMARY KEY,
+  -- Which union branch declared it: Crafting | Processing | DiagramCrafting |
+  -- StructuralCrafting. Read from the data's own discriminator, not guessed --
+  -- the schema declares it as an enum on all four branches.
+  bench_type TEXT
+) STRICT;
+
+-- A bench id may be declared by more than one asset, so this is a separate table
+-- rather than a column. Vanilla already does it: 16 declarations, 15 distinct
+-- ids, with 'Farmingbench' declared by BOTH Bench_Farming and Bench_Trough.
+-- Holding the asset on benches directly meant ON CONFLICT DO NOTHING silently
+-- discarded Bench_Trough -- it appeared nowhere in the index at all.
+CREATE TABLE IF NOT EXISTS bench_declarations (
+  bench_id TEXT NOT NULL REFERENCES benches(id) ON DELETE CASCADE,
+  asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  PRIMARY KEY (bench_id, asset_id)
+) STRICT;
+
+-- Keyed by (bench, category), never by category alone: 'Decorative' is declared
+-- by both Builders and Farmingbench, and 'All' by both Farmingbench and
+-- Loombench. Those two collisions cover 100 of 1 364 category matches, so a
+-- global lookup would be ambiguous exactly where it is used most.
+CREATE TABLE IF NOT EXISTS bench_categories (
+  bench_id    TEXT NOT NULL REFERENCES benches(id) ON DELETE CASCADE,
+  category_id TEXT NOT NULL,
+  -- Nesting comes from BenchCategory.ItemCategories, NOT from a nested
+  -- 'Categories'. An earlier revision guessed the latter: the guessed shape
+  -- matched nothing (parent_id was null for all 67 rows) while the 12 real
+  -- nested categories the schema does declare were dropped on the floor.
+  parent_id   TEXT,
+  -- Localization key, stored with its 'server.' root already stripped so it
+  -- joins lang_keys directly. 38 of 53 declared names carry that prefix and none
+  -- resolve without removing it.
+  name_key    TEXT,
+  icon        TEXT,
+  PRIMARY KEY (bench_id, category_id)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS bench_requirements (
+  asset_id     INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  json_pointer TEXT NOT NULL,
+  bench_id     TEXT NOT NULL,
+  -- 0 when bench_id names no declared bench. 58 of those are the literal 'TODO',
+  -- shipped by vanilla itself -- a validation finding, not a parse failure.
+  resolved     INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (asset_id, json_pointer)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS bench_requirement_categories (
+  asset_id     INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  json_pointer TEXT NOT NULL,
+  category_id  TEXT NOT NULL,
+  PRIMARY KEY (asset_id, json_pointer, category_id)
 ) STRICT;
 
 -- ---------------------------------------------------------------------------
 -- Indexes
 -- ---------------------------------------------------------------------------
 
+CREATE INDEX IF NOT EXISTS idx_bench_req_bench ON bench_requirements (bench_id);
+CREATE INDEX IF NOT EXISTS idx_value_links_value ON value_links (link, value, role);
+
 CREATE INDEX IF NOT EXISTS idx_edges_src        ON edges (src, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_dst        ON edges (dst, kind);
 CREATE INDEX IF NOT EXISTS idx_candidates_value ON candidates (raw_value);
-CREATE INDEX IF NOT EXISTS idx_candidates_schema_ptr ON candidates (schema_pointer);
+CREATE INDEX IF NOT EXISTS idx_candidates_schema_ptr ON candidates (schema_scope, schema_pointer);
 CREATE INDEX IF NOT EXISTS idx_schema_fields_ref ON schema_fields (reference_target);
 CREATE INDEX IF NOT EXISTS idx_candidates_asset ON candidates (asset_id);
+-- NOTE: idx_candidates_asset_ptr is created in pass 3, not here. Declaring it up
+-- front made every one of 479 000 candidate inserts maintain a second wide index
+-- and the build stopped finishing at all -- see computeFieldStats().
 CREATE INDEX IF NOT EXISTS idx_assets_logical   ON assets (logical_id);
 CREATE INDEX IF NOT EXISTS idx_assets_epoch     ON assets (last_changed_epoch);
 CREATE INDEX IF NOT EXISTS idx_assets_type      ON assets (type);
@@ -317,9 +514,19 @@ CREATE VIRTUAL TABLE IF NOT EXISTS assets_fts USING fts5 (
 -- because absence is invisible to a search over what exists.
 -- No locale column: the generated schema's prose is English-only, because it comes
 -- from the game's own source rather than from the translation files.
+-- Every field is indexed, including the 9 936 with no prose at all. Indexing only
+-- fields carrying a title or description left 'GatherType' -- a real field, used
+-- by 1 757 assets -- unfindable, and search_schema answered 'nothing declares this
+-- capability', which is worse than no answer.
+--
+-- 'terms' carries the pointer and type name split into words (GatherType ->
+-- Gather Type) so a capability can be found in the words a human would use. It is
+-- separate from json_pointer because that column is returned verbatim and joins
+-- back to schema_fields.
 CREATE VIRTUAL TABLE IF NOT EXISTS schema_fts USING fts5 (
   asset_type,
   json_pointer,
+  terms,
   title,
   description,
   enum_values,
