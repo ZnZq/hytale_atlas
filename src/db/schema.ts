@@ -21,7 +21,7 @@
  * makes a bump orphan old databases rather than silently reusing one whose shape
  * no longer matches.
  */
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
 
 /**
  * Version of the indexing PIPELINE, written to `meta.pipeline` only after every
@@ -441,6 +441,12 @@ CREATE TABLE IF NOT EXISTS bench_requirement_categories (
 
 CREATE INDEX IF NOT EXISTS idx_bench_req_bench ON bench_requirements (bench_id);
 CREATE INDEX IF NOT EXISTS idx_value_links_value ON value_links (link, value, role);
+-- Both existing value_links indexes lead with the link column, while the probe
+-- describe runs per rendered field keys on (asset_id, json_pointer) -- so
+-- neither applied and the plan was a full SCAN of value_links, once per
+-- candidate row, for every one of up to 60 fields. Three declared links exist
+-- in the whole corpus, so ~59 of 60 probes paid that scan to return nothing.
+CREATE INDEX IF NOT EXISTS idx_value_links_asset ON value_links (asset_id, json_pointer);
 
 CREATE INDEX IF NOT EXISTS idx_edges_src        ON edges (src, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_dst        ON edges (dst, kind);
@@ -448,10 +454,23 @@ CREATE INDEX IF NOT EXISTS idx_candidates_value ON candidates (raw_value);
 CREATE INDEX IF NOT EXISTS idx_candidates_schema_ptr ON candidates (schema_scope, schema_pointer);
 CREATE INDEX IF NOT EXISTS idx_schema_fields_ref ON schema_fields (reference_target);
 CREATE INDEX IF NOT EXISTS idx_candidates_asset ON candidates (asset_id);
+-- The child column of an ON DELETE SET NULL parent. Without it the DELETE in
+-- pass 2 is O(edges x candidates); it is survivable today only because the
+-- index command removes the database file before rebuilding, so edges is always
+-- empty when that statement runs. The first incremental or resumable re-index
+-- path -- which is exactly what that DELETE is written to support -- would stop
+-- finishing.
+CREATE INDEX IF NOT EXISTS idx_candidates_edge ON candidates (resolved_edge_id);
 -- NOTE: idx_candidates_asset_ptr is created in pass 3, not here. Declaring it up
 -- front made every one of 479 000 candidate inserts maintain a second wide index
 -- and the build stopped finishing at all -- see computeFieldStats().
 CREATE INDEX IF NOT EXISTS idx_assets_logical   ON assets (logical_id);
+-- SPECULATIVE, and measurably so: nothing writes a non-zero last_changed_epoch
+-- and no query reads it, so this is a second b-tree over all 38 925 asset rows
+-- holding 38 925 identical keys, maintained on every insert of every build. It
+-- is kept rather than dropped because whats_changed(since) is the reader the
+-- column was added for. If that lands, delete this line from the list of things
+-- to justify; if it is abandoned, delete the index and the column together.
 CREATE INDEX IF NOT EXISTS idx_assets_epoch     ON assets (last_changed_epoch);
 CREATE INDEX IF NOT EXISTS idx_assets_type      ON assets (type);
 CREATE INDEX IF NOT EXISTS idx_lang_key         ON lang_keys (key, locale);

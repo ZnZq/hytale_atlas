@@ -326,10 +326,6 @@ export interface SchemaSearchResult {
   readonly widened: boolean;
 }
 
-export function searchSchema(db: Database, query: string, limit = 20): readonly SchemaHit[] {
-  return searchSchemaDetailed(db, query, limit).hits;
-}
-
 export function searchSchemaDetailed(
   db: Database,
   query: string,

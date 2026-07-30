@@ -1,6 +1,4 @@
 import type { SourceStamp } from "../util/paths.ts";
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import type { Entry, ZipFile } from "yauzl";
 import yauzl from "yauzl";
@@ -175,23 +173,6 @@ export class AssetArchive implements AssetSource {
     this.#closed = true;
     this.#zip.close();
   }
-}
-
-/**
- * SHA-256 of the archive itself, used as the frozen-layer cache key.
- *
- * Keyed by content, never by version string: several patchlines commonly coexist
- * on one machine (`docs/init/OPEN-QUESTIONS.md` Q6), and a version string cannot
- * distinguish them reliably.
- *
- * This reads the whole file. Callers should cache the result against
- * (path, size, mtime) rather than recomputing it per run.
- */
-export async function hashArchive(path: string): Promise<string> {
-  const hash = createHash("sha256");
-  const stream = createReadStream(path);
-  for await (const chunk of stream) hash.update(chunk as Buffer);
-  return hash.digest("hex");
 }
 
 /** Cheap identity for deciding whether a cached hash is still valid. */

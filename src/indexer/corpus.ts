@@ -10,6 +10,7 @@ import {
   parseFallbacks,
   parseLang,
 } from "../sources/lang.ts";
+import { escapeSegment, parseJsonLenient } from "../util/json.ts";
 import { normalizeSearchText } from "../util/text.ts";
 import { collectCandidates } from "./references.ts";
 
@@ -80,6 +81,16 @@ export interface BuildResult {
   readonly files: number;
   readonly candidates: number;
   readonly locales: readonly string[];
+  /**
+   * Assets whose JSON could not be parsed even leniently.
+   *
+   * They are still indexed by identifier -- so `search` finds them -- but they
+   * contribute no candidates, no edges and no localization. That used to be
+   * swallowed by a bare `continue`, so neither the build nor `status` could say
+   * how many assets were silently inert, and a reader hitting one had no way to
+   * tell a corpus-wide problem from a single bad file.
+   */
+  readonly parseFailures: number;
   readonly elapsedMs: number;
 }
 
@@ -102,10 +113,6 @@ interface Reference {
   readonly reference: string;
   /** Last pointer segment, e.g. "Name" or "Description". */
   readonly role: string;
-}
-
-function escapePointer(segment: string): string {
-  return segment.replace(/~/g, "~0").replace(/\//g, "~1");
 }
 
 /**
@@ -145,7 +152,7 @@ export function collectReferences(
   }
   if (node !== null && typeof node === "object") {
     for (const [k, v] of Object.entries(node)) {
-      collectReferences(v, `${pointer}/${escapePointer(k)}`, out, isReference);
+      collectReferences(v, `${pointer}/${escapeSegment(k)}`, out, isReference);
     }
   }
   return out;
@@ -288,6 +295,7 @@ export async function buildSearchIndex(
     let localized = 0;
     let ftsRows = 0;
     let candidates = 0;
+    let parseFailures = 0;
 
     // One pass per pack, in priority order. Everything above this line is
     // global -- the merged language catalogue, the shared statement cache --
@@ -324,17 +332,31 @@ export async function buildSearchIndex(
       );
 
 
+      // Counted per pack for the progress line, because its denominator is per
+      // pack. `assets` is the run-wide total, so reporting it against this
+      // pack's size printed lines like `parsed 35,500 / 1,128` for every mod
+      // after the first -- which reads as a corrupted counter or a runaway loop,
+      // during the slowest command the tool has.
+      let packAssets = 0;
       for (const entry of assetEntries) {
         const id = assetIdFromPath(entry.path);
         const assetType = types?.resolve(entry.path) ?? null;
         if (assetType !== null) typed++;
         insAsset.run(packId, id, assetType, entry.path);
         assets++;
+        packAssets++;
 
         let doc: unknown;
         try {
-          doc = JSON.parse(await archive.readText(entry.path));
+          // LENIENT, like the schema ingest. The repo ships a parser written for
+          // this corpus's own quirk -- bare NaN and Infinity literals, which
+          // `JSON.parse` rejects outright -- and it was wired into the schema
+          // reader only, so the asset walk went on failing on the exact shape it
+          // handles. Anything still unparseable is COUNTED rather than dropped
+          // in silence.
+          doc = parseJsonLenient(await archive.readText(entry.path)).value;
         } catch {
+          parseFailures++;
           continue; // malformed asset: still indexed by id, just not localized
         }
 
@@ -395,7 +417,9 @@ export async function buildSearchIndex(
           ftsRows++;
         }
 
-        if (onProgress && assets % progressEvery === 0) onProgress(assets, assetEntries.length);
+        if (onProgress && packAssets % progressEvery === 0) {
+          onProgress(packAssets, assetEntries.length);
+        }
       }
     }
 
@@ -413,6 +437,7 @@ export async function buildSearchIndex(
       files,
       candidates,
       locales: catalog.locales,
+      parseFailures,
       elapsedMs: Date.now() - started,
     };
   } catch (err) {

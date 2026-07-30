@@ -6,6 +6,7 @@ import { collectCandidates } from "../indexer/references.ts";
 import { buildPointerAligner } from "../indexer/stats.ts";
 import { DirectorySource, treeStamp } from "../sources/directory.ts";
 import { isTranslationReference, localeFromPath, parseLang, referenceToKey } from "../sources/lang.ts";
+import { normalizeSearchText } from "../util/text.ts";
 
 /**
  * The pack being authored, laid over the frozen corpus.
@@ -26,6 +27,36 @@ import { isTranslationReference, localeFromPath, parseLang, referenceToKey } fro
  * an optimisation on top: it is unreliable for deep trees on Windows, and a
  * missed event would mean a silently stale answer.
  */
+
+type PointerAligner = ReturnType<typeof buildPointerAligner>;
+
+/**
+ * The pointer aligner, built once per connection.
+ *
+ * It is derived ENTIRELY from the frozen tables, so it is identical for every
+ * overlay rebuild against the same index -- yet it was rebuilt from scratch on
+ * each one, and an overlay rebuild runs on every CLI command and on every MCP
+ * call whose tree stamp moved. Measured on the shipped corpus: 1.2-1.4 s, of
+ * which ~0.8 s is three unindexed scans of 608 145 candidate rows.
+ *
+ * That is 6-60x the entire freshness budget this file justifies itself with
+ * (~23 ms at 50 files, ~224 ms at 500) and it was not counted in it: the number
+ * that decides whether checking before every answer is affordable was measured
+ * without the most expensive thing checking does.
+ *
+ * Keyed on the connection, like `hasThirdPartyPacks`, so it cannot outlive the
+ * data it summarises.
+ */
+const alignerCache = new WeakMap<Database, PointerAligner>();
+
+function pointerAligner(db: Database): PointerAligner {
+  let cached = alignerCache.get(db);
+  if (cached === undefined) {
+    cached = buildPointerAligner(db);
+    alignerCache.set(db, cached);
+  }
+  return cached;
+}
 
 /** Sentinel pack id. Negative, so it cannot collide with an autoincremented one. */
 export const WORKING_PACK_ID = -1;
@@ -51,21 +82,61 @@ const ASSET_COLUMNS =
  * holds. That keeps the overlay usable at tier 1, where no schema exists at all,
  * and avoids loading the schema set a second time.
  */
-function inferType(db: Database, path: string): string | null {
-  const parts = path.split("/");
-  // Longest directory prefix first: the deeper the match, the more specific.
-  for (let depth = parts.length - 1; depth >= 1; depth--) {
-    const prefix = `${parts.slice(0, depth).join("/")}/`;
-    const row = db
-      .prepare(
-        `SELECT type, count(*) AS n FROM main.assets
-          WHERE path LIKE ?1 || '%' AND type IS NOT NULL
-          GROUP BY type ORDER BY n DESC LIMIT 1`,
-      )
-      .get(prefix) as { type: string; n: number } | undefined;
-    if (row !== undefined) return row.type;
-  }
-  return null;
+function typeInferrer(db: Database): (path: string) => string | null {
+  // Prepared ONCE. This sat inside the depth loop, so the statement was
+  // recompiled on every iteration of every file -- and the query itself cannot
+  // use an index (`assets` has none on `path`, and SQLite's case-insensitive
+  // LIKE could not use one anyway), so each iteration also walked every typed
+  // row. ~9 ms x files x depth levels, against the ~224 ms this file budgets for
+  // re-reading a 500-file pack in full.
+  const stmt = db.prepare(
+    `SELECT type, count(*) AS n FROM main.assets
+      WHERE path LIKE ?1 || '%' AND type IS NOT NULL
+      GROUP BY type ORDER BY n DESC LIMIT 1`,
+  );
+  // A pack's files share very few directories -- the repo's own twelve collapse
+  // to one distinct prefix -- so the answers are worth keeping for the build.
+  const memo = new Map<string, string | null>();
+  return (path) => {
+    const parts = path.split("/");
+    // Longest directory prefix first: the deeper the match, the more specific.
+    for (let depth = parts.length - 1; depth >= 1; depth--) {
+      const prefix = `${parts.slice(0, depth).join("/")}/`;
+      let hit = memo.get(prefix);
+      if (hit === undefined) {
+        const row = stmt.get(prefix) as { type: string; n: number } | undefined;
+        hit = row?.type ?? null;
+        memo.set(prefix, hit);
+      }
+      if (hit !== null) return hit;
+    }
+    return null;
+  };
+}
+
+/**
+ * Suffixes that make a file an ASSET, read from the frozen corpus.
+ *
+ * The overlay tested `.json` and nothing else, directly under a comment claiming
+ * it applied "the same suffix rule the corpus indexer applies". It does not: the
+ * indexer takes the schema's own set, which on this corpus is `.json`,
+ * `instance.bson`, `.particlespawner` and `.particlesystem`. A draft
+ * `MyEffect.particlesystem` was therefore invisible to the overlay entirely --
+ * no row, no FTS entry, no edge -- while the identical file inside a shipped
+ * archive indexed normally.
+ *
+ * Read from `asset_types` rather than the schema set for the same reason
+ * `typeInferrer` is: it keeps the overlay working at tier 1 and avoids loading
+ * the schemas a second time. Falls back to `.json` on a corpus that records none.
+ */
+function assetSuffixesOf(db: Database): string[] {
+  const rows = db
+    .prepare(
+      "SELECT DISTINCT file_extension AS ext FROM main.asset_types WHERE file_extension IS NOT NULL",
+    )
+    .all() as unknown as { ext: string }[];
+  const found = rows.map((r) => r.ext).filter((e) => e !== "");
+  return found.length > 0 ? found : [".json"];
 }
 
 /**
@@ -92,6 +163,14 @@ export async function buildWorkingLayer(
 
   db.exec(`CREATE TEMP TABLE working_assets AS SELECT ${ASSET_COLUMNS} FROM main.assets LIMIT 0`);
   db.exec("CREATE TEMP TABLE working_packs AS SELECT * FROM main.packs LIMIT 0");
+  // CTAS copies columns and NOTHING else -- no primary key, no index -- so every
+  // join reaching this side had SQLite build an AUTOMATIC COVERING INDEX first,
+  // per execution. Indexed here instead. `CREATE TABLE AS` is kept because
+  // writing the columns out would duplicate the main schema and let the two
+  // drift; the indexes are dropped with their tables on the next rebuild.
+  db.exec("CREATE UNIQUE INDEX temp.idx_working_assets_id ON working_assets (id)");
+  db.exec("CREATE INDEX temp.idx_working_assets_logical ON working_assets (logical_id)");
+  db.exec("CREATE INDEX temp.idx_working_assets_type ON working_assets (type)");
 
   db.prepare(
     "INSERT INTO temp.working_packs (id, group_name, name, version, path, kind, priority, source_hash)" +
@@ -116,24 +195,37 @@ export async function buildWorkingLayer(
     `INSERT INTO temp.working_assets (${ASSET_COLUMNS}) VALUES (?,?,?,?,?,1,NULL,0)`,
   );
 
-  // Same suffix rule the corpus indexer applies, so an id here means what it
-  // means there.
   // The SAME walk pass 3 runs over the corpus. A pointer collected here is raw,
   // exactly as pass 2 collects them, so anything sitting behind a `$ref` matches
   // no declared field until it is rebased -- which silently swallowed the ItemId
   // inside a Recipe, the commonest shape there is.
-  const aligner = buildPointerAligner(db);
+  //
+  // Cached per connection AND lazy: a pack whose files have no schema-known type
+  // never touches it, and a pack that does pays for it once per process rather
+  // than once per command.
+  let alignerRef: PointerAligner | null = null;
+  const aligner = (): PointerAligner => (alignerRef ??= pointerAligner(db));
   // Parsed ONCE. Both the candidate pass and the search pass need the document,
   // and reading each file twice doubled the cost of every refresh -- the one
   // number that decides whether checking freshness before each answer is
   // affordable at all.
   const parsed = new Map<string, unknown>();
 
+  // Same suffix rule the corpus indexer applies, so an id here means what it
+  // means there -- taken from the corpus rather than assumed.
+  const suffixes = assetSuffixesOf(db);
+  const inferType = typeInferrer(db);
+
   let id = -1;
   let assets = 0;
   for (const entry of source.entries) {
-    if (!entry.path.endsWith(".json")) continue;
-    const assetType = types?.resolve(entry.path) ?? inferType(db, entry.path);
+    if (!suffixes.some((s) => entry.path.endsWith(s))) continue;
+    // Pack METADATA, not an asset. It was indexed as one: a searchable, untyped
+    // asset called `manifest`, which also pushed the untyped-blind-spot count up
+    // by one for every pack. The frozen indexer never sees this because archives
+    // are filtered by configured root as well as by suffix.
+    if (entry.path === "manifest.json") continue;
+    const assetType = types?.resolve(entry.path) ?? inferType(entry.path);
     const logicalId = assetIdFromPath(entry.path);
     insert.run(id, WORKING_PACK_ID, logicalId, assetType, entry.path);
     id -= 1;
@@ -154,8 +246,8 @@ export async function buildWorkingLayer(
       // which a working asset has no row in -- so a union stays unresolved and
       // the pointer is left as collected. Plain crossings, which is most of them,
       // rebase correctly.
-      const aligned = aligner.knows(assetType)
-        ? aligner.align(assetType, c.schemaPointer, c.pointer, id + 1)
+      const aligned = aligner().knows(assetType)
+        ? aligner().align(assetType, c.schemaPointer, c.pointer, id + 1)
         : { type: assetType, pointer: c.schemaPointer };
       insValue.run(id + 1, aligned.type, c.pointer, aligned.pointer, c.value, c.kind, logicalId);
     }
@@ -234,7 +326,19 @@ async function buildWorkingSearch(
   for (const row of rows) {
     // The identifier row always exists, with separators opened up so a single
     // token matches -- the frozen index does the same for unlocalized assets.
-    insFts.run(row.logical_id, row.type, "", row.logical_id.replace(/[_.]/g, " "), "");
+    // NORMALISED, like the frozen half. The tokenizer settings were copied here
+    // and the other half of the contract was not: `normalizeSearchText` segments
+    // CJK ideographs and folds Ukrainian G-with-upturn to G, and
+    // `buildMatchExpression` applies it to every QUERY. Storing raw meant a draft
+    // with a zh-CN or uk-UA name could not be found by that name -- including by
+    // typing it verbatim -- while the identical string in a vanilla asset was.
+    insFts.run(
+      row.logical_id,
+      row.type,
+      "",
+      normalizeSearchText(row.logical_id.replace(/[_.]/g, " ")),
+      "",
+    );
     if (byLocale.size === 0) continue;
 
     // Already parsed by the caller; absent means it did not parse, and that was
@@ -254,7 +358,13 @@ async function buildWorkingSearch(
         else name = value;
       }
       if (name !== "" || description !== "") {
-        insFts.run(row.logical_id, row.type, locale, name, description);
+        insFts.run(
+          row.logical_id,
+          row.type,
+          locale,
+          normalizeSearchText(name),
+          normalizeSearchText(description),
+        );
       }
     }
   }
@@ -275,6 +385,17 @@ function buildWorkingEdges(db: Database): void {
   db.exec("DROP VIEW IF EXISTS temp.edges");
   db.exec("DROP TABLE IF EXISTS temp.working_edges");
   db.exec("CREATE TEMP TABLE working_edges AS SELECT * FROM main.edges LIMIT 0");
+  // Same reason as `working_assets`: `refs` joins this side on both src and dst.
+  //
+  // NOT unique on `id`, unlike `main.edges` where it is the primary key. The ids
+  // here are synthesised as `-rowid` off `working_values`, and one working value
+  // can resolve to SEVERAL destination assets -- the heuristic rule below joins
+  // on logical_id alone, and 442 identifiers in this corpus name more than eight
+  // assets. So the same rowid legitimately produces several edges and they share
+  // an id. Worth knowing before anything treats `edges.id` as a key across the
+  // union view: on the frozen side it is one, on this side it is not.
+  db.exec("CREATE INDEX temp.idx_working_edges_src ON working_edges (src, kind)");
+  db.exec("CREATE INDEX temp.idx_working_edges_dst ON working_edges (dst, kind)");
 
   db.exec(`
     INSERT INTO temp.working_edges (id, src, dst, dst_kind, kind, json_pointer, confidence, role)
@@ -326,7 +447,14 @@ function buildWorkingEdges(db: Database): void {
 
   // `edges` is a RETRIEVAL table: `refs` answers "what points at this", and a
   // modder asking that about a vanilla asset wants to know their own pack now
-  // points at it. Statistics keep reading `main.edges` explicitly.
+  // points at it.
+  //
+  // Statistics read `main.edges` explicitly -- which was stated here as a fact
+  // for some time before it was one. No such query existed: `statsOp` and
+  // `assetsOfType` read the unqualified names and so counted the draft whenever
+  // an overlay was attached, and the only reason the totals looked right was
+  // that `statusOp` opens its own connection. They are qualified now, and this
+  // sentence is a description again rather than a hope.
   db.exec(
     "CREATE TEMP VIEW edges AS SELECT * FROM main.edges UNION ALL SELECT * FROM temp.working_edges",
   );

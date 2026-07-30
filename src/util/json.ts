@@ -110,10 +110,6 @@ function readSentinel(value: unknown): NonFiniteToken | null {
   return (TOKENS as readonly string[]).includes(token) ? (token as NonFiniteToken) : null;
 }
 
-function escapePointerSegment(segment: string): string {
-  return segment.replace(/~/g, "~0").replace(/\//g, "~1");
-}
-
 /** Replaces sentinels with null in place, recording where each one was. */
 function collectRepairs(node: unknown, pointer: string, repairs: Repair[]): unknown {
   if (Array.isArray(node)) {
@@ -125,7 +121,7 @@ function collectRepairs(node: unknown, pointer: string, repairs: Repair[]): unkn
   if (node !== null && typeof node === "object") {
     const obj = node as Record<string, unknown>;
     for (const key of Object.keys(obj)) {
-      obj[key] = collectRepairs(obj[key], `${pointer}/${escapePointerSegment(key)}`, repairs);
+      obj[key] = collectRepairs(obj[key], `${pointer}/${escapeSegment(key)}`, repairs);
     }
     return obj;
   }
@@ -203,6 +199,11 @@ export function isUnsetDefault(repair: Repair): boolean {
  * indexer and the schema reader -- which is three chances for a pointer written
  * one way and read another. Small enough that nobody minded; exactly the size at
  * which a divergence goes unnoticed.
+ *
+ * Two of those copies outlived the consolidation this docstring announced: one
+ * ninety lines above it in this same file, and one in the Stage-1 corpus walk,
+ * which builds the localization pointers Stage 3 then reads back. Both call this
+ * now, so the sentence above is finally true.
  */
 export function escapeSegment(segment: string): string {
   return segment.replace(/~/g, "~0").replace(/\//g, "~1");

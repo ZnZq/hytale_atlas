@@ -20,7 +20,7 @@
     "dev": "tsc --watch",
     "start": "node dist/cli/main.js",
     "test": "node --experimental-strip-types scripts/test.mjs",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "dependencies": {

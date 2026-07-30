@@ -1,6 +1,7 @@
 import type { Database } from "../db/open.ts";
 import { referenceToKey } from "../sources/lang.ts";
 import { scopes } from "../sources/schema-doc.ts";
+import { candidateRows } from "./references.ts";
 import { VALUE_LINKS } from "./value-links.ts";
 
 /**
@@ -58,22 +59,7 @@ export interface BenchResult {
   readonly duplicateIds: readonly string[];
 }
 
-interface Row {
-  asset_id: number;
-  json_pointer: string;
-  raw_value: string;
-}
-
 /** Candidates of one resolved schema field, with their raw document position. */
-function fieldRows(db: Database, scope: string, pointer: string): Row[] {
-  return db
-    .prepare(
-      `SELECT asset_id, json_pointer, raw_value FROM candidates
-        WHERE schema_scope = ? AND schema_pointer = ?`,
-    )
-    .all(scope, pointer) as unknown as Row[];
-}
-
 /** Drops the last `/Key` from a pointer, giving the object that holds it. */
 function parentOf(pointer: string): string {
   const cut = pointer.lastIndexOf("/");
@@ -118,11 +104,11 @@ export function indexBenches(db: Database): BenchResult {
       // read the value from the data instead of deriving it, since the data is
       // what the game actually loaded.
       const typeByPointer = new Map<string, string>();
-      for (const row of fieldRows(db, branch, "/Type")) {
+      for (const row of candidateRows(db, branch, "/Type")) {
         typeByPointer.set(`${row.asset_id}|${parentOf(row.json_pointer)}`, row.raw_value);
       }
 
-      for (const row of fieldRows(db, branch, BENCH_DECLARED.pointer)) {
+      for (const row of candidateRows(db, branch, BENCH_DECLARED.pointer)) {
         const at = parentOf(row.json_pointer);
         insBench.run(row.raw_value, typeByPointer.get(`${row.asset_id}|${at}`) ?? null);
         insDecl.run(row.raw_value, row.asset_id);
@@ -162,7 +148,7 @@ export function indexBenches(db: Database): BenchResult {
 
     // Bare-string categories: the branch declares /Categories/* as a string.
     for (const branch of branches) {
-      for (const row of fieldRows(db, branch, "/Categories/*")) {
+      for (const row of candidateRows(db, branch, "/Categories/*")) {
         const bench = benchFor(row.asset_id, row.json_pointer);
         if (bench === undefined) continue;
         insCategory.run(bench, row.raw_value, null, null, null);
@@ -178,14 +164,14 @@ export function indexBenches(db: Database): BenchResult {
     ] as const) {
       const names = new Map<string, string>();
       const icons = new Map<string, string>();
-      for (const row of fieldRows(db, scope, "/Name")) {
+      for (const row of candidateRows(db, scope, "/Name")) {
         names.set(`${row.asset_id}|${parentOf(row.json_pointer)}`, row.raw_value);
       }
-      for (const row of fieldRows(db, scope, "/Icon")) {
+      for (const row of candidateRows(db, scope, "/Icon")) {
         icons.set(`${row.asset_id}|${parentOf(row.json_pointer)}`, row.raw_value);
       }
 
-      for (const row of fieldRows(db, scope, "/Id")) {
+      for (const row of candidateRows(db, scope, "/Id")) {
         const at = parentOf(row.json_pointer);
         const bench = benchFor(row.asset_id, at);
         if (bench === undefined) continue;
@@ -236,7 +222,7 @@ export function indexBenches(db: Database): BenchResult {
     const unresolved = new Set<string>();
 
     const link = BENCH_REFERENCED;
-    for (const row of fieldRows(db, link.scope, link.pointer)) {
+    for (const row of candidateRows(db, link.scope, link.pointer)) {
       const at = parentOf(row.json_pointer);
       const known = benchIds.has(row.raw_value);
       insReq.run(row.asset_id, at, row.raw_value, known ? 1 : 0);
@@ -247,7 +233,7 @@ export function indexBenches(db: Database): BenchResult {
       else unresolved.add(row.raw_value);
     }
 
-    for (const row of fieldRows(db, link.scope, "/Categories/*")) {
+    for (const row of candidateRows(db, link.scope, "/Categories/*")) {
       insReqCat.run(row.asset_id, parentOf(parentOf(row.json_pointer)), row.raw_value);
     }
 

@@ -2151,8 +2151,16 @@ export function typeExists(db: Database, assetType: string): boolean {
  * too. 'The schema says nothing about this type' and 'this type does not
  * exist' are different answers and the reader needs the first one.
  */
+/**
+ * How many assets the CORPUS carries of a type.
+ *
+ * `main.`, because this is a statistic: it backs "N assets carry it" in
+ * `describe` and the untyped-blind-spot caveat, and both are claims about what
+ * the game does. Unqualified, it ran on the overlaid connection and inflated
+ * those counts by whatever the draft happened to contain.
+ */
 export function assetsOfType(db: Database, assetType: string): number {
-  return count(db, "SELECT count(*) AS n FROM assets WHERE type = ?", assetType);
+  return count(db, "SELECT count(*) AS n FROM main.assets WHERE type = ?", assetType);
 }
 
 export function searchSchemaOp(db: Database, query: string, limit = 20) {
@@ -2189,9 +2197,10 @@ export function searchSchemaOp(db: Database, query: string, limit = 20) {
   // exact one, so its caveat is printed BEFORE the rows rather than after.
   const loosened = caveats.filter((c) => c.code === "relaxed");
   const rest = caveats.filter((c) => c.code !== "relaxed");
+  const lead = loosened.length > 0 ? `${loosened.map((c) => c.message).join("\n")}\n\n` : "";
   return rendered(
     hits,
-    (loosened.length > 0 ? `${loosened.map((c) => c.message).join("\n")}\n\n` : "") +
+    lead +
       hits
         .map(
           (h) =>
@@ -2201,6 +2210,11 @@ export function searchSchemaOp(db: Database, query: string, limit = 20) {
         .join("") +
       caveatBlock(rest),
     caveats,
+    // The rows and nothing else are dropped: every field of every one is already
+    // in `value`, and the padding that lines them up in a terminal is bytes a
+    // model pays for twice. The qualifications stay -- they are the half that is
+    // NOT in `value` as prose.
+    lead + caveatBlock(rest),
   );
 }
 
@@ -2358,6 +2372,10 @@ export function undocumentedOp(db: Database, type: string | undefined, limit = 4
     { found: true, fields, total, declared, containersExcluded: containers },
     `${header}\n${body}${caveatBlock(caveats)}`,
     caveats,
+    // Header and qualifications, without the field rows: `value.fields` carries
+    // assetType, pointer, declaredType, referenceTarget and description for every
+    // one of them, so the table is the same data a second time in a padded form.
+    `${header}${caveatBlock(caveats)}`,
   );
 }
 
@@ -2424,24 +2442,39 @@ export function typesOp(
     const typePack = hasThirdPartyPacks(db) ? packLookup(db) : (): null => null;
     const shown = fetched.slice(0, limit);
     const capped = fetched.length > limit;
+    // The owner ON THE ROW, in `value`. The rendered table has always marked it,
+    // and `prose` below drops that table -- so without this the served answer
+    // would lose provenance exactly the way `search` did.
+    const owned = shown.map((r) => {
+      const p = typePack(r.logicalId, type);
+      return { ...r, pack: p?.name ?? null, packKind: p?.kind ?? null };
+    });
+    const head = `${formatCount(carried)} asset(s) of type '${type}':\n\n`;
+    const tail = capped ? truncationLine(shown.length, "assets", carried) : "";
     return rendered(
-      { kind: "assets" as const, type, assets: shown, total: carried },
-      `${formatCount(carried)} asset(s) of type '${type}':\n\n` +
+      { kind: "assets" as const, type, assets: owned, total: carried },
+      head +
         // Marked like every other listing. Without it this enumeration was the
         // one place a draft and a shipped asset looked identical.
         shown
           .map(
             (r) =>
-              `${(r.logicalId + packMark(typePack(r.logicalId))).padEnd(44)} ${r.path}\n`,
+              `${(r.logicalId + packMark(typePack(r.logicalId, type))).padEnd(44)} ${r.path}\n`,
           )
           .join("") +
-        (capped ? truncationLine(shown.length, "assets", carried) : ""),
+        tail,
       capped ? [caveat.truncated(shown.length, "assets", carried)] : [],
+      head + tail,
     );
   }
 
   const all = assetTypesOp(db).value;
   const shown = all.slice(0, limit);
+  const legend =
+    (all.length > limit ? truncationLine(shown.length, "types", all.length) : "") +
+    `\nFIELDS 0 means the generated schema declares nothing for that type, not ` +
+    `that it is empty.\nShared definitions ('common:...') are not asset types ` +
+    `and are not listed; describe accepts them.\n`;
   return rendered(
     { kind: "types" as const, types: shown, total: all.length },
     `${"TYPE".padEnd(34)} ${"ASSETS".padStart(7)} ${"FIELDS".padStart(7)}  WHERE\n\n` +
@@ -2452,11 +2485,11 @@ export function typesOp(
             `${formatCount(r.declaredFields).padStart(7)}  ${r.path ?? ""}\n`,
         )
         .join("") +
-      (all.length > limit ? truncationLine(shown.length, "types", all.length) : "") +
-      `\nFIELDS 0 means the generated schema declares nothing for that type, not ` +
-      `that it is empty.\nShared definitions ('common:...') are not asset types ` +
-      `and are not listed; describe accepts them.\n`,
+      legend,
     all.length > limit ? [caveat.truncated(shown.length, "types", all.length)] : [],
+    // No column headings either: they label a table that is not being sent, and
+    // every field they name is a key on each row of `value.types`.
+    legend,
   );
 }
 
@@ -2618,7 +2651,9 @@ export function refsOp(
   );
 
   const caveats: Caveat[] = [
-    caveat.untypedBlindSpot(count(db, "SELECT count(*) AS n FROM assets WHERE type IS NULL")),
+    // `main.`: this quantifies the CORPUS's blind spot, so a draft's untyped
+    // files must not be added to it.
+    caveat.untypedBlindSpot(count(db, "SELECT count(*) AS n FROM main.assets WHERE type IS NULL")),
     // Edges are built from files as written, so an asset that INHERITS a
     // reference is not among them: `refs Drops_Plant_Crop_Carrot_Stage1` lists
     // the two files that name it and not `Plant_Crop_Apple_Block`, whose
@@ -3420,7 +3455,18 @@ export function langOp(db: Database, query: string, limit = 20): Result<LangEntr
       );
     })
     .join("");
-  return rendered(entries, body + caveatBlock(caveats), caveats);
+  return rendered(
+    entries,
+    body + caveatBlock(caveats),
+    caveats,
+    // Nothing but the qualifications. Every line of the body above restates a
+    // field `value` already carries -- key, reference, translations, files,
+    // usedBy, usedByTotal -- including the two sentences that look like prose:
+    // "... and N more" is `usedByTotal` against `usedBy.length`, and "used by
+    // nothing indexed" is `usedBy.length === 0`. This is the largest text body
+    // of the ten tools, and all of it was a second copy.
+    caveatBlock(caveats),
+  );
 }
 
 export interface ValueLink {
@@ -3915,6 +3961,16 @@ export interface StatusValue {
     readonly overridden: readonly string[];
   };
   readonly tiers: readonly number[];
+  /**
+   * The pack being AUTHORED, when the config names one.
+   *
+   * `status` is described as the place to start, and it said nothing about a
+   * third layer of unvalidated drafts being laid over every answer that follows.
+   * A reader could see `Config:` and `mods selected:` and still have no idea a
+   * working pack was in play -- while `get`, `search` and `types` were already
+   * returning its rows.
+   */
+  readonly workingPack: string | null;
   readonly index: IndexStats | null;
   /** Why there are no index stats, when there are none. */
   readonly indexState:
@@ -3988,6 +4044,15 @@ export async function statusOp(
       `             overrides: ${overrides.length > 0 ? overrides.join(", ") : "none"}` +
         `  ·  mods selected: ${sources.mods.length}`,
     );
+    // Named, and named as a THIRD LAYER, because every answer below is overlaid
+    // with it. Retrieval sees these drafts; the statistics deliberately do not,
+    // and a reader who is not told the layer exists cannot make sense of either.
+    if (sources.config.pack !== null) {
+      lines.push(
+        `Working pack: ${sources.config.pack}`,
+        "             drafts appear in get/search/types; corpus statistics exclude them",
+      );
+    }
   }
   for (const problem of sources.problems) lines.push(`             PROBLEM: ${problem}`);
   if (install === null) {
@@ -4011,6 +4076,7 @@ export async function statusOp(
           overridden,
         },
         tiers: [],
+        workingPack: sources.config.pack,
         index: null,
         indexState: "no-archive" as const,
         databasePath: null,
@@ -4136,6 +4202,7 @@ export async function statusOp(
         overridden,
       },
       tiers,
+      workingPack: sources.config.pack,
       index: stats,
       indexState: state,
       databasePath: dbPath,
@@ -4153,10 +4220,22 @@ export async function statusOp(
   );
 }
 
+/**
+ * What the INDEX holds. `main.` on every table, deliberately.
+ *
+ * These are corpus statistics, and the working overlay is a third layer that
+ * must never be folded into them -- a half-written pack becoming its own
+ * evidence is the single failure `working.ts` was written to prevent. That file
+ * enforces the split by choosing which tables to union, which is a rule about
+ * `working.ts` and not about its readers: every aggregate here read `assets` and
+ * `edges` unqualified, so any connection carrying an overlay counted the draft.
+ * It survived only because `statusOp` happens to open its own connection.
+ * Qualifying makes the invariant the comment claims actually true here.
+ */
 export function statsOp(db: Database): Result<IndexStats> {
   const stats: IndexStats = {
-    assets: count(db, "SELECT count(*) AS n FROM assets"),
-    typed: count(db, "SELECT count(*) AS n FROM assets WHERE type IS NOT NULL"),
+    assets: count(db, "SELECT count(*) AS n FROM main.assets"),
+    typed: count(db, "SELECT count(*) AS n FROM main.assets WHERE type IS NOT NULL"),
     declaredFields: count(
       db,
       "SELECT count(*) AS n FROM schema_fields WHERE json_pointer <> ''",
@@ -4167,7 +4246,7 @@ export function statsOp(db: Database): Result<IndexStats> {
       `SELECT count(*) AS n FROM field_stats fs JOIN schema_fields sf
          ON sf.asset_type = fs.asset_type AND sf.json_pointer = fs.json_pointer`,
     ),
-    edges: count(db, "SELECT count(*) AS n FROM edges"),
+    edges: count(db, "SELECT count(*) AS n FROM main.edges"),
     locales: (
       db
         .prepare("SELECT DISTINCT locale FROM lang_keys ORDER BY locale")

@@ -718,7 +718,14 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
       [
         `Indexed ${formatCount(result.assets)} assets ` +
           `(${formatCount(result.typed)} typed, ${formatCount(result.localized)} localized), ` +
-          `${formatCount(result.files)} files`,
+          `${formatCount(result.files)} files` +
+          // Stated, because these assets are indexed and inert: findable by name,
+          // contributing no field, edge or translation. Silence made a corpus-wide
+          // problem and one bad file look identical.
+          (result.parseFailures > 0
+            ? `\n  note: ${formatCount(result.parseFailures)} asset(s) could not be parsed ` +
+              `and contribute no fields, edges or localization`
+            : ""),
         `Edges: ${formatCount(edges.references)} references ` +
           `(${formatCount(edges.ambiguous)} low-confidence), ` +
           `${formatCount(edges.fileReferences)} to files, ` +
