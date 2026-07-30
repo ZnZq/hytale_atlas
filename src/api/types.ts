@@ -57,6 +57,7 @@ export type CaveatCode =
   | "pointer-repaired"
   /** Part of this answer comes from a third-party pack, not from the game. */
   | "third-party"
+  | "working-pack"
   | "shadowed"
   | "shadowed-shown"
   | "contested-packs";
@@ -79,6 +80,16 @@ export type CaveatCode =
 export interface Result<T> {
   readonly value: T;
   readonly caveats: readonly Caveat[];
+  /**
+   * The same answer WITHOUT the rows that `value` already carries.
+   *
+   * A tabular row is a second, lossier copy of structured data the caller was
+   * handed anyway -- and an MCP client pays for both. What is NOT in `value` is
+   * the prose: the qualifications, the explanations of what a column means, the
+   * next step to take. That is the part worth serving to a model, and this field
+   * is it. Absent where an answer has no table to drop.
+   */
+  readonly prose?: string;
   /** Rendered form. Optional while the commands are being moved across. */
   readonly text?: string;
 }
@@ -125,8 +136,9 @@ export function rendered<T>(
   value: T,
   text: string,
   caveats: readonly Caveat[] = [],
+  prose?: string,
 ): Result<T> {
-  return { value, caveats, text };
+  return { value, caveats, text, ...(prose === undefined ? {} : { prose }) };
 }
 
 /**
@@ -316,6 +328,24 @@ export const caveat = {
       `this index cannot observe. ${winner} is the expected winner (packs load ` +
       `after the base game). Ask again naming the pack you want.`,
   }),
+  /**
+   * The answer touched the pack currently being written.
+   *
+   * Deliberately not the third-party caveat, which says "requires that pack to be
+   * installed" -- true of someone else's mod, false of your own working copy, and
+   * exactly the kind of sentence that is right in one context and misleading in
+   * the next. What matters here instead is that this content is unverified: it is
+   * a draft, frequently written by the same model now reading it back.
+   */
+  workingPack: (): Caveat => ({
+    code: "working-pack",
+    message:
+      "This answer includes assets from the pack you are AUTHORING, marked " +
+      "[working]. They are drafts: nothing has validated them, and they are not " +
+      "evidence of what the game does. Treat them as what you wrote, not as " +
+      "what exists.",
+  }),
+
   thirdParty: (packs: readonly string[]): Caveat => ({
     code: "third-party",
     message:

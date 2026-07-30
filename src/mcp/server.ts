@@ -1,5 +1,7 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { createServer } from "node:http";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -146,7 +148,13 @@ async function ensureIndex(options: { assets?: string; patchline?: string }): Pr
   process.stderr.write("hytale-atlas: index ready.\n");
 }
 
-export async function serveMcp(options: { assets?: string; patchline?: string } = {}): Promise<number> {
+interface Prepared {
+  readonly context: ToolContext;
+  readonly close: () => void;
+}
+
+/** Index, database and lazy archive -- identical for either transport. */
+async function prepare(options: { assets?: string; patchline?: string }): Promise<Prepared> {
   await ensureIndex(options);
   const db = await openIndex(options);
 
@@ -167,6 +175,17 @@ export async function serveMcp(options: { assets?: string; patchline?: string } 
     },
   };
 
+  return {
+    context,
+    close: () => {
+      archive?.close();
+      db.close();
+    },
+  };
+}
+
+/** The MCP server itself, with no transport attached yet. */
+function buildServer(context: ToolContext): Server {
   const server = new Server(SERVER_INFO, {
     capabilities: { tools: {} },
     instructions: INSTRUCTIONS,
@@ -205,6 +224,26 @@ export async function serveMcp(options: { assets?: string; patchline?: string } 
     }
   });
 
+  return server;
+}
+
+/**
+ * The port this serves on when nothing says otherwise.
+ *
+ * Derived from the package name rather than picked, so it is not another 8080 --
+ * the round numbers collide precisely because everyone reaches for them. The
+ * 40000-47999 band sits above the dense registered range and below the dynamic
+ * range Windows hands out for outgoing connections (49152+), so a listener here
+ * will not fight the OS for it either.
+ */
+export const DEFAULT_HTTP_PORT = 43790;
+
+export async function serveMcp(
+  options: { assets?: string; patchline?: string } = {},
+): Promise<number> {
+  const { context, close } = await prepare(options);
+  const server = buildServer(context);
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   process.stderr.write(
@@ -218,7 +257,85 @@ export async function serveMcp(options: { assets?: string; patchline?: string } 
     process.on("SIGTERM", resolve);
   });
 
-  archive?.close();
-  db.close();
+  close();
+  return 0;
+}
+
+/**
+ * The same server over HTTP, for clients that take a URL instead of a command.
+ *
+ * Binds LOOPBACK by default, and that is the whole security model. A stdio server
+ * is reachable only by the process that spawned it; the moment this listens on a
+ * socket, anything that can reach the socket can ask it questions. There is no
+ * auth here because there is nothing to authenticate against -- so the answer is
+ * not to be reachable. Passing a non-loopback host is possible and is a decision
+ * the caller has to make deliberately.
+ *
+ * Stateless: `sessionIdGenerator: undefined` means no session table to grow or
+ * leak. DNS-rebinding protection is on, which stops a page in a browser from
+ * resolving a hostname it controls to 127.0.0.1 and talking to this.
+ */
+export async function serveHttp(
+  options: { assets?: string; patchline?: string } = {},
+  port: number = DEFAULT_HTTP_PORT,
+  host = "127.0.0.1",
+): Promise<number> {
+  const { context, close } = await prepare(options);
+
+  // A FRESH server and transport per request, which is what stateless means in
+  // this SDK. Sharing one transport across requests looked right and worked for
+  // exactly one call: `initialize` succeeded, and every later request -- including
+  // the next `initialize` -- came back 500, because the single transport was
+  // still holding the first exchange's state. The database and archive are still
+  // shared through `context`; only the protocol plumbing is per-request, and that
+  // costs no I/O.
+  const http = createServer((req, res) => {
+    void (async () => {
+      const perRequest = buildServer(context);
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+        enableDnsRebindingProtection: true,
+        allowedHosts: [`${host}:${port}`, `localhost:${port}`, `127.0.0.1:${port}`],
+      } as unknown as ConstructorParameters<typeof StreamableHTTPServerTransport>[0]);
+      res.on("close", () => {
+        void transport.close();
+        void perRequest.close();
+      });
+      await perRequest.connect(transport as unknown as Parameters<Server["connect"]>[0]);
+      await transport.handleRequest(req, res);
+    })().catch((err: unknown) => {
+      if (!res.headersSent) res.writeHead(500);
+      res.end(String(err instanceof Error ? err.message : err));
+    });
+  });
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      http.once("error", reject);
+      http.listen(port, host, resolve);
+    });
+  } catch (err) {
+    close();
+    const code = (err as NodeJS.ErrnoException).code;
+    throw new Error(
+      code === "EADDRINUSE"
+        ? `Port ${port} is already in use. Pass --port <n>, or set "port" in hytale-atlas.json.`
+        : `Could not listen on ${host}:${port}: ${code ?? String(err)}`,
+    );
+  }
+
+  // stdout is FREE here, unlike stdio mode where it carries the protocol.
+  process.stdout.write(
+    `hytale-atlas MCP on http://${host}:${port}/mcp -- ${TOOLS.length} tools, index ready.\n` +
+      `Loopback only. Ctrl+C to stop.\n`,
+  );
+
+  await new Promise<void>((resolve) => {
+    process.on("SIGINT", resolve);
+    process.on("SIGTERM", resolve);
+  });
+
+  await new Promise<void>((resolve) => http.close(() => resolve()));
+  close();
   return 0;
 }

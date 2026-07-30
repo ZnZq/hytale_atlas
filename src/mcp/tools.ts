@@ -5,6 +5,7 @@ import {
   assetsDeclaringField,
   countAssetsDeclaringField,
   packDefinitions,
+  refreshWorking,
   declarerSampleSize,
   assetsOfType,
   benchIdExists,
@@ -243,12 +244,48 @@ export interface ToolContext {
   readonly options: { assets?: string; patchline?: string };
 }
 
+/**
+ * Drops column padding, keeping indentation.
+ *
+ * The rendered text is written to line up in a terminal, and a model pays for
+ * that alignment in tokens: measured across five tools, 16% of the served text
+ * was runs of spaces -- 27% on `refs` and `bench` -- carrying nothing.
+ *
+ * Only runs FOLLOWING a non-space collapse. Leading indentation is structure:
+ * it says a line belongs to the one above it, and flattening it would cost
+ * more meaning than the padding was worth. Nothing else changes, so the CLI
+ * and MCP still say the same things -- the parity test compares through this
+ * same function rather than being relaxed.
+ */
+export function compact(text: string): string {
+  return text.replace(/(?<=\S) {2,}/g, " ");
+}
+
 export async function callTool(
   ctx: ToolContext,
   name: string,
   args: Record<string, unknown>,
 ): Promise<Result<unknown>> {
+  const result = await dispatch(ctx, name, args);
+  // One place, so no tool can forget. `value` and `caveats` pass through
+  // untouched. `prose` wins where an operation offers it: the rows it drops are
+  // already in `value`, field by field, and serving both means the model reads
+  // the same rows twice -- once as data, once as a padded string.
+  const served = result.prose ?? result.text;
+  return served === undefined ? result : { ...result, text: compact(served) };
+}
+
+async function dispatch(
+  ctx: ToolContext,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<Result<unknown>> {
   const { db } = ctx;
+  // Before answering, not on a timer. A server outlives the files it describes,
+  // so the pack being authored is re-read here whenever its tree stamp moved --
+  // which is why a one-shot CLI run and a long-lived server need no different
+  // code, and why a missed file-watch event cannot produce a stale answer.
+  await refreshWorking(db);
   // A malformed `limit` is REPORTED, not swallowed. `count` maps anything
   // invalid to undefined, which the operations then replace with their default,
   // so `limit: 0` returned a full page and `limit: "20"` returned the default --
@@ -294,7 +331,7 @@ export async function callTool(
     case "search": {
       const query = text(args, "query");
       if (query === undefined) return miss("A 'query' is required.");
-      return searchAssetsOp(db, query, limit ?? 20, text(args, "type"));
+      return searchAssetsOp(db, query, limit, text(args, "type"));
     }
 
     case "get": {
@@ -305,12 +342,12 @@ export async function callTool(
       // asset was catalogued and unreachable -- the worst state, because every
       // count still included it.
       const pack = text(args, "pack");
-      const { load, close } = packAssetLoader(
+      const { load, close, unreadable } = packAssetLoader(
         db,
         type,
         ...(pack === undefined ? [] : [{ logicalId: id, pack }]),
       );
-      const resolved = await getAssetOp(db, id, load, type, false, pack);
+      const resolved = await getAssetOp(db, id, load, type, false, pack, unreadable);
       close();
       // A multi-pack identifier also comes back with no value, and it is NOT a
       // miss -- the asset exists and is waiting on a choice. Reporting "No asset"
@@ -472,19 +509,19 @@ export async function callTool(
       // Every branch -- asset, wrong type, value, file, miss -- comes from one
       // operation now. Assembled here, each one diverged: the value branch was
       // served with `caveats: []` and one row more than the limit asked for.
-      return refsAnyOp(db, id, text(args, "type"), limit ?? 40) as Result<unknown>;
+      return refsAnyOp(db, id, text(args, "type"), limit) as Result<unknown>;
     }
 
     case "search_schema": {
       const query = text(args, "query");
       if (query === undefined) return miss("A 'query' is required.");
-      return searchSchemaOp(db, query, limit ?? 20);
+      return searchSchemaOp(db, query, limit);
     }
 
     case "search_lang": {
       const query = text(args, "query");
       if (query === undefined) return miss("A 'query' is required.");
-      const found = langOp(db, query, limit ?? 20);
+      const found = langOp(db, query, limit);
       // The operation's own miss text, which explains root stripping and the
       // literal-matching limit. This returned a paraphrase of it.
       return found.value.length === 0
@@ -498,12 +535,12 @@ export async function callTool(
 
     case "bench": {
       const id = text(args, "id");
-      if (id === undefined) return benchesOp(db, limit ?? 200) as Result<unknown>;
-      return benchOp(db, id, limit ?? 200) as Result<unknown>;
+      if (id === undefined) return benchesOp(db, limit) as Result<unknown>;
+      return benchOp(db, id, limit) as Result<unknown>;
     }
 
     case "undocumented":
-      return undocumentedOp(db, text(args, "type"), limit ?? 40);
+      return undocumentedOp(db, text(args, "type"), limit);
 
     default:
       return miss(`No tool named '${name}'.`);

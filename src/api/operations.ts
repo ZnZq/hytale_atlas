@@ -16,7 +16,14 @@ import {
   searchSchemaDetailed,
 } from "../query/schema.ts";
 import { type SearchHit, searchAssets } from "../query/search.ts";
-import { AssetArchive, sourceStamp } from "../sources/archive.ts";
+import { AssetArchive, type AssetSource, sourceStamp } from "../sources/archive.ts";
+import { DirectorySource } from "../sources/directory.ts";
+import {
+  buildWorkingLayer,
+  refreshWorkingLayer,
+  type WorkingLayer,
+  workingValues,
+} from "./working.ts";
 import { detectInstallation, detectProject } from "../sources/detect.ts";
 import {
   type AtlasConfig,
@@ -55,6 +62,8 @@ import {
 export interface OpenOptions {
   readonly assets?: string;
   readonly patchline?: string;
+  /** Where to look for `hytale-atlas.json`. Defaults to the process's own. */
+  readonly cwd?: string;
 }
 
 /** Resolves and opens the frozen index, or explains precisely why it cannot. */
@@ -78,6 +87,9 @@ export async function openIndex(
   // assets with zero edges, and `search`, `get`, `refs` and `describe` all read
   // that happily and answer with confidence. Detecting a half-built index is
   // worth nothing if the commands that would be wrong about it never ask.
+  // The pack being authored, if the config names one. Attached HERE because this
+  // is the single gate every read path already goes through -- `frozenDb` and the
+  // MCP bootstrap both land here, so neither can miss it or attach it differently.
   const state = pipelineState(db);
   if (state !== "ready") {
     db.close();
@@ -89,7 +101,31 @@ export async function openIndex(
         `\nRun: hytale-atlas index --force\n  database: ${dbPath}`,
     );
   }
+  await attachWorking(db, options.cwd);
   return db;
+}
+
+/** The overlay currently attached to a connection, for refreshing it later. */
+const attached = new WeakMap<Database, { root: string; layer: WorkingLayer | null }>();
+
+async function attachWorking(db: Database, cwd?: string): Promise<void> {
+  const root = loadConfig(cwd).pack;
+  if (root === null) return;
+  attached.set(db, { root, layer: await buildWorkingLayer(db, root) });
+}
+
+/**
+ * Re-reads the working pack when it changed, and only then.
+ *
+ * A one-shot CLI run is fresh by construction; a server is not, so it calls this
+ * before answering. Comparing a tree stamp rather than watching files keeps both
+ * on one code path -- and a stamp cannot miss an event, which a watcher on a deep
+ * Windows tree can.
+ */
+export async function refreshWorking(db: Database): Promise<void> {
+  const entry = attached.get(db);
+  if (entry === undefined) return;
+  entry.layer = await refreshWorkingLayer(db, entry.layer, entry.root);
 }
 
 function count(db: Database, sql: string, ...params: unknown[]): number {
@@ -250,7 +286,8 @@ export function searchAssetsOp(
         ),
         ...(fetched.length > limit ? [caveat.truncated(literal.length, "matches", total)] : []),
       ];
-      return rendered(rows, searchTable(rows, literalCaveats), literalCaveats);
+      const literalTable = searchTable(rows, literalCaveats);
+      return rendered(rows, literalTable.text, literalCaveats, literalTable.prose);
     }
   }
   // Stated on a miss, because "no matches" reads as "this string appears
@@ -259,7 +296,8 @@ export function searchAssetsOp(
     caveats.push(caveat.namesNotValues());
     return rendered(hits, searchMiss(db, query, type, caveats), caveats);
   }
-  return rendered(hits, searchTable(hits, caveats, packs), caveats);
+  const table = searchTable(hits, caveats, packs);
+  return rendered(hits, table.text, caveats, table.prose);
 }
 
 /**
@@ -375,7 +413,7 @@ function searchTable(
   hits: readonly SearchHit[],
   caveats: readonly Caveat[],
   packs?: ReadonlyMap<string, AssetPack | null>,
-): string {
+): { text: string; prose: string } {
   // "name" was a promise the column cannot keep. Translation references are
   // recognised by SHAPE, not by an allowlist of field names -- they arrive under
   // at least eight, `Value` being the second most common -- so the text here is
@@ -409,17 +447,21 @@ function searchTable(
     ? `\n~N marks a row the query only reached after being loosened N time(s); ` +
       `those are weaker matches.\n`
     : "";
-  return (
-    header +
-    body +
+  const explain =
     loosened +
     `\n[id] means the match was on the identifier, not on a translation.\n` +
     `A locale here is where THIS query matched, not the only language the ` +
     `asset has.\nThe text is whichever translated string the asset carries -- ` +
     `usually its name, but\nan asset with no name shows another (a death ` +
     `message, a hint).\nUse 'search-lang <id>' for every translation of one asset.\n` +
-    caveatBlock(caveats)
-  );
+    caveatBlock(caveats);
+
+  // Two renderings of one answer. `text` is what a terminal shows; `prose`
+  // drops the rows because `value` already carries each of them as fields, and
+  // a model reading both pays twice for the worse copy.
+  // No header in `prose`: it is a legend for columns that are not there. The
+  // fields it labels are named in `value` anyway.
+  return { text: header + body + explain, prose: explain };
 }
 
 /**
@@ -550,20 +592,22 @@ export function packAssetLoader(
   // because a shadowed file's `Parent` still points into the live corpus and
   // pinning the whole chain would invent a variant of the game nobody runs.
   pin?: { readonly logicalId: string; readonly pack: string },
-): { load: AssetLoader; close: () => void } {
+): { load: AssetLoader; unreadable: ReadonlySet<string>; close: () => void } {
   const byId = db.prepare(
-    `SELECT a.path, a.type, a.pack_id AS packId, p.path AS packPath
+    `SELECT a.path, a.type, a.pack_id AS packId, p.path AS packPath, p.kind AS packKind
        FROM assets a JOIN packs p ON p.id = a.pack_id
       WHERE a.logical_id = ?1 AND (?2 IS NULL OR a.type = ?2)
-      ORDER BY a.is_effective DESC, a.type LIMIT 1`,
+      ORDER BY a.is_effective DESC, p.priority ASC, a.type LIMIT 1`,
   );
   const byIdAndPack = db.prepare(
-    `SELECT a.path, a.type, a.pack_id AS packId, p.path AS packPath
+    `SELECT a.path, a.type, a.pack_id AS packId, p.path AS packPath, p.kind AS packKind
        FROM assets a JOIN packs p ON p.id = a.pack_id
       WHERE a.logical_id = ?1 AND (?2 IS NULL OR a.type = ?2) AND p.name = ?3
       ORDER BY a.type LIMIT 1`,
   );
-  const open = new Map<number, Promise<AssetArchive>>();
+  const open = new Map<number, Promise<AssetSource>>();
+  /** Identifiers whose file was found and could not be parsed. */
+  const unreadable = new Set<string>();
 
   const load: AssetLoader = async (logicalId, forType) => {
     const stmt = pin !== undefined && pin.logicalId === logicalId ? byIdAndPack : byId;
@@ -572,12 +616,23 @@ export function packAssetLoader(
         ? stmt.get(logicalId, forType ?? fallbackType ?? null, pin!.pack)
         : stmt.get(logicalId, forType ?? fallbackType ?? null)
     ) as
-      | { path: string; type: string | null; packId: number; packPath: string }
+      | {
+          path: string;
+          type: string | null;
+          packId: number;
+          packPath: string;
+          packKind: string;
+        }
       | undefined;
     if (row === undefined) return null;
     let pending = open.get(row.packId);
     if (pending === undefined) {
-      pending = AssetArchive.open(row.packPath);
+      // The pack being authored is a DIRECTORY, not an archive. The zip opener
+      // fails on its first byte, so the kind decides which reader runs.
+      pending =
+        row.packKind === "working"
+          ? Promise.resolve(DirectorySource.open(row.packPath))
+          : AssetArchive.open(row.packPath);
       open.set(row.packId, pending);
     }
     try {
@@ -588,15 +643,20 @@ export function packAssetLoader(
         document: JSON.parse(await archive.readText(row.path)) as unknown,
       };
     } catch {
-      // A pack that vanished between indexing and reading, or a malformed
-      // document. Both are "no effective definition", which is what the caller
-      // already knows how to report.
+      // Both cases end in "no document", but they are NOT the same finding: a
+      // vanished pack is absence, a malformed file is a draft mid-edit. Erasing
+      // the difference here forced `getAssetOp` to guess the cause from the
+      // candidate list, and it guessed by saying "No 'X' of type 'Item'. It
+      // exists as: Item, Item" -- denying and asserting one fact in a sentence.
+      // The distinction is recorded rather than reconstructed.
+      unreadable.add(logicalId);
       return null;
     }
   };
 
   return {
     load,
+    unreadable,
     close: () => {
       for (const pending of open.values()) void pending.then((a) => a.close()).catch(() => {});
     },
@@ -734,8 +794,13 @@ export async function packVariants(
 
 export function packLookup(db: Database): (logicalId: string) => AssetPack | null {
   const stmt = db.prepare(
+    // Priority breaks the tie. Every working row is is_effective=1, and so is the
+    // frozen row it shadows, so ordering on that alone left SQLite to choose --
+    // and it chose the installed pack, labelling a row `[SomePack]` while the
+    // value shown came from the draft that replaced it. `get` ordered correctly
+    // and `search` did not, which is the divergence this column exists to expose.
     `SELECT p.name, p.kind FROM assets a JOIN packs p ON p.id = a.pack_id
-      WHERE a.logical_id = ? ORDER BY a.is_effective DESC LIMIT 1`,
+      WHERE a.logical_id = ? ORDER BY a.is_effective DESC, p.priority ASC LIMIT 1`,
   );
   return (logicalId) => (stmt.get(logicalId) as AssetPack | undefined) ?? null;
 }
@@ -751,6 +816,8 @@ export async function getAssetOp(
   // would name the pack that WON while printing the file that lost -- the exact
   // class of quiet disagreement this whole provenance pass exists to remove.
   pinnedPack?: string,
+  /** From the loader: identifiers whose file was found but would not parse. */
+  unreadable?: ReadonlySet<string>,
 ): Promise<Result<(ResolvedAsset & { pack: AssetPack | null }) | null>> {
   const candidates = sameNamed(db, logicalId);
   // The count comes from an unlimited query; `candidates` is the 8-row sample.
@@ -783,7 +850,32 @@ export async function getAssetOp(
     // that does not exist -- circular, and it sent a reader looking for a
     // disambiguation feature under the wrong command.
     let text: string;
-    if (type !== undefined && candidates.length > 0) {
+    // The loader SAYS which it was. This used to be inferred from the candidate
+    // list -- if a candidate shared the requested type, the failure was assumed
+    // to be a read failure -- which was a guess dressed as a diagnosis, and wrong
+    // whenever an asset of that type existed in another pack. Now the cause
+    // travels with the failure instead of being reconstructed from its shadow.
+    const sameType = candidates.filter((c) => c.type === type);
+    if (unreadable?.has(logicalId) === true) {
+      text =
+        `'${logicalId}' was FOUND but could not be parsed.\n` +
+        // Deduplicated on the PATH, because two packs defining one identifier
+        // give two candidate rows with the same relative path, and printing a
+        // file twice reads as two separate problems.
+        `${[...new Set((sameType.length > 0 ? sameType : candidates).map((c) => c.path))]
+          .map((path) => `  ${path}\n`)
+          .join("")}` +
+        `The file exists and is not valid JSON -- most often a trailing comma or\n` +
+        `an unclosed brace, which is the normal state of a file being edited.\n`;
+    } else if (type !== undefined && sameType.length > 0) {
+      text =
+        `'${logicalId}' exists as ${type} but could not be READ.\n` +
+        `${sameType.map((c) => `  ${c.path}\n`).join("")}` +
+        `Most often malformed JSON -- a trailing comma, an unclosed brace.\n` +
+        (sameType.length > 1
+          ? `${sameType.length} packs define it; try --pack <name> to read one.\n`
+          : "");
+    } else if (type !== undefined && candidates.length > 0) {
       text =
         `No '${logicalId}' of type '${type}'. It exists as: ` +
         `${candidates.map((s) => s.type ?? "untyped").join(", ")}\n`;
@@ -819,12 +911,18 @@ export async function getAssetOp(
     pack = pinned === undefined ? null : { name: pinned.pack, kind: pinned.kind };
   }
   const foreign = new Set<string>();
-  if (pack !== null && pack.kind !== "vanilla") foreign.add(pack.name);
-  for (const ancestor of resolved.parentChain) {
-    const p = of(ancestor);
-    if (p !== null && p.kind !== "vanilla") foreign.add(p.name);
-  }
+  let touchesWorking = false;
+  const note = (p: AssetPack | null): void => {
+    if (p === null || p.kind === "vanilla") return;
+    // The pack being authored is not a dependency someone must install; it is a
+    // draft. Two different warnings, and mixing them makes both wrong.
+    if (p.kind === "working") touchesWorking = true;
+    else foreign.add(p.name);
+  };
+  note(pack);
+  for (const ancestor of resolved.parentChain) note(of(ancestor));
   if (foreign.size > 0) caveats.push(caveat.thirdParty([...foreign].sort()));
+  if (touchesWorking) caveats.push(caveat.workingPack());
 
   // Several packs define this identifier and the caller did not say which one it
   // wants. Answering anyway would mean picking for them, and the pick is not
@@ -1329,6 +1427,19 @@ function describeField(
         `           (${shown.length} of ${formatCount(o.cardinality)} distinct` +
         `${single ? "" : "; use --field for the rest"})\n`;
     }
+  }
+
+  // THIRD LAYER. Never folded into `seen:` above -- that line answers "what does
+  // the corpus do", and a draft in it answers a different question than the one
+  // asked. Worse, this pack is often written by the model that then reads it
+  // back, so merging would let an invention become its own evidence.
+  const mine = workingValues(db, f.assetType, f.pointer);
+  if (mine.length > 0) {
+    const shown = mine.slice(0, 8);
+    out +=
+      `    yours: ${shown.map((m) => m.value).join(", ")}` +
+      (mine.length > shown.length ? `  (${shown.length} of ${mine.length})` : "") +
+      `   [working -- unverified draft]\n`;
   }
 
   if (o) {
@@ -2093,12 +2204,20 @@ export function typesOp(
       );
     }
     const fetched = assetsOfTypeList(db, type, limit + 1);
+    const typePack = hasThirdPartyPacks(db) ? packLookup(db) : (): null => null;
     const shown = fetched.slice(0, limit);
     const capped = fetched.length > limit;
     return rendered(
       { kind: "assets" as const, type, assets: shown, total: carried },
       `${formatCount(carried)} asset(s) of type '${type}':\n\n` +
-        shown.map((r) => `${r.logicalId.padEnd(44)} ${r.path}\n`).join("") +
+        // Marked like every other listing. Without it this enumeration was the
+        // one place a draft and a shipped asset looked identical.
+        shown
+          .map(
+            (r) =>
+              `${(r.logicalId + packMark(typePack(r.logicalId))).padEnd(44)} ${r.path}\n`,
+          )
+          .join("") +
         (capped ? truncationLine(shown.length, "assets", carried) : ""),
       capped ? [caveat.truncated(shown.length, "assets", carried)] : [],
     );
@@ -2772,7 +2891,10 @@ export function refsAnyOp(
         reason:
           `No asset '${logicalId}'${type ? ` of type '${type}'` : ""}, and nothing carries ` +
           `it as a value. No file of that name is REFERENCED by any asset (asset ` +
-          `documents themselves are not in the file index).`,
+          `documents themselves are not in the file index).` +
+          (hasThirdPartyPacks(db)
+            ? ` The pack you are authoring is not scanned for VALUES here -- only the indexed corpus is -- so a string that appears only in your draft reads as absent.`
+            : ""),
         ...(declared === null ? {} : { declaredAs: declared }),
         alsoKnownAs: identify(db, logicalId),
       },
@@ -2789,6 +2911,7 @@ export function refsAnyOp(
   // declaring it, so `refs Bench_WorkBench` returned one unrelated edge while 49
   // recipes required that bench.
   const declares = benchDeclaredBy(db, logicalId);
+  const refPack = hasThirdPartyPacks(db) ? packLookup(db) : (): null => null;
   const beyond = valueOccurrencesWithoutEdges(
     db,
     logicalId,
@@ -2804,13 +2927,29 @@ export function refsAnyOp(
     (v.total === 0
       ? `Nothing references '${logicalId}'.\n`
       : `${formatCount(v.total)} references to '${logicalId}':\n\n` +
-        v.references
-          .map(
-            (r) =>
-              `${r.confidence.padEnd(7)} ${r.logicalId.padEnd(34)} ` +
-              `${(r.type ?? "(untyped)").padEnd(20)} ${r.kind} ${r.pointer ?? ""}\n`,
-          )
-          .join("")) +
+        ((): string => {
+          // Width from the ROWS, not a guess. A fixed 34 was narrower than the
+          // identifiers packs actually ship -- `BlameJared_ThoriumFurnaces_Mithril_Furnace`
+          // is 42 -- so every such row overflowed and pushed the columns after it
+          // out of alignment. A reviewer misread one of these as a different
+          // furnace of the same pack, which is what a ragged table is FOR.
+          const width = Math.max(
+            ...v.references.map((r) => (r.logicalId + packMark(refPack(r.logicalId))).length),
+            34,
+          );
+          return v.references
+            .map(
+              (r) =>
+              // Marked, because an unmarked row reads as an asset that EXISTS.
+              // The pack being authored shows up here the moment its /Parent
+              // resolves, and a draft indistinguishable from shipped content is
+              // the confusion provenance exists to prevent.
+                `${r.confidence.padEnd(7)} ` +
+                `${(r.logicalId + packMark(refPack(r.logicalId))).padEnd(width)} ` +
+                `${(r.type ?? "(untyped)").padEnd(20)} ${r.kind} ${r.pointer ?? ""}\n`,
+            )
+            .join("");
+        })()) +
     // The asset branch is chosen silently when the token is BOTH an asset and a
     // field value, and the value report is then unreachable. Every Quality value
     // in the game (1-6) is also the name of a BlockMigration asset.

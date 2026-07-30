@@ -56,6 +56,16 @@ export interface AtlasConfig {
    * key: moving the directory does not invalidate anything, it just relocates it.
    */
   readonly cacheDir: string | null;
+  /**
+   * The pack being AUTHORED, as a directory, resolved against this config file.
+   *
+   * Distinct from `mods` on purpose: those are archives someone else shipped and
+   * a player has installed, this is loose files you are editing right now. One
+   * key, singular, because you write one pack at a time.
+   */
+  readonly pack: string | null;
+  /** TCP port for `serve`. Null means the built-in default. */
+  readonly port: number | null;
   readonly mods: ModSources;
   /**
    * Standing answer to the one prompt that guards code execution.
@@ -88,6 +98,8 @@ const EMPTY: AtlasConfig = {
   patchline: null,
   schema: null,
   cacheDir: null,
+  pack: null,
+  port: null,
   mods: { dir: null, include: [], exclude: [] },
   consent: { runModPlugins: false },
   problems: [],
@@ -101,6 +113,8 @@ const KNOWN_KEYS = new Set([
   "patchline",
   "schema",
   "cacheDir",
+  "pack",
+  "port",
   "mods",
   "consent",
 ]);
@@ -129,6 +143,22 @@ function asString(value: unknown, key: string, problems: string[]): string | nul
   if (value === undefined || value === null) return null;
   if (typeof value !== "string" || value.trim().length === 0) {
     problems.push(`'${key}' must be a non-empty string; ignoring it.`);
+    return null;
+  }
+  return value;
+}
+
+/**
+ * A usable listening port, or null.
+ *
+ * Rejected rather than coerced: "8080" as a string, 0, and 70000 all reach here
+ * from a hand-edited file, and a silently-ignored port is a server listening
+ * somewhere the reader did not ask for.
+ */
+function asPort(value: unknown, problems: string[]): number | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 65535) {
+    problems.push(`'port' must be a whole number between 1 and 65535; ignoring it.`);
     return null;
   }
   return value;
@@ -187,6 +217,8 @@ export function readConfig(file: string): AtlasConfig {
   const patchline = asString(obj["patchline"], "patchline", problems);
   const schema = asString(obj["schema"], "schema", problems);
   const cacheDir = asString(obj["cacheDir"], "cacheDir", problems);
+  const pack = asString(obj["pack"], "pack", problems);
+  const port = asPort(obj["port"], problems);
 
   let mods: ModSources = { dir: null, include: [], exclude: [] };
   const rawMods = obj["mods"];
@@ -247,6 +279,8 @@ export function readConfig(file: string): AtlasConfig {
     patchline,
     schema: schema === null ? null : against(base, schema),
     cacheDir: cacheDir === null ? null : against(base, cacheDir),
+    pack: pack === null ? null : against(base, pack),
+    port,
     mods,
     consent,
     problems,
@@ -271,10 +305,18 @@ export function loadConfig(cwd: string = process.cwd()): AtlasConfig {
   return file === null ? EMPTY : readConfig(file);
 }
 
-/** `*` is the only wildcard. Matched on the basename, case-insensitively. */
-function matches(pattern: string, name: string): boolean {
+/**
+ * `*` is the only wildcard, matched case-insensitively.
+ *
+ * Against the basename OR the full path. Basename-only was the documented rule
+ * and it failed the obvious case silently: an entry copied from what the tool
+ * itself prints -- an absolute path -- matched nothing, excluded nothing, and
+ * said nothing. A rule that ignores the form the tool displays is a trap.
+ */
+function matches(pattern: string, name: string, fullPath: string): boolean {
   const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
-  return new RegExp(`^${escaped}$`, "i").test(name);
+  const re = new RegExp(`^${escaped}$`, "i");
+  return re.test(name) || re.test(fullPath) || re.test(resolve(fullPath));
 }
 
 export interface ResolvedMod {
@@ -298,6 +340,10 @@ export function resolveMods(mods: ModSources): {
   const problems: string[] = [];
   const seen = new Set<string>();
   const packs: ResolvedMod[] = [];
+  // Which exclusions actually caught something. One that catches nothing is
+  // almost always a typo or the wrong path form, and silence about that is how a
+  // reader concludes a mod was dropped while it is still being indexed.
+  const used = new Set<string>();
 
   const add = (path: string, from: "dir" | "include"): void => {
     const key = resolve(path).toLowerCase();
@@ -316,8 +362,13 @@ export function resolveMods(mods: ModSources): {
     } else {
       for (const name of readdirSync(mods.dir).sort()) {
         if (!/\.(jar|zip)$/i.test(name)) continue;
-        if (mods.exclude.some((p) => matches(p, name))) continue;
-        add(join(mods.dir, name), "dir");
+        const full = join(mods.dir, name);
+        const hit = mods.exclude.find((p) => matches(p, name, full));
+        if (hit !== undefined) {
+          used.add(hit);
+          continue;
+        }
+        add(full, "dir");
       }
     }
   }
@@ -331,6 +382,10 @@ export function resolveMods(mods: ModSources): {
     // otherwise a broad pattern in one field silently cancels a named path in
     // the other, and the reader has no way to see why.
     add(path, "include");
+  }
+
+  for (const pattern of mods.exclude) {
+    if (!used.has(pattern)) problems.push(`mods.exclude matched nothing: ${pattern}`);
   }
 
   return { packs, problems };

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { existsSync } from "node:fs";
 
-import { serveMcp } from "../mcp/server.ts";
+import { DEFAULT_HTTP_PORT, serveHttp, serveMcp } from "../mcp/server.ts";
 import { looksMangled, normalizeFieldPointer } from "../query/schema.ts";
+import { loadConfig } from "../sources/config.ts";
 import { statusOp } from "../api/operations.ts";
 import {
   cmdBench,
@@ -49,6 +50,9 @@ const USAGE = `hytale-atlas — unofficial local index of Hytale assets
   hytale-atlas                 Same as 'index': build if absent, report if present
   hytale-atlas mcp-install     How to register this server with each AI client,
                                with your absolute paths filled in. Prints only
+  hytale-atlas serve           Serve MCP over HTTP for clients that take a URL.
+                               Loopback only; port from --port, then the config,
+                               then 43790
   hytale-atlas status          Where the game is, which patchline, which tier, and
                                what the built index contains
   hytale-atlas index           Build the corpus index (cached globally, ~40s)
@@ -111,6 +115,7 @@ Options
                                and 'refs'; identifiers are not unique across types
   --client <id>                One MCP client for 'mcp-install' instead of every
                                detected one
+  --port <n>                   Listening port for 'serve'
   --raw                        'get' prints the effective JSON and nothing else
   --limit <n>                  Result cap. Defaults: search 20, search-schema 20,
                                search-lang 20, describe 60, refs 40, types 200,
@@ -173,6 +178,7 @@ const VALUE_FLAGS = new Set([
   "cache-dir",
   "mod",
   "client",
+  "port",
   "exclude",
   "pack",
 ]);
@@ -368,6 +374,28 @@ function main(): number | Promise<number> {
         ...(str("client") === undefined ? {} : { client: str("client")! }),
         ...(args.flags.has("all") ? { all: true } : {}),
       });
+    case "serve": {
+      // The port a caller named beats the config, which beats the built-in.
+      // Resolved here rather than inside the server so the precedence is visible
+      // in one place and `--port` cannot be quietly ignored.
+      const raw = str("port");
+      let flagPort: number | undefined;
+      if (raw !== undefined) {
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n < 1 || n > 65535) {
+          throw new UsageError(`--port takes a whole number between 1 and 65535, not '${raw}'.`);
+        }
+        flagPort = n;
+      }
+      const configured = loadConfig().port;
+      return serveHttp(
+        {
+          ...(str("assets") === undefined ? {} : { assets: str("assets")! }),
+          ...(str("patchline") === undefined ? {} : { patchline: str("patchline")! }),
+        },
+        flagPort ?? configured ?? DEFAULT_HTTP_PORT,
+      );
+    }
     case "status":
       return cmdStatus(args);
     case "index":

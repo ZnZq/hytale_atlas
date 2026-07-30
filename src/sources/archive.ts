@@ -43,6 +43,25 @@ export interface ArchiveEntry {
   readonly crc32: number;
 }
 
+/**
+ * The read surface every asset source offers.
+ *
+ * Exists because `AssetArchive` carries `#private` fields, which make it
+ * NOMINALLY distinct in TypeScript -- a structurally identical directory reader
+ * would still be rejected wherever the class is named as a type. Consumers that
+ * only read should say `AssetSource` and stay indifferent to zip or folder.
+ */
+export interface AssetSource {
+  readonly path: string;
+  readonly entries: readonly ArchiveEntry[];
+  readonly size: number;
+  has(path: string): boolean;
+  list(prefix: string): readonly ArchiveEntry[];
+  readBuffer(path: string): Promise<Buffer>;
+  readText(path: string): Promise<string>;
+  close(): void;
+}
+
 /** Directory entries are excluded; only files are listed. */
 function isDirectoryEntry(entry: Entry): boolean {
   return entry.fileName.endsWith("/");
@@ -59,7 +78,7 @@ function openZipFile(path: string): Promise<ZipFile> {
   });
 }
 
-export class AssetArchive {
+export class AssetArchive implements AssetSource {
   readonly #zip: ZipFile;
   readonly #entries: readonly ArchiveEntry[];
   readonly #byPath: ReadonlyMap<string, Entry>;

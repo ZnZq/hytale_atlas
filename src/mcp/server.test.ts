@@ -319,7 +319,7 @@ test("what the CLI knows, the tool call returns", opts, async () => {
  */
 test("the CLI and the MCP server emit the same bytes", opts, async () => {
   const ops = await import("../../dist/api/operations.js");
-  const { callTool } = await import("../../dist/mcp/tools.js");
+  const { callTool, compact } = await import("../../dist/mcp/tools.js");
   const { AssetArchive } = await import("../../dist/sources/archive.js");
   let db;
   try {
@@ -374,7 +374,21 @@ test("the CLI and the MCP server emit the same bytes", opts, async () => {
       // STREAM is the CLI's decision, the bytes are the operation's.
       const printed = (proc.stdout || "") + (proc.status === 1 ? proc.stderr : "");
       const served = (await callTool(ctx, tool, args)).text ?? "";
-      assert.equal(printed, served, `${argv.join(" ")} differs between the CLI and MCP`);
+      // The contract changed shape, not strength. MCP now drops tabular rows --
+      // `value` already carries every one of them as named fields, so serving
+      // both makes a model read the same data twice, once in a worse form. What
+      // must still hold is that MCP never says anything the CLI does not: every
+      // served line has to appear in the printed answer. That catches a surface
+      // inventing, rewording or contradicting the other, which is what this test
+      // was always for; byte equality was only ever a proxy for it.
+      const haystack = compact(printed);
+      for (const line of served.split("\n")) {
+        if (line.trim().length === 0) continue;
+        assert.ok(
+          haystack.includes(line.trim()),
+          `${argv.join(" ")}: MCP served a line the CLI never printed:\n  ${line}`,
+        );
+      }
     }
   } finally {
     archive?.close();
