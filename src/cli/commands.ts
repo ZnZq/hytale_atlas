@@ -12,7 +12,6 @@ import { resolveCandidates } from "../indexer/references.ts";
 import { computeFieldStats } from "../indexer/stats.ts";
 import { TypeResolver, applyTypes, assetSuffixes, ingestSchemas } from "../indexer/schema.ts";
 import { searchAssets } from "../query/search.ts";
-import { findUndocumented } from "../query/schema.ts";
 import { AssetArchive } from "../sources/archive.ts";
 import { detectInstallation } from "../sources/detect.ts";
 import { CONFIG_FILENAME, findConfigFile, resolveMods } from "../sources/config.ts";
@@ -23,18 +22,14 @@ import {
   benchOp,
   benchesOp,
   resolveDbPath,
-  declaredCount,
   describeOp,
   getAssetOp,
   openIndex,
-  undeclaredObserved,
   langOp,
   refsAnyOp,
   packAssetLoader,
   searchAssetsOp,
-  assetsOfType,
   searchSchemaOp,
-  typeAlternatives,
   typesOp,
   undocumentedOp,
 } from "../api/operations.ts";
@@ -50,33 +45,9 @@ import { askConsent } from "./consent.ts";
  */
 function stripAnsi(text: string): string {
   // eslint-disable-next-line no-control-regex
-  return text.replace(/\[[0-9;]*m/g, "");
+  return text.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
-/**
- * Shortens prose for a list, and says so when it does.
- *
- * Silent truncation is the failure this whole surface keeps making in different
- * costumes. Here it cut a field description mid-word with no ellipsis and no
- * flag to disable it, and the cut sentence was the one that would have settled
- * whether an area-mining primitive exists. The row-count truncation next to it
- * announced itself correctly, which made the inconsistency worse.
- */
-
-/**
- * The next commands worth running, chosen from what the token actually is.
- *
- * One suggester for every miss, reading one classification (`identify`). Each
- * command used to decide this for itself from a single fact, and the results
- * contradicted both each other and the prose they sat under: `search` withheld
- * `refs` from the value case its own sentence was about, `refs` and `search`
- * pointed at each other with no exit, and neither ever named `search-lang` for a
- * localization key or `bench` for a bench id.
- *
- * Ordered by how likely the token is to be that thing, and every line is a
- * command that returns something for this exact token -- a suggestion that
- * misses is worse than none, because it reads as a verdict.
- */
 /** Resolves the archive to index, honouring an explicit override. */
 async function resolveArchive(
   assetsOverride: string | undefined,
@@ -178,6 +149,23 @@ async function openPacks(
  * id is the order WE opened the archives, which is a directory walk, not a game
  * load order. Six identifiers in a real mods folder land here, so `getAssetOp`
  * reports equal-priority collisions as CONTESTED rather than naming a winner.
+ *
+ * **Within a type**, because identity here is (logical_id, type) and nothing
+ * else -- the same rule `resolveCandidates` enforces with `a.type = src.type`
+ * and the loader enforces when resolving a parent. Shadowing on the identifier
+ * alone let one mod file named `Default` mark every OTHER vanilla `Default` as
+ * overridden: an Environment, a GameplayConfig, a Trail, a BlockSoundSet and
+ * six more types the engine never conflates. That is worse than a miscount,
+ * because `sameNamed`, `sameNamedCount` and `sameNamedTypes` all filter
+ * `is_effective = 1`: the collision list arrived one row long, the
+ * `candidates.length > 1` guard in `getAssetOp` never fired, and an agent
+ * asking for the game's `Default` Environment was handed a MovementConfig with
+ * no sign anything had been chosen for it.
+ *
+ * `IS`, not `=`, so two untyped assets sharing an identifier still shadow each
+ * other. `resolveCandidates` wants the opposite there and uses `=` on purpose
+ * (an unknown type yields NULL and claims nothing); here a mod replacing an
+ * untyped worldgen file must still mark the original, so NULL has to equal NULL.
  */
 function markEffective(db: Database): { overridden: number } {
   db.exec("UPDATE assets SET is_effective = 0");
@@ -188,7 +176,7 @@ function markEffective(db: Database): { overridden: number } {
         JOIN packs p ON p.id = a.pack_id
         WHERE NOT EXISTS (
           SELECT 1 FROM assets b JOIN packs q ON q.id = b.pack_id
-           WHERE b.logical_id = a.logical_id
+           WHERE b.logical_id = a.logical_id AND b.type IS a.type
              AND (q.priority < p.priority
                OR (q.priority = p.priority AND q.id > p.id))))`);
   const row = db
@@ -1052,62 +1040,14 @@ export async function cmdUndocumented(args: {
 }): Promise<number> {
   const db = await frozenDb(args.assets, args.patchline);
   try {
-    // A type name is checked before it is used, because the two outcomes this
-    // command conflates are the two a reader most needs told apart: "this type
-    // has nothing unused" and "you misspelled the type". Both printed the same
-    // sentence and exited 0, and `search-schema` sends people here specifically
-    // to firm up a negative -- so a typo returned a confident, wrong answer.
-    if (args.type !== undefined) {
-      // From the shared operation, not a second inline copy of the query. The
-      // copy that used to live here counted the empty-pointer TYPE row, so this
-      // header said "declares 9 fields" above a `describe` listing 8 -- the exact
-      // drift the api layer exists to prevent, reintroduced by hand.
-      const declared = declaredCount(db, args.type);
-      const extra = undeclaredObserved(db, args.type);
-      if (declared === 0) {
-        // The shared suggester, not a third inline copy of half of it. This one
-        // kept only the exact-respelling half, so `undocumented FarmingBlock`
-        // gave up where `describe FarmingBlock` reaches common:FarmingData.
-        const alternatives = typeAlternatives(db, args.type);
-        const carriedByType = assetsOfType(db, args.type);
-        process.stderr.write(
-          (carriedByType > 0
-            ? `'${args.type}' is a real asset type (${formatCount(carriedByType)} assets) ` +
-              `but the schema declares no fields for it, so nothing here can be\n` +
-              `unused or documented.\n`
-            : `No type '${args.type}' in the schema.\n`) +
-            // Suggestions only when the name really did not resolve. Offering
-            // "did you mean" under a sentence that just confirmed the type is
-            // real invites the reader to correct a spelling that was right.
-            (carriedByType === 0 && alternatives.length > 0
-              ? `Did you mean:\n` + alternatives.map((a) => `  ${a}\n`).join("")
-              : `Try: hytale-atlas search-schema "${args.type}"\n`),
-        );
-        return 1;
-      }
-      const fields = findUndocumented(db, args.type, args.limit);
-      if (fields.length === 0) {
-        process.stdout.write(
-          `'${args.type}' declares ${formatCount(declared)} fields and every one of ` +
-            `them appears in at least one vanilla asset.\n` +
-            `Nothing here is unused. (The type exists -- this is a real negative, ` +
-            `not a name that failed to resolve.)\n` +
-            // Both numbers are right and the pair still read as an off-by-one,
-            // which is how a blind trial filed it. `describe` unions the observed
-            // layer; this command counts only what the schema declares.
-            (extra > 0
-              ? `'describe ${args.type}' lists ${formatCount(declared + extra)} rows: ` +
-                `${formatCount(extra)} more that the corpus uses but the schema never ` +
-                `declares.\n`
-              : ""),
-        );
-        return 0;
-      }
-    }
-
-    // Everything below is the operation's own rendering.
-    process.stdout.write(undocumentedOp(db, args.type, args.limit).text ?? "");
-    return 0;
+    // Renders nothing of its own. The unresolved-type and nothing-unused
+    // branches used to be printed here, which made this the last command whose
+    // answer differed by front end -- and the difference landed on the one
+    // question `search-schema` sends a reader here to settle.
+    const result = undocumentedOp(db, args.type, args.limit);
+    const miss = result.value.found === false;
+    (miss ? process.stderr : process.stdout).write(result.text ?? "");
+    return miss ? 1 : 0;
   } finally {
     db.close();
   }

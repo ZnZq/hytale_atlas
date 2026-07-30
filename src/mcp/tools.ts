@@ -62,12 +62,35 @@ export interface ToolDefinition {
   readonly inputSchema: Record<string, unknown>;
 }
 
+/**
+ * Ceiling on `limit`, for the MCP path only.
+ *
+ * The payload here lands in a context window, not a terminal, and nothing
+ * downstream bounded it: `search_schema{query:'a', limit:20000}` serialises to
+ * 3.48 MB -- around 869k tokens, larger than any current context window, so the
+ * client either truncates mid-JSON or the session dies. The surface actively
+ * invited it, too: the `truncated` caveat says "raise the limit for more", and
+ * `describe`'s own docstring records agents doing exactly that when a sample
+ * looked clipped.
+ *
+ * 1000 rows is well past any answer a model reads in full and still two orders
+ * of magnitude short of the failure. A request above it is clamped rather than
+ * refused -- the honest reading of "raise the limit for more" is that the caller
+ * wants everything available, and they still get told what they did not get,
+ * because the operation emits `truncated` at the served count.
+ *
+ * The CLI stays unclamped. A terminal can take 3 MB, and `--limit` there is a
+ * person asking for a full listing.
+ */
+const MAX_LIMIT = 1000;
+
 /** JSON Schema helpers, kept tiny -- these shapes are all flat. */
 const str = (description: string): Record<string, unknown> => ({ type: "string", description });
 const int = (description: string): Record<string, unknown> => ({
   type: "integer",
   description,
   minimum: 1,
+  maximum: MAX_LIMIT,
 });
 const object = (
   properties: Record<string, unknown>,
@@ -93,7 +116,9 @@ const TYPE_ARG = str(
 const SCHEMA_TYPE_ARG = str(
   "Asset type, e.g. 'Item', or a shared definition with its namespace: 'common:ItemTool'.",
 );
-const LIMIT_ARG = int("Maximum rows. The answer says so when it truncates.");
+const LIMIT_ARG = int(
+  `Maximum rows, up to ${MAX_LIMIT}. The answer says so when it truncates.`,
+);
 
 export const TOOLS: readonly ToolDefinition[] = [
   {
@@ -199,6 +224,29 @@ function text(args: Record<string, unknown>, key: string): string | undefined {
   const value = args[key];
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
+
+/**
+ * Names an argument that was PRESENT but unusable, so it can be reported.
+ *
+ * `text` maps anything that is not a non-empty string to undefined, and every
+ * call site then treats the argument as absent. On `type` that fails open into a
+ * wrong answer wearing the shape of a right one: `search{query:'Burning',
+ * type:['EntityEffect']}` returned rows of every type, indistinguishable from a
+ * filtered result, and the disambiguation the whole surface leans on ("pass type
+ * wherever a tool offers it") silently did nothing. This file already learnt the
+ * lesson on `limit` -- "a malformed limit is REPORTED, not swallowed" -- and the
+ * fix never crossed to the string arguments.
+ */
+function malformedText(args: Record<string, unknown>, keys: readonly string[]): string | null {
+  for (const key of keys) {
+    const value = args[key];
+    if (value === undefined) continue;
+    if (typeof value !== "string" || value.length === 0) {
+      return `'${key}' takes a non-empty string, not ${JSON.stringify(value)}.`;
+    }
+  }
+  return null;
+}
 function count(args: Record<string, unknown>, key: string): number | undefined {
   const value = args[key];
   return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
@@ -272,7 +320,13 @@ export async function callTool(
   // already in `value`, field by field, and serving both means the model reads
   // the same rows twice -- once as data, once as a padded string.
   const served = result.prose ?? result.text;
-  return served === undefined ? result : { ...result, text: compact(served) };
+  // `prose` is DROPPED once promoted, not carried alongside. Leaving it in sent
+  // the legend twice, byte-identical -- about 15% of a `search` response spent
+  // restating itself, in the one operation that implements the contract against
+  // exactly that.
+  if (served === undefined) return result;
+  const { prose: _promoted, ...rest } = result;
+  return { ...rest, text: compact(served) };
 }
 
 async function dispatch(
@@ -297,7 +351,22 @@ async function dispatch(
       `'limit' takes a positive whole number, not ${JSON.stringify(args["limit"])}.`,
     );
   }
-  const limit = count(args, "limit");
+  // Clamped, not rejected: `maximum` in the inputSchema tells a validating
+  // client where the ceiling is, but nothing server-side may assume the client
+  // validated. The operation still emits `truncated` at whatever it served, so
+  // an over-large ask is answered AND qualified rather than refused.
+  const asked = count(args, "limit");
+  const limit = asked === undefined ? undefined : Math.min(asked, MAX_LIMIT);
+
+  // Every argument on this surface except `limit` is a string, and the schemas
+  // set additionalProperties:false, so "not `limit`" is the whole set rather
+  // than a list that goes stale. A list is what let this defect survive the
+  // first time: `limit` was fixed and the string arguments were not.
+  const badText = malformedText(
+    args,
+    Object.keys(args).filter((k) => k !== "limit"),
+  );
+  if (badText !== null) return miss(badText);
 
   switch (name) {
     case "status":

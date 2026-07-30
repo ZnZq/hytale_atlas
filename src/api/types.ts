@@ -383,8 +383,11 @@ export const caveat = {
     code: "crosses-into",
     message:
       `'${pointer}' is a reference, so the tree continues in '${into}' -- the rest of ` +
-      `your pointer is declared there, not here. Describe '${into}' with field ` +
-      `'${continueAt}'.`,
+      `your pointer is declared there, not here. ` +
+      // No field when the remainder cannot be placed there. Naming one anyway is
+      // how this sentence used to hand back `field '/'`, which declares nothing:
+      // the route out was a second dead end.
+      (continueAt === "" ? `Describe '${into}'.` : `Describe '${into}' with field '${continueAt}'.`),
   }),
   // Each side qualifies absence from the OTHER one, and the two were crossed:
   // `status` quoted 2 457 of 2 875 observed fields -- 85% -- under a sentence

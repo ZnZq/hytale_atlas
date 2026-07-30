@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-import { existsSync } from "node:fs";
-
 import { DEFAULT_HTTP_PORT, serveHttp, serveMcp } from "../mcp/server.ts";
 import { looksMangled, normalizeFieldPointer } from "../query/schema.ts";
 import { loadConfig } from "../sources/config.ts";

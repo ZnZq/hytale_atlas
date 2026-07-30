@@ -219,6 +219,18 @@ export interface ResolveResult {
  * Deliberately does not delete unmatched candidates. They are the dangling
  * references `validate_pack` reports, and the hook that lets a later-added asset
  * light up the edges pointing at it.
+ *
+ * **Edges terminate on the definition the engine loads**, hence `a.is_effective
+ * = 1` on every destination join. A pack override is whole-asset replacement and
+ * the losers are inert, but drawing an edge to every copy made one `/Parent`
+ * report two parents -- an inheritance graph that is not a tree, at `high` --
+ * and split an asset's inbound set across the winning row and the shadowed one.
+ * 137 (logical_id, type) groups are defined by more than one pack in a real mods
+ * folder, so this is the common case, not the exotic one. Runs after
+ * `markEffective`, which `cmdIndex` already sequences.
+ *
+ * `REFERENCES_FILE` is the exception: `files` carries no `is_effective`, so a
+ * file reference cannot yet be narrowed the same way.
  */
 export function resolveCandidates(db: Database): ResolveResult {
   db.exec("BEGIN");
@@ -251,6 +263,7 @@ export function resolveCandidates(db: Database): ResolveResult {
         FROM candidates c
         JOIN assets src ON src.id = c.asset_id
         JOIN assets a ON a.logical_id = c.raw_value AND a.type = src.type
+                     AND a.is_effective = 1
        WHERE c.value_kind = 'string' AND ${NOT_NOISE}
          AND c.json_pointer = '/Parent' AND a.id <> c.asset_id
     `);
@@ -305,6 +318,7 @@ export function resolveCandidates(db: Database): ResolveResult {
         JOIN assets a
                ON a.logical_id = c.raw_value
               AND a.type = sf.reference_target
+              AND a.is_effective = 1
        WHERE c.value_kind = 'string' AND ${NOT_NOISE}
          AND c.json_pointer <> '/Parent' AND a.id <> c.asset_id
     `);
@@ -332,7 +346,7 @@ export function resolveCandidates(db: Database): ResolveResult {
              END
         FROM candidates c
         JOIN assets src ON src.id = c.asset_id
-        JOIN assets a ON a.logical_id = c.raw_value
+        JOIN assets a ON a.logical_id = c.raw_value AND a.is_effective = 1
        WHERE c.value_kind = 'string' AND ${NOT_NOISE}
          AND c.json_pointer <> '/Parent'
          AND a.id <> c.asset_id

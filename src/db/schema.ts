@@ -48,7 +48,7 @@ export const SCHEMA_VERSION = 17;
  * refactor, not for rendering, not for a query — for anything that would make a
  * freshly built index differ from an existing one.
  */
-export const PIPELINE_VERSION = 1;
+export const PIPELINE_VERSION = 2;
 
 export const SCHEMA_SQL = `
 -- ---------------------------------------------------------------------------
