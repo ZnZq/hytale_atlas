@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { detected, launchCommand, snippet, targets } from "./mcp-install.ts";
 import { basename, join, resolve } from "node:path";
 
 import { type Database, openDatabase, setMeta } from "../db/open.ts";
@@ -1174,3 +1175,59 @@ export async function cmdEval(args: {
   }
 }
 
+export interface McpInstallArgs {
+  readonly client?: string;
+  readonly all?: boolean;
+}
+
+/**
+ * Prints how to register this server with each AI client.
+ *
+ * Prints only. See mcp-install.ts for why nothing is written: the value a
+ * command adds over the README is the absolute paths, and that is all it adds.
+ */
+export function cmdMcpInstall(args: McpInstallArgs): number {
+  const all = targets();
+  const chosen =
+    args.client !== undefined
+      ? all.filter((t) => t.id === args.client)
+      : args.all === true
+        ? all
+        : all.filter(detected);
+
+  if (args.client !== undefined && chosen.length === 0) {
+    process.stderr.write(
+      `Unknown client '${args.client}'. Known: ${all.map((t) => t.id).join(", ")}\n`,
+    );
+    return 2;
+  }
+
+  const { command, args: launchArgs } = launchCommand();
+  const out: string[] = [`Server:  ${command} ${launchArgs.join(" ")}\n\n`];
+
+  if (chosen.length === 0) {
+    out.push(`No AI client detected here. --all lists all ${all.length} anyway.\n`);
+    process.stdout.write(out.join(""));
+    return 0;
+  }
+
+  if (args.client === undefined && args.all !== true) {
+    out.push(`Detected ${chosen.length} of ${all.length} known clients. --all for the rest.\n\n`);
+  }
+
+  for (const t of chosen) {
+    out.push(`${t.label}\n`);
+    if (t.cli !== undefined) {
+      out.push(`  ${t.cli}\n`);
+      out.push(`  or edit ${t.file}:\n`);
+    } else {
+      out.push(`  edit ${t.file}:\n`);
+    }
+    for (const l of snippet(t).split("\n")) out.push(l.length > 0 ? `    ${l}\n` : "");
+    out.push("\n");
+  }
+
+  out.push("Merge into what is already there -- these show the key, not the whole file.\n");
+  process.stdout.write(out.join(""));
+  return 0;
+}

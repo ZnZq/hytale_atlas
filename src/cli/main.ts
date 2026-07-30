@@ -14,6 +14,7 @@ import {
   cmdGet,
   cmdIndex,
   cmdInit,
+  cmdMcpInstall,
   cmdSearch,
   cmdSearchSchema,
   cmdTypes,
@@ -46,6 +47,8 @@ import {
 const USAGE = `hytale-atlas — unofficial local index of Hytale assets
 
   hytale-atlas                 Same as 'index': build if absent, report if present
+  hytale-atlas mcp-install     How to register this server with each AI client,
+                               with your absolute paths filled in. Prints only
   hytale-atlas status          Where the game is, which patchline, which tier, and
                                what the built index contains
   hytale-atlas index           Build the corpus index (cached globally, ~40s)
@@ -106,6 +109,8 @@ Options
                                a shadowed one the game does not load. 'get' only.
   --type <Type>                Narrow to one asset type. Works on 'get', 'search'
                                and 'refs'; identifiers are not unique across types
+  --client <id>                One MCP client for 'mcp-install' instead of every
+                               detected one
   --raw                        'get' prints the effective JSON and nothing else
   --limit <n>                  Result cap. Defaults: search 20, search-schema 20,
                                search-lang 20, describe 60, refs 40, types 200,
@@ -167,6 +172,7 @@ const VALUE_FLAGS = new Set([
   "mods-dir",
   "cache-dir",
   "mod",
+  "client",
   "exclude",
   "pack",
 ]);
@@ -357,6 +363,11 @@ function main(): number | Promise<number> {
         dryRun: args.flags.get("dry-run") === true,
       });
 
+    case "mcp-install":
+      return cmdMcpInstall({
+        ...(str("client") === undefined ? {} : { client: str("client")! }),
+        ...(args.flags.has("all") ? { all: true } : {}),
+      });
     case "status":
       return cmdStatus(args);
     case "index":

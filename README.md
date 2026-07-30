@@ -165,9 +165,118 @@ version, because that is the one every player has.
 
 ## MCP (for AI assistants)
 
+The server itself is one command:
+
 ```bash
-node dist/cli/main.js --mcp
+node /ABSOLUTE/PATH/TO/hytale-atlas/dist/cli/main.js --mcp
 ```
+
+Use an **absolute** path to both `node` and `main.js`. A client starts the server
+from its own working directory with its own `PATH`, so a bare `node` or a relative
+path produces a config that works on the machine that wrote it and nowhere else.
+`node -e "console.log(process.execPath)"` prints the path to your `node`.
+
+Below, `<NODE>` is that path and `<ATLAS>` is this repository's
+`dist/cli/main.js`. To skip the substituting, this prints every line below with
+your own paths already in place:
+
+```bash
+node dist/cli/main.js mcp-install         # clients detected here
+node dist/cli/main.js mcp-install --all   # every client it knows
+```
+
+It only prints. Registering the server is your call, in your own config.
+
+### Clients with a command for it
+
+```bash
+# Claude Code -- project scope writes .mcp.json, shareable via git
+claude mcp add hytale-atlas --scope project -- <NODE> <ATLAS> --mcp
+# or --scope user for every project
+
+# Gemini CLI
+gemini mcp add hytale-atlas -s user <NODE> <ATLAS> --mcp
+
+# VS Code / GitHub Copilot (writes your user profile)
+code --add-mcp "{\"name\":\"hytale-atlas\",\"command\":\"<NODE>\",\"args\":[\"<ATLAS>\",\"--mcp\"]}"
+
+# Kiro
+kiro-cli mcp add --name hytale-atlas --command <NODE> --args <ATLAS> --args --mcp
+
+# Amazon Q Developer
+qchat mcp add --name hytale-atlas --command <NODE> --args <ATLAS>,--mcp
+```
+
+`opencode mcp add` and GitHub Copilot CLI's `/mcp add` exist but take no
+arguments — they prompt. Configure those by file, below.
+
+### Clients you configure by file
+
+There is no universal format. Four shapes are in use, and the differences are
+not cosmetic — the top-level key, the entry fields, and whether the command is a
+string or an array all differ.
+
+**`mcpServers`** — Claude Code (`.mcp.json`, `~/.claude.json`), Cursor
+(`~/.cursor/mcp.json`), Windsurf (`~/.codeium/windsurf/mcp_config.json`), Gemini
+CLI (`~/.gemini/settings.json`), Cline and Roo Code (their VS Code
+`globalStorage` settings), Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "hytale-atlas": { "command": "<NODE>", "args": ["<ATLAS>", "--mcp"] }
+  }
+}
+```
+
+**`servers`** — VS Code workspace, `.vscode/mcp.json`:
+
+```json
+{
+  "servers": {
+    "hytale-atlas": { "command": "<NODE>", "args": ["<ATLAS>", "--mcp"] }
+  }
+}
+```
+
+**`context_servers`** — Zed, in its `settings.json`:
+
+```json
+{
+  "context_servers": {
+    "hytale-atlas": { "command": "<NODE>", "args": ["<ATLAS>", "--mcp"], "env": {} }
+  }
+}
+```
+
+**`mcp`** — opencode, `opencode.json`. Note the command is **one array**, not a
+command plus arguments; splitting it the way the shapes above do produces a
+config the schema accepts and the client cannot launch:
+
+```json
+{
+  "mcp": {
+    "hytale-atlas": {
+      "type": "local",
+      "command": ["<NODE>", "<ATLAS>", "--mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+**TOML** — Codex, `~/.codex/config.toml` (or `.codex/config.toml` in a trusted
+project):
+
+```toml
+[mcp_servers.hytale-atlas]
+command = "<NODE>"
+args = ["<ATLAS>", "--mcp"]
+```
+
+Continue, Goose and Hermes use YAML; see their own docs for the exact key.
+
+### What it serves
 
 Serves the same answers as structured data over stdio, with caveats attached.
 Ten read-only tools: `status`, `types`, `search`, `get`, `describe`, `refs`,
