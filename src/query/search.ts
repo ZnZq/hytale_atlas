@@ -83,12 +83,31 @@ export function searchAssets(
   // remainder is worldgen under Server/World and Server/Prefabs. Without this,
   // "sword" returned Server/Item/Animations/Sword.json above every weapon: an
   // animation's identifier is a cleaner lexical match than a localized item's is.
+  // The pack being authored lives in its own FTS table. It cannot be folded into
+  // a union VIEW the way `assets` is, because `MATCH` does not run against views
+  // -- so this is the single place the overlay has to be visible in a query.
+  const hasWorking =
+    db
+      .prepare("SELECT 1 FROM sqlite_temp_master WHERE type = 'table' AND name = 'working_fts'")
+      .get() !== undefined;
+
+  const typeFilter = type === undefined ? "" : " AND type = ?2";
+  const one = (table: string, working: 0 | 1): string =>
+    `SELECT logical_id, type, locale, display_name, rank, ${working} AS working
+       FROM ${table} WHERE ${table} MATCH ?1${typeFilter}`;
+  // Numbered parameters, so the expression binds once for both halves.
   const sql =
-    `SELECT logical_id, type, locale, display_name
-       FROM assets_fts
-      WHERE assets_fts MATCH ?${type === undefined ? "" : " AND type = ?"}
-      ORDER BY (locale = '') ASC, rank
-      LIMIT ?`;
+    `SELECT logical_id, type, locale, display_name FROM (` +
+    // Unqualified: FTS5 rejects a schema-qualified name on the left of MATCH,
+    // and an unqualified temp table resolves to temp anyway.
+    (hasWorking
+      ? `${one("assets_fts", 0)} UNION ALL ${one("working_fts", 1)}`
+      : one("assets_fts", 0)) +
+    // Working rows FIRST. The `locale = ''` demotion below exists to push
+    // identifier-only matches under localized ones, and every working row is
+    // identifier-only by construction -- so without this the pack you are
+    // writing is the one thing the search can never surface.
+    `) ORDER BY working DESC, (locale = '') ASC, rank LIMIT ?${type === undefined ? 2 : 3}`;
   const statement = db.prepare(sql);
 
   // Over-fetch so demotion and diversification have material to work with.

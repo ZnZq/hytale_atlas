@@ -2855,6 +2855,7 @@ export function refsAnyOp(
   // declaring it, so `refs Bench_WorkBench` returned one unrelated edge while 49
   // recipes required that bench.
   const declares = benchDeclaredBy(db, logicalId);
+  const refPack = hasThirdPartyPacks(db) ? packLookup(db) : (): null => null;
   const beyond = valueOccurrencesWithoutEdges(
     db,
     logicalId,
@@ -2873,7 +2874,11 @@ export function refsAnyOp(
         v.references
           .map(
             (r) =>
-              `${r.confidence.padEnd(7)} ${r.logicalId.padEnd(34)} ` +
+              // Marked, because an unmarked row reads as an asset that EXISTS.
+              // The pack being authored shows up here the moment its /Parent
+              // resolves, and a draft indistinguishable from shipped content is
+              // the confusion provenance exists to prevent.
+              `${r.confidence.padEnd(7)} ${(r.logicalId + packMark(refPack(r.logicalId))).padEnd(34)} ` +
               `${(r.type ?? "(untyped)").padEnd(20)} ${r.kind} ${r.pointer ?? ""}\n`,
           )
           .join("")) +

@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import type { Database } from "../db/open.ts";
 import { assetIdFromPath } from "../indexer/corpus.ts";
 import { collectCandidates } from "../indexer/references.ts";
+import { buildPointerAligner } from "../indexer/stats.ts";
 import { DirectorySource, treeStamp } from "../sources/directory.ts";
 
 /**
@@ -100,12 +101,14 @@ export async function buildWorkingLayer(
   // WORKING section of an answer -- folding it into the observed statistics is
   // precisely the merge this design exists to prevent.
   db.exec(
-    "CREATE TEMP TABLE working_values (asset_type TEXT, schema_pointer TEXT," +
-      " raw_value TEXT, logical_id TEXT)",
+    "CREATE TEMP TABLE working_values (asset_id INTEGER, asset_type TEXT," +
+      " json_pointer TEXT, schema_pointer TEXT, raw_value TEXT, value_kind TEXT," +
+      " logical_id TEXT)",
   );
   const insValue = db.prepare(
-    "INSERT INTO temp.working_values (asset_type, schema_pointer, raw_value, logical_id)" +
-      " VALUES (?,?,?,?)",
+    "INSERT INTO temp.working_values" +
+      " (asset_id, asset_type, json_pointer, schema_pointer, raw_value, value_kind, logical_id)" +
+      " VALUES (?,?,?,?,?,?,?)",
   );
 
   const insert = db.prepare(
@@ -114,6 +117,12 @@ export async function buildWorkingLayer(
 
   // Same suffix rule the corpus indexer applies, so an id here means what it
   // means there.
+  // The SAME walk pass 3 runs over the corpus. A pointer collected here is raw,
+  // exactly as pass 2 collects them, so anything sitting behind a `$ref` matches
+  // no declared field until it is rebased -- which silently swallowed the ItemId
+  // inside a Recipe, the commonest shape there is.
+  const aligner = buildPointerAligner(db);
+
   let id = -1;
   let assets = 0;
   for (const entry of source.entries) {
@@ -134,7 +143,14 @@ export async function buildWorkingLayer(
       continue;
     }
     for (const c of collectCandidates(doc)) {
-      insValue.run(assetType, c.schemaPointer, c.value, logicalId);
+      // Union branches are chosen from a discriminator read out of `candidates`,
+      // which a working asset has no row in -- so a union stays unresolved and
+      // the pointer is left as collected. Plain crossings, which is most of them,
+      // rebase correctly.
+      const aligned = aligner.knows(assetType)
+        ? aligner.align(assetType, c.schemaPointer, c.pointer, id + 1)
+        : { type: assetType, pointer: c.schemaPointer };
+      insValue.run(id + 1, aligned.type, c.pointer, aligned.pointer, c.value, c.kind, logicalId);
     }
   }
 
@@ -149,7 +165,111 @@ export async function buildWorkingLayer(
     "CREATE TEMP VIEW packs AS SELECT * FROM main.packs UNION ALL SELECT * FROM temp.working_packs",
   );
 
+  buildWorkingSearch(db);
+  buildWorkingEdges(db);
   return { root, stamp, assets, source };
+}
+
+/**
+ * A tiny FTS index over the pack being written.
+ *
+ * Its own table rather than a union view: `assets_fts` is an FTS5 virtual table,
+ * and `MATCH` cannot run against a view, so the shadowing trick the rest of this
+ * overlay relies on is not available here. `searchAssets` therefore queries both
+ * and merges -- the one place the working layer is not transparent.
+ *
+ * Rows carry the identifier only. Translated names live in the pack's own `.lang`
+ * files, which are not parsed here, so a draft is found by what it is CALLED in
+ * code and not yet by what it says on screen.
+ */
+function buildWorkingSearch(db: Database): void {
+  db.exec("DROP TABLE IF EXISTS temp.working_fts");
+  db.exec(
+    // Same tokenizer and prefix settings as `assets_fts`. Without them the two
+    // halves of the union split text differently: `MyMod_Frost_Cleaver` answered
+    // to its full identifier but not to `cleaver`, while every frozen row did.
+    "CREATE VIRTUAL TABLE temp.working_fts USING fts5" +
+      " (logical_id, type, locale UNINDEXED, display_name, description," +
+      " tokenize = 'unicode61 remove_diacritics 2', prefix = '2 3')",
+  );
+  db.exec(`
+    INSERT INTO temp.working_fts (logical_id, type, locale, display_name, description)
+    SELECT logical_id, ifnull(type, ''), '',
+           replace(replace(logical_id, '_', ' '), '.', ' '), ''
+      FROM temp.working_assets
+  `);
+}
+
+/**
+ * Edges FROM the pack being written, resolved against the frozen corpus.
+ *
+ * Mirrors the indexer's own two asset rules rather than inventing looser ones:
+ * `/Parent` binds to an asset of the SAME type, and any other field binds only
+ * where the schema declares a reference target. Matching on name alone would
+ * make `refs` claim edges the corpus itself would not draw.
+ *
+ * Only this direction exists. Nothing the game ships can point at a pack that
+ * does not exist yet, and that asymmetry is why one pass is enough.
+ */
+function buildWorkingEdges(db: Database): void {
+  db.exec("DROP VIEW IF EXISTS temp.edges");
+  db.exec("DROP TABLE IF EXISTS temp.working_edges");
+  db.exec("CREATE TEMP TABLE working_edges AS SELECT * FROM main.edges LIMIT 0");
+
+  db.exec(`
+    INSERT INTO temp.working_edges (id, src, dst, dst_kind, kind, json_pointer, confidence, role)
+    SELECT -w.rowid, w.asset_id, a.id, 'asset', 'INHERITS_FROM', w.json_pointer, 'high', NULL
+      FROM temp.working_values w
+      JOIN assets a ON a.logical_id = w.raw_value AND a.type = w.asset_type
+     WHERE w.value_kind = 'string' AND w.json_pointer = '/Parent' AND a.id <> w.asset_id
+  `);
+
+  db.exec(`
+    INSERT INTO temp.working_edges (id, src, dst, dst_kind, kind, json_pointer, confidence, role)
+    SELECT -100000 - w.rowid, w.asset_id, a.id, 'asset', 'REFERENCES', w.json_pointer, 'high', NULL
+      FROM temp.working_values w
+      JOIN main.schema_fields sf
+             ON sf.asset_type = w.asset_type
+            AND sf.json_pointer = w.schema_pointer
+            AND sf.reference_target IS NOT NULL
+      JOIN assets a ON a.logical_id = w.raw_value AND a.type = sf.reference_target
+     WHERE w.value_kind = 'string' AND w.json_pointer <> '/Parent' AND a.id <> w.asset_id
+  `);
+
+  // The naming-convention rule, at the corpus's own confidence grades. Without it
+  // the draft loses every reference the schema does not declare a target for --
+  // 2 237 of them at `/Recipe/Input/*/ItemId` alone, which is exactly the shape a
+  // modder writes most. GLOB, not LIKE: SQLite's LIKE folds case, so '%Id' also
+  // catches /Solid and /Fluid.
+  db.exec(`
+    INSERT INTO temp.working_edges (id, src, dst, dst_kind, kind, json_pointer, confidence, role)
+    SELECT -200000 - w.rowid, w.asset_id, a.id, 'asset', 'REFERENCES', w.json_pointer,
+           CASE
+             WHEN w.json_pointer GLOB '*Id'
+               OR w.json_pointer GLOB '*/Set'
+               OR w.json_pointer GLOB '*/Model'
+               OR w.json_pointer GLOB '*/BlockType'
+               OR w.json_pointer GLOB '*/BlockTypes/*'
+               OR w.json_pointer GLOB '*/BlockSets/*' THEN 'medium'
+             ELSE 'low'
+           END,
+           NULL
+      FROM temp.working_values w
+      JOIN assets a ON a.logical_id = w.raw_value
+     WHERE w.value_kind = 'string' AND w.json_pointer <> '/Parent' AND a.id <> w.asset_id
+       AND NOT EXISTS (
+             SELECT 1 FROM main.schema_fields sf
+              WHERE sf.asset_type = w.asset_type
+                AND sf.json_pointer = w.schema_pointer
+                AND sf.reference_target IS NOT NULL)
+  `);
+
+  // `edges` is a RETRIEVAL table: `refs` answers "what points at this", and a
+  // modder asking that about a vanilla asset wants to know their own pack now
+  // points at it. Statistics keep reading `main.edges` explicitly.
+  db.exec(
+    "CREATE TEMP VIEW edges AS SELECT * FROM main.edges UNION ALL SELECT * FROM temp.working_edges",
+  );
 }
 
 /**

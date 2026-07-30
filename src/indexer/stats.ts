@@ -114,10 +114,29 @@ function discriminatorKey(assetId: number, pointer: string): string {
   return `${assetId} ${pointer}`;
 }
 
-function normalisePointersAgainstSchema(db: Database): {
-  changed: number;
-  resolvedUnions: number;
-  unresolvedUnions: number;
+/**
+ * Builds the pointer aligner: the walk that rebases a schema pointer across
+ * every `$ref` it crosses.
+ *
+ * Split out of `normalisePointersAgainstSchema` so the pack being AUTHORED can
+ * use the same walk. Its pointers are collected the way pass 2 collects them --
+ * raw, un-rebased -- and without this they simply fail to match any declared
+ * field the moment a value sits behind a crossing. Measured on a three-reference
+ * draft: `/Parent` and `/ItemSoundSetId` resolved, the ItemId inside
+ * `/Recipe/Input` did not, because `/Recipe` is a crossing into
+ * `common:CraftingRecipe`. (Written without a star-slash: that sequence ends a
+ * block comment, which is how this very paragraph broke the build once.)
+ *
+ * One implementation, deliberately. A second copy of this walk is how the
+ * observed layer and the working layer would start disagreeing about where a
+ * field lives.
+ */
+export function buildPointerAligner(db: Database): {
+  align: (startType: string, pointer: string, rawPointer: string, assetId: number) =>
+    { type: string; pointer: string };
+  counts: () => { resolvedUnions: number; unresolvedUnions: number };
+  /** Whether the schema declares this type at all; nothing else can be aligned. */
+  knows: (type: string) => boolean;
 } {
   const byType = new Map<string, Set<string>>();
   /**
@@ -391,6 +410,19 @@ function normalisePointersAgainstSchema(db: Database): {
     }
     return { type, pointer: prefix };
   };
+  return {
+    align,
+    counts: () => ({ resolvedUnions, unresolvedUnions }),
+    knows: (type: string) => byType.get(type) !== undefined,
+  };
+}
+
+function normalisePointersAgainstSchema(db: Database): {
+  changed: number;
+  resolvedUnions: number;
+  unresolvedUnions: number;
+} {
+  const { align, counts, knows } = buildPointerAligner(db);
 
   const rows = db
     .prepare(
@@ -411,12 +443,12 @@ function normalisePointersAgainstSchema(db: Database): {
   );
   let changed = 0;
   for (const row of rows) {
-    if (byType.get(row.type) === undefined) continue;
+    if (!knows(row.type)) continue;
     const aligned = align(row.type, row.schema_pointer, row.json_pointer, row.asset_id);
     update.run(aligned.pointer, aligned.type, row.id);
     if (aligned.pointer !== row.schema_pointer || aligned.type !== row.type) changed++;
   }
-  return { changed, resolvedUnions, unresolvedUnions };
+  return { changed, ...counts() };
 }
 
 export function computeFieldStats(db: Database): StatsResult {
