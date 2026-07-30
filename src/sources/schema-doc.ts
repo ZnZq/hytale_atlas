@@ -1,4 +1,5 @@
 import { readdirSync, readFileSync, existsSync } from "node:fs";
+import { escapeSegment } from "../util/json.ts";
 import { basename, join } from "node:path";
 
 import { isUnsetDefault, parseJsonLenient } from "../util/json.ts";
@@ -192,10 +193,6 @@ function hytale(node: Node): Node | null {
   return asNode(node["hytale"]);
 }
 
-function escapeSegment(segment: string): string {
-  return segment.replace(/~/g, "~0").replace(/\//g, "~1");
-}
-
 export class SchemaResolver {
   readonly #files: ReadonlyMap<string, Node>;
 
@@ -363,7 +360,12 @@ function rootUnionScopes(node: Node, currentFile: string): string[] {
 
 /** The namespaces a refScope names -- more than one means a polymorphic union. */
 export function scopes(refScope: string | null): string[] {
-  return refScope === null || refScope === "" ? [] : refScope.split(" ");
+  // Empties dropped. Three call sites split this column by hand and every one of
+  // them filtered; only the canonical decoder did not, so the same stored string
+  // could yield a different branch COUNT depending on which reader saw it. No
+  // writer can produce a double space today, which is exactly why the difference
+  // sat unnoticed -- the four readers disagreed about a case none of them met.
+  return refScope === null ? [] : refScope.split(" ").filter(Boolean);
 }
 
 function emit(

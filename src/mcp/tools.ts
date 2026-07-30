@@ -1,10 +1,11 @@
 import type { Database } from "../db/open.ts";
 import { AssetArchive } from "../sources/archive.ts";
-import type { AssetLoader } from "../query/asset.ts";
 import {
   typesOp,
   assetsDeclaringField,
   countAssetsDeclaringField,
+  packDefinitions,
+  declarerSampleSize,
   assetsOfType,
   benchIdExists,
   benchOp,
@@ -13,6 +14,7 @@ import {
   declaredCount,
   describeOp,
   getAssetOp,
+  packAssetLoader,
   identify,
   langOp,
   refsAnyOp,
@@ -126,8 +128,21 @@ export const TOOLS: readonly ToolDefinition[] = [
     description:
       "The effective definition of one asset, with its parent chain folded in -- what the " +
       "engine sees, not what the file says. Identifiers are not unique across types; pass " +
-      "`type` to choose.",
-    inputSchema: object({ id: str("Asset identifier, e.g. 'Tool_Pickaxe_Iron'."), type: TYPE_ARG }, ["id"]),
+      "`type` to choose. When several packs define one identifier this returns the LIST of " +
+      "packs instead of a document -- the engine keeps whichever pack loaded last and that " +
+      "order is not in this index, so call again with `pack` to say which one you want.",
+    inputSchema: object(
+      {
+        id: str("Asset identifier, e.g. 'Tool_Pickaxe_Iron'."),
+        type: TYPE_ARG,
+        pack: str(
+          "Which pack's version to read, e.g. 'Hytale' for the base game. Required " +
+            "once a previous call reported several definitions; it also reads a version " +
+            "the game does not load.",
+        ),
+      },
+      ["id"],
+    ),
   },
   {
     name: "describe",
@@ -234,6 +249,17 @@ export async function callTool(
   args: Record<string, unknown>,
 ): Promise<Result<unknown>> {
   const { db } = ctx;
+  // A malformed `limit` is REPORTED, not swallowed. `count` maps anything
+  // invalid to undefined, which the operations then replace with their default,
+  // so `limit: 0` returned a full page and `limit: "20"` returned the default --
+  // in both cases indistinguishable from a request that named no limit at all.
+  // The CLI has rejected exactly these since the day `--limit 0` printed
+  // "No matches." for a query with dozens; the lesson never crossed to MCP.
+  if (args["limit"] !== undefined && count(args, "limit") === undefined) {
+    return miss(
+      `'limit' takes a positive whole number, not ${JSON.stringify(args["limit"])}.`,
+    );
+  }
   const limit = count(args, "limit");
 
   switch (name) {
@@ -275,30 +301,44 @@ export async function callTool(
       const id = text(args, "id");
       if (id === undefined) return miss("An 'id' is required.");
       const type = text(args, "type");
-      const archive = await ctx.openArchive();
-      const byId = db.prepare(
-        "SELECT path, type FROM assets WHERE logical_id = ?1 AND (?2 IS NULL OR type = ?2)" +
-          " ORDER BY is_effective DESC, type LIMIT 1",
+      // Pack-aware: `get` used to read the vanilla archive alone, so a mod's
+      // asset was catalogued and unreachable -- the worst state, because every
+      // count still included it.
+      const pack = text(args, "pack");
+      const { load, close } = packAssetLoader(
+        db,
+        type,
+        ...(pack === undefined ? [] : [{ logicalId: id, pack }]),
       );
-      // The loader is handed the type when resolving a PARENT, because
-      // inheritance is within a type -- the same rule the index enforces on
-      // edges. Without it a parent is chosen by identifier alone.
-      const load: AssetLoader = async (logicalId, forType) => {
-        const row = byId.get(logicalId, forType ?? type ?? null) as
-          | { path: string; type: string | null }
-          | undefined;
-        if (row === undefined) return null;
-        try {
-          return {
-            path: row.path,
-            type: row.type,
-            document: JSON.parse(await archive.readText(row.path)) as unknown,
-          };
-        } catch {
-          return null;
-        }
-      };
-      const resolved = await getAssetOp(db, id, load, type);
+      const resolved = await getAssetOp(db, id, load, type, false, pack);
+      close();
+      // A multi-pack identifier also comes back with no value, and it is NOT a
+      // miss -- the asset exists and is waiting on a choice. Reporting "No asset"
+      // there would deny something the very same result is listing.
+      const needsChoice = resolved.caveats.some(
+        (c) => c.code === "shadowed" || c.code === "contested-packs",
+      );
+      // The pack names a client must choose between belong in the payload, not
+      // only in a sentence. This branch returned `value: null` with the choices
+      // spelled out in prose and in CLI syntax -- `--pack "Endgame&QoL"` -- so an
+      // MCP client following this project's own advice ("the machine-actionable
+      // form is value and the caveat codes") had to regex a shell command out of
+      // an English paragraph to learn what to pass. Enrichment by composition,
+      // the same shape `missOf` uses.
+      if (needsChoice) {
+        return {
+          ...resolved,
+          value: {
+            found: false,
+            reason: `'${id}' is defined by more than one pack -- pass 'pack' to choose.`,
+            packs: packDefinitions(db, id, type).map((d) => ({
+              pack: d.pack,
+              vanilla: d.kind === "vanilla",
+              path: d.path,
+            })),
+          },
+        };
+      }
       if (resolved.value === null) {
         return missOf(resolved, {
           reason: benchIdExists(db, id)
@@ -348,7 +388,12 @@ export async function callTool(
 
       // Enrichment by COMPOSITION -- the same operations the CLI calls, not a
       // second implementation of them.
-      const rows = 7;
+      // The sample honours the caller's `limit`. It was a hard seven, and an
+      // agent trying to establish whether ANY vanilla item emits light while
+      // worn was handed "7 of 93" with no way to page -- it said so, and gave up
+      // on the question. A sample nobody can widen is a wall, not a sample.
+      // The same rule the rendered text uses, not a second one.
+      const rows = declarerSampleSize(limit);
       let clipped = 0;
       const enriched = described.value.fields.map((f) => {
         const broken = brokenRefsFor(db, type, f.pointer);

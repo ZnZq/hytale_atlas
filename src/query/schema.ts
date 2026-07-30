@@ -25,15 +25,49 @@ import { buildRelaxedMatchExpressions } from "../util/text.ts";
  * same error as `search_schema` claiming a capability did not exist: a limit of
  * extraction presented as a fact about the data.
  */
+/**
+ * The declared types that HOLD other fields, as data.
+ *
+ * One list, because there were four encodings of it: this predicate in JS, the
+ * negated SQL below, a second negated copy in the describe legend, and a third
+ * positive copy in `undocumented`. All four agreed by luck; the comment on
+ * DECLARED_UNOBSERVED_SQL records the last time they did not, when a dropped
+ * `$ref` clause answered 8 439 and 7 405 to the same question. Adding a new
+ * container shape now means editing one array.
+ */
+const CONTAINER_SUBSTRINGS = ["object", "array"] as const;
+const CONTAINER_EXACT = ["anyOf", "oneOf"] as const;
+const CONTAINER_PREFIX = "$ref";
+
 export function isContainer(declaredType: string | null): boolean {
   if (declaredType === null) return false;
   return (
-    declaredType.includes("object") ||
-    declaredType.includes("array") ||
-    declaredType === "anyOf" ||
-    declaredType === "oneOf" ||
-    declaredType.startsWith("$ref")
+    CONTAINER_SUBSTRINGS.some((t) => declaredType.includes(t)) ||
+    (CONTAINER_EXACT as readonly string[]).includes(declaredType) ||
+    declaredType.startsWith(CONTAINER_PREFIX)
   );
+}
+
+/** The same test in SQL, over any column reference. */
+export function containerSql(column: string): string {
+  const col = `ifnull(${column},'')`;
+  return (
+    "(" +
+    [
+      ...CONTAINER_SUBSTRINGS.map((t) => `${col} LIKE '%${t}%'`),
+      `${col} LIKE '${CONTAINER_PREFIX}%'`,
+      `${col} IN (${CONTAINER_EXACT.map((t) => `'${t}'`).join(",")})`,
+    ].join(" OR ") +
+    ")"
+  );
+}
+
+/**
+ * The complement. Safe as a plain negation because every branch reads through
+ * `ifnull`, so no comparison can go NULL and swallow the row.
+ */
+export function scalarSql(column: string): string {
+  return `NOT ${containerSql(column)}`;
 }
 
 /**
@@ -367,10 +401,7 @@ export interface UndocumentedField {
  * predicate, two numbers a reader has no way to reconcile.
  */
 export const DECLARED_UNOBSERVED_SQL = `
-  ifnull(sf.declared_type,'') NOT LIKE '%object%'
-  AND ifnull(sf.declared_type,'') NOT LIKE '%array%'
-  AND ifnull(sf.declared_type,'') NOT LIKE '$ref%'
-  AND ifnull(sf.declared_type,'') NOT IN ('anyOf','oneOf')
+  ${scalarSql("sf.declared_type")}
   AND NOT EXISTS (SELECT 1 FROM field_stats fs
                    WHERE fs.asset_type = sf.asset_type
                      AND fs.json_pointer = sf.json_pointer)`;

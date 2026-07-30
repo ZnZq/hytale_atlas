@@ -7,13 +7,12 @@ import {
 
 import { existsSync } from "node:fs";
 
-import { openIndex } from "../api/operations.ts";
+import { openIndex, resolveDbPath } from "../api/operations.ts";
 import { cmdIndex } from "../cli/commands.ts";
 import { getMeta, openDatabase, pipelineState } from "../db/open.ts";
 import { PIPELINE_VERSION } from "../db/schema.ts";
-import { AssetArchive, archiveStamp } from "../sources/archive.ts";
+import { AssetArchive } from "../sources/archive.ts";
 import { detectInstallation } from "../sources/detect.ts";
-import { frozenDbPath, frozenKey } from "../util/paths.ts";
 import { TOOLS, type ToolContext, callTool } from "./tools.ts";
 
 /**
@@ -57,7 +56,13 @@ Two limits worth knowing before you draw a conclusion:
   contribute no references, so a reference list can be incomplete by design.
 
 Identifiers are not unique across types: 442 of them name more than eight
-assets. Pass 'type' wherever a tool offers it.`;
+assets. Pass 'type' wherever a tool offers it.
+
+THIRD-PARTY PACKS. This index may hold assets from installed mods alongside the
+game's own. They are NOT distinguishable by identifier -- some packs prefix
+theirs, most do not -- so never infer "this is vanilla" from a name. The get and
+search tools report the owning pack, and a third-party caveat names it. An
+answer built on a modded asset only works for someone who has that mod.`;
 
 /**
  * Builds the index if it is missing, stale or half-written, before serving.
@@ -75,15 +80,14 @@ assets. Pass 'type' wherever a tool offers it.`;
  * everything.
  */
 async function ensureIndex(options: { assets?: string; patchline?: string }): Promise<void> {
-  const archivePath = options.assets ?? detectInstallation(options.patchline)?.assetsZip ?? null;
-  if (archivePath === null || !existsSync(archivePath)) {
+  const { path: dbPath } = await resolveDbPath(options);
+  if (dbPath === null) {
     throw new Error(
       "Assets.zip not found, so the index cannot be built. " +
         "Set HYTALE_ROOT or pass --assets <path>.",
     );
   }
 
-  const dbPath = frozenDbPath(frozenKey(archivePath, await archiveStamp(archivePath)));
   let reason: string | null = null;
   if (!existsSync(dbPath)) {
     reason = "no index for this Assets.zip";

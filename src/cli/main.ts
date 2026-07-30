@@ -13,6 +13,8 @@ import {
   cmdGenerateSchema,
   cmdGet,
   cmdIndex,
+  cmdInit,
+  cmdMcpInstall,
   cmdSearch,
   cmdSearchSchema,
   cmdTypes,
@@ -45,6 +47,8 @@ import {
 const USAGE = `hytale-atlas — unofficial local index of Hytale assets
 
   hytale-atlas                 Same as 'index': build if absent, report if present
+  hytale-atlas mcp-install     How to register this server with each AI client,
+                               with your absolute paths filled in. Prints only
   hytale-atlas status          Where the game is, which patchline, which tier, and
                                what the built index contains
   hytale-atlas index           Build the corpus index (cached globally, ~40s)
@@ -101,8 +105,12 @@ Options
                                --field Speed instead
                                (the leading slash is optional, and helps: some
                                shells rewrite a leading slash into a path)
+  --pack <Name>                Read one pack's version of an identifier, including
+                               a shadowed one the game does not load. 'get' only.
   --type <Type>                Narrow to one asset type. Works on 'get', 'search'
                                and 'refs'; identifiers are not unique across types
+  --client <id>                One MCP client for 'mcp-install' instead of every
+                               detected one
   --raw                        'get' prints the effective JSON and nothing else
   --limit <n>                  Result cap. Defaults: search 20, search-schema 20,
                                search-lang 20, describe 60, refs 40, types 200,
@@ -111,12 +119,33 @@ Options
                                field's observed values -- those are not stored
                                above it.
   --set <path>                 Evaluation set (default docs/evaluation/search-phrases.json)
+
+hytale-atlas init            Write hytale-atlas.json here, filled in from what
+                             detection found. Optional: with no config the tool
+                             reads the game's own install. Also spelled 'setup'.
+  --assets/--jar <path>      Override the archive or the server JAR
+  --patchline <name>         Which install to read when several are present
+  --cache-dir <path>         Where to keep the built index (default: user cache)
+  --schema <dir>             Generated asset schemas (from generate-schema)
+  --mods-dir <path>          Directory to scan for packs
+  --mod <path>               One pack, repeatable
+  --exclude <pattern>        Filename to skip, repeatable, '*' wildcard
+  --dry-run                  Print the file without writing it
+  --force                    Overwrite an existing config
   -h, --help                   This message
 `;
 
 interface Args {
   readonly command: string;
   readonly flags: ReadonlyMap<string, string | true>;
+  /**
+   * Flags that may be given more than once, accumulated in order.
+   *
+   * `--mod a.jar --mod b.jar` is what a person types; the scalar map keeps only
+   * the last one, which would drop packs in silence -- the same class of defect
+   * as the ignored unknown flag this parser already refuses to repeat.
+   */
+  readonly lists: ReadonlyMap<string, readonly string[]>;
   /** Positional arguments after the command, e.g. the search query. */
   readonly rest: readonly string[];
 }
@@ -140,7 +169,16 @@ const VALUE_FLAGS = new Set([
   "limit",
   "set",
   "type",
+  "mods-dir",
+  "cache-dir",
+  "mod",
+  "client",
+  "exclude",
+  "pack",
 ]);
+
+/** Value flags that accumulate instead of overwriting. */
+const REPEATED_FLAGS = new Set(["mod", "exclude"]);
 
 const SWITCH_FLAGS = new Set(["force", "yes", "dry-run", "raw", "all", "mcp", "help"]);
 
@@ -161,8 +199,25 @@ function nearestFlag(name: string): string | null {
 
 export class UsageError extends Error {}
 
+/** Stores a value, accumulating it when the flag is repeatable. */
+function remember(
+  flags: Map<string, string | true>,
+  lists: Map<string, string[]>,
+  key: string,
+  value: string,
+): void {
+  if (REPEATED_FLAGS.has(key)) {
+    const existing = lists.get(key);
+    if (existing === undefined) lists.set(key, [value]);
+    else existing.push(value);
+    return;
+  }
+  flags.set(key, value);
+}
+
 function parseArgs(argv: readonly string[]): Args {
   const flags = new Map<string, string | true>();
+  const lists = new Map<string, string[]>();
   const rest: string[] = [];
   let command = "index";
   let seenCommand = false;
@@ -193,7 +248,7 @@ function parseArgs(argv: readonly string[]): Args {
       }
 
       if (inlineValue !== undefined) {
-        flags.set(key, inlineValue);
+        remember(flags, lists, key, inlineValue);
         continue;
       }
       // The next argument is the value even when it starts with a dash, so
@@ -205,7 +260,7 @@ function parseArgs(argv: readonly string[]): Args {
         // exactly like passing no flag at all, with nothing said.
         throw new UsageError(`--${key} needs a value, e.g. --${key} <value>.`);
       }
-      flags.set(key, next);
+      remember(flags, lists, key, next);
       i++;
     } else if (a.startsWith("-") && a.length > 1 && a !== "-h") {
       // A single dash reads as a flag to a user and as a positional to a parser,
@@ -232,7 +287,7 @@ function parseArgs(argv: readonly string[]): Args {
     }
   }
 
-  return { command, flags, rest };
+  return { command, flags, lists, rest };
 }
 
 /**
@@ -282,7 +337,37 @@ function main(): number | Promise<number> {
     });
   }
 
+  /** A flag's value when it carries one. Switches read as undefined here. */
+  const str = (name: string): string | undefined => {
+    const value = args.flags.get(name);
+    return typeof value === "string" ? value : undefined;
+  };
+
   switch (args.command) {
+    case "init":
+    case "setup":
+      // Two names for one command: `init` is the npm/git muscle memory, `setup`
+      // is what people type when they are not thinking about other tools.
+      return cmdInit({
+        ...(str("assets") === undefined ? {} : { assets: str("assets")! }),
+        ...(str("jar") === undefined ? {} : { jar: str("jar")! }),
+        ...(str("patchline") === undefined ? {} : { patchline: str("patchline")! }),
+        ...(str("mods-dir") === undefined ? {} : { modsDir: str("mods-dir")! }),
+        ...(str("cache-dir") === undefined ? {} : { cacheDir: str("cache-dir")! }),
+        ...(str("schema") === undefined ? {} : { schema: str("schema")! }),
+        ...(args.lists.get("mod") === undefined ? {} : { mods: args.lists.get("mod")! }),
+        ...(args.lists.get("exclude") === undefined
+          ? {}
+          : { exclude: args.lists.get("exclude")! }),
+        force: args.flags.get("force") === true,
+        dryRun: args.flags.get("dry-run") === true,
+      });
+
+    case "mcp-install":
+      return cmdMcpInstall({
+        ...(str("client") === undefined ? {} : { client: str("client")! }),
+        ...(args.flags.has("all") ? { all: true } : {}),
+      });
     case "status":
       return cmdStatus(args);
     case "index":
@@ -424,6 +509,7 @@ function opts(args: Args) {
     ...(str("keep") !== undefined ? { keep: str("keep")! } : {}),
     ...(str("field") !== undefined ? { field: str("field")! } : {}),
     ...(str("type") !== undefined ? { type: str("type")! } : {}),
+    ...(str("pack") !== undefined ? { pack: str("pack")! } : {}),
     ...(args.flags.has("force") ? { force: true } : {}),
     ...(args.flags.has("yes") ? { yes: true } : {}),
     ...(args.flags.has("dry-run") ? { dryRun: true } : {}),

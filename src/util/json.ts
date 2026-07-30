@@ -195,3 +195,15 @@ export function readJsonFileLenient<T = unknown>(path: string): LenientParseResu
 export function isUnsetDefault(repair: Repair): boolean {
   return /\/default(\/|$)/.test(repair.pointer);
 }
+
+/**
+ * Escapes one JSON Pointer segment (RFC 6901): `~` becomes `~0`, `/` becomes `~1`.
+ *
+ * Was copied verbatim into three modules -- the asset resolver, the reference
+ * indexer and the schema reader -- which is three chances for a pointer written
+ * one way and read another. Small enough that nobody minded; exactly the size at
+ * which a divergence goes unnoticed.
+ */
+export function escapeSegment(segment: string): string {
+  return segment.replace(/~/g, "~0").replace(/\//g, "~1");
+}

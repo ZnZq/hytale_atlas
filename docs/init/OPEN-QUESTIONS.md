@@ -350,11 +350,24 @@ packs and plugins share one abstraction.
    tiebreak lives elsewhere (candidates: registration order, `LoadBefore` from the
    manifest, dependency topology). **`is_effective` cannot be computed from
    `PackSource` alone.**
-2. **Whether override is whole-asset replacement or field-level merge is still
-   open**, and it is now sharper rather than softer: `Parent` (Q18) proves the
-   engine already performs field-level inheritance *within* the corpus, and
-   `InheritCodec` exists. If pack override reuses that machinery, `diff_override`
-   semantics change substantially.
+2. ~~Whether override is whole-asset replacement or field-level merge~~ **CLOSED
+   by measurement: whole-asset replacement, last registration wins.**
+   `CommonAssetRegistry` keeps a `List<PackAsset>` per name, appends on add, and
+   `getByName` returns `getLast()`. No sort, no comparator, no merge. Disassembly
+   in `02-DOMAIN.md` Overlay and load order. `Parent`/`InheritCodec` (Q18) is a
+   separate axis -- merge within one asset's inheritance chain, not between packs
+   -- and conflating the two is what kept this open.
+
+   **The tiebreak in item 1 above is therefore not "unknown", it is "load
+   order".** The load order itself stays untraced, and that is now deliberate:
+   it predicts one player's install, not how to author a mod. What the tool owes
+   a reader is whether an identifier comes from the base game (safe), from a
+   pack (needs that pack), or from two packs and no base game (safe neither
+   way) -- and none of those need it. See `02-DOMAIN.md`.
+
+   Note also that `PackSource.overrides()` turned out to govern duplicate pack
+   REGISTRATIONS rather than assets, so item 1's premise -- that the enum is the
+   asset tiebreak at all -- was wrong.
 
 **How to check next, statically:** the `AssetStore` load path and `InheritCodec`,
 plus wherever `LoadBefore` is consumed. Blocks Phase 4 only.

@@ -1,29 +1,35 @@
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { detected, launchCommand, snippet, targets } from "./mcp-install.ts";
+import { basename, join, resolve } from "node:path";
 
-import { openDatabase, setMeta } from "../db/open.ts";
+import { type Database, openDatabase, setMeta } from "../db/open.ts";
 import { PIPELINE_VERSION } from "../db/schema.ts";
-import { buildSearchIndex } from "../indexer/corpus.ts";
+import { type PackSource, buildSearchIndex } from "../indexer/corpus.ts";
 import { indexBenches } from "../indexer/benches.ts";
 import { VALUE_LINKS, indexValueLinks } from "../indexer/value-links.ts";
 import { resolveCandidates } from "../indexer/references.ts";
 import { computeFieldStats } from "../indexer/stats.ts";
 import { TypeResolver, applyTypes, assetSuffixes, ingestSchemas } from "../indexer/schema.ts";
-import type { AssetLoader } from "../query/asset.ts";
 import { searchAssets } from "../query/search.ts";
 import { findUndocumented } from "../query/schema.ts";
-import { AssetArchive, archiveStamp } from "../sources/archive.ts";
+import { AssetArchive } from "../sources/archive.ts";
 import { detectInstallation } from "../sources/detect.ts";
+import { CONFIG_FILENAME, findConfigFile, resolveMods } from "../sources/config.ts";
+import { resolveSources } from "../api/operations.ts";
 import { TELEMETRY_DISCLOSURE, withGeneratedSchemas } from "../sources/schema-gen.ts";
 import { readGeneratedSchemas } from "../sources/schema-doc.ts";
 import {
   benchOp,
   benchesOp,
+  resolveDbPath,
   declaredCount,
   describeOp,
   getAssetOp,
+  openIndex,
   undeclaredObserved,
   langOp,
   refsAnyOp,
+  packAssetLoader,
   searchAssetsOp,
   assetsOfType,
   searchSchemaOp,
@@ -32,7 +38,7 @@ import {
   undocumentedOp,
 } from "../api/operations.ts";
 import { caveatBlock } from "../api/types.ts";
-import { formatCount, frozenDbPath, frozenKey } from "../util/paths.ts";
+import { formatCount } from "../util/paths.ts";
 import { askConsent } from "./consent.ts";
 
 /**
@@ -83,6 +89,274 @@ async function resolveArchive(
     );
   }
   return install.assetsZip;
+}
+
+/**
+ * Reads a pack's `manifest.json` without unpacking the archive.
+ *
+ * Returns nulls rather than throwing: a jar that is pure code has no manifest and
+ * is not an error, just not a pack.
+ */
+async function readManifest(
+  archive: AssetArchive,
+): Promise<{ group: string | null; name: string | null; version: string | null }> {
+  const entry = archive.entries.find((e) => e.path === "manifest.json");
+  if (entry === undefined) return { group: null, name: null, version: null };
+  try {
+    const m = JSON.parse(await archive.readText(entry.path)) as Record<string, unknown>;
+    const str = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
+    return { group: str(m["Group"]), name: str(m["Name"]), version: str(m["Version"]) };
+  } catch {
+    return { group: null, name: null, version: null };
+  }
+}
+
+/**
+ * Opens every source and gives each a `packs` row.
+ *
+ * Priority mirrors the server's own load order (`docs/init/03-ARCHITECTURE.md`):
+ * lower wins, so mods at 2 override vanilla at 3. That is the direction a modder
+ * expects -- their file replaces the game's -- and it is the direction the
+ * `is_effective` pass below reads.
+ *
+ * A pack with no asset roots is skipped and SAID: 22 of the 31 archives in a
+ * typical `UserData/Mods` are plugin jars, and most of those carry no assets at
+ * all. Silently opening and discarding them would make "31 packs" in the config
+ * and "9 packs" in the index look like a bug.
+ */
+async function openPacks(
+  db: Database,
+  vanilla: string,
+  mods: readonly string[],
+): Promise<{ sources: PackSource[]; skipped: string[] }> {
+  const insPack = db.prepare(
+    "INSERT INTO packs (group_name, name, version, path, kind, priority) VALUES (?,?,?,?,?,?)" +
+      " ON CONFLICT (path) DO UPDATE SET name = excluded.name RETURNING id",
+  );
+  const sources: PackSource[] = [];
+  const skipped: string[] = [];
+
+  const add = async (path: string, kind: "vanilla" | "archive"): Promise<void> => {
+    const archive = await AssetArchive.open(path);
+    const carriesAssets = archive.entries.some((e) =>
+      /^(Server|Common|Client)\/.+\.(json|lang)$/i.test(e.path),
+    );
+    if (!carriesAssets) {
+      skipped.push(basename(path));
+      archive.close();
+      return;
+    }
+    const m = kind === "vanilla" ? { group: "Hytale", name: "Hytale", version: null } : await readManifest(archive);
+    const row = insPack.get(
+      m.group,
+      m.name ?? basename(path),
+      m.version,
+      path,
+      kind,
+      kind === "vanilla" ? 3 : 2,
+    ) as { id: number } | undefined;
+    sources.push({ archive, packId: row?.id ?? 1 });
+  };
+
+  await add(vanilla, "vanilla");
+  for (const path of mods) await add(path, "archive");
+  return { sources, skipped };
+}
+
+/**
+ * Marks exactly one row per logical identifier as the one the engine sees.
+ *
+ * Without this every query would count a mod's override and the vanilla original
+ * as two assets, and `get` would pick whichever the join happened to reach first.
+ * Lowest priority wins.
+ *
+ * Ties break on the highest pack id -- an ARBITRARY rule, and callers must be
+ * told so. This comment used to claim it was "the same rule the server applies
+ * to two mods claiming one id"; that was never established, and it contradicts
+ * OPEN-QUESTIONS Q5, which records the equal-ordinal tiebreak as unknown. Pack
+ * id is the order WE opened the archives, which is a directory walk, not a game
+ * load order. Six identifiers in a real mods folder land here, so `getAssetOp`
+ * reports equal-priority collisions as CONTESTED rather than naming a winner.
+ */
+function markEffective(db: Database): { overridden: number } {
+  db.exec("UPDATE assets SET is_effective = 0");
+  db.exec(`
+    UPDATE assets SET is_effective = 1
+     WHERE id IN (
+       SELECT a.id FROM assets a
+        JOIN packs p ON p.id = a.pack_id
+        WHERE NOT EXISTS (
+          SELECT 1 FROM assets b JOIN packs q ON q.id = b.pack_id
+           WHERE b.logical_id = a.logical_id
+             AND (q.priority < p.priority
+               OR (q.priority = p.priority AND q.id > p.id))))`);
+  const row = db
+    .prepare("SELECT count(*) AS n FROM assets WHERE is_effective = 0")
+    .get() as { n: number } | undefined;
+  return { overridden: Number(row?.n ?? 0) };
+}
+
+export interface InitArgs {
+  readonly assets?: string;
+  readonly jar?: string;
+  readonly patchline?: string;
+  readonly modsDir?: string;
+  /** Where the built index goes. Omitted means the per-user cache directory. */
+  readonly cacheDir?: string;
+  /** Generated schema directory. Detected from the default when it exists. */
+  readonly schema?: string;
+  readonly mods?: readonly string[];
+  readonly exclude?: readonly string[];
+  readonly force?: boolean;
+  readonly dryRun?: boolean;
+  /** Where to write. Defaults to the current directory. */
+  readonly cwd?: string;
+}
+
+/**
+ * Writes `hytale-atlas.json`, filled in from flags and from what detection found.
+ *
+ * The file is OPTIONAL: with none, the tool reads the game's own install, which
+ * is what makes `npx hytale-atlas` work with no setup at all. This command exists
+ * for the cases detection cannot answer -- a relocated archive, two patchlines,
+ * and above all which third-party packs take part in the index, which is not
+ * discoverable from the game directory at all.
+ *
+ * **It resolves before it writes.** A config naming a path that is not there is
+ * the exact failure the config layer reports at read time; writing one and only
+ * finding out later would be this tool teaching the user to distrust it. So every
+ * path is checked, the mod selection is expanded, and the counts are printed --
+ * a person should be able to see the file did what they meant before they run
+ * anything else.
+ */
+export async function cmdInit(args: InitArgs = {}): Promise<number> {
+  const cwd = args.cwd ?? process.cwd();
+  const target = join(cwd, CONFIG_FILENAME);
+  const existing = findConfigFile(cwd);
+
+  if (existsSync(target) && args.force !== true) {
+    process.stderr.write(
+      `${CONFIG_FILENAME} already exists here:\n  ${target}\n` +
+        `Pass --force to overwrite it, or edit it directly.\n`,
+    );
+    return 1;
+  }
+  // A config FURTHER UP still applies to this directory, so writing a new one
+  // here changes which file wins. Said plainly, because the surprise otherwise
+  // arrives much later as "my settings stopped working".
+  if (existing !== null && existing !== target) {
+    process.stdout.write(
+      `note: ${existing}\n` +
+        `      already applies to this directory. The new file will take precedence here.\n\n`,
+    );
+  }
+
+  // Detection fills whatever the flags did not, so a bare `init` produces a
+  // working file rather than an empty one a reader has to research.
+  const install = detectInstallation(args.patchline);
+  const assets = args.assets ?? install?.assetsZip ?? null;
+  const jar = args.jar ?? install?.serverJar ?? null;
+  const patchline = args.patchline ?? install?.patchline ?? null;
+  const modsDir =
+    args.modsDir ??
+    (install?.userData == null ? null : join(install.userData, "Mods"));
+
+  const config: Record<string, unknown> = {};
+  if (assets !== null) config["assets"] = assets;
+  if (jar !== null) config["serverJar"] = jar;
+  if (patchline !== null) config["patchline"] = patchline;
+  // Written only when asked for. Emitting the default would freeze today's cache
+  // location into every config file, so a later change to where caches live
+  // would silently not apply to anyone who ran `init`.
+  if (args.cacheDir !== undefined) config["cacheDir"] = resolve(cwd, args.cacheDir);
+  // Written ABSOLUTE whenever it can be found, because the relative default is
+  // the thing that breaks as soon as the tool runs from anywhere else.
+  const schemaDir =
+    args.schema !== undefined
+      ? resolve(cwd, args.schema)
+      : existsSync(resolve(cwd, DEFAULT_SCHEMA_DIR))
+        ? resolve(cwd, DEFAULT_SCHEMA_DIR)
+        : null;
+  if (schemaDir !== null) config["schema"] = schemaDir;
+
+  const mods: Record<string, unknown> = {};
+  if (modsDir !== null && existsSync(modsDir)) mods["dir"] = modsDir;
+  if (args.mods !== undefined && args.mods.length > 0) {
+    mods["include"] = args.mods.map((p) => resolve(cwd, p));
+  }
+  if (args.exclude !== undefined && args.exclude.length > 0) {
+    mods["exclude"] = [...args.exclude];
+  }
+  if (Object.keys(mods).length > 0) config["mods"] = mods;
+
+  // Resolved with the same code the tool will use to read it back, so what is
+  // reported here is what will actually happen -- not a second implementation
+  // that can drift from the first.
+  const selection = resolveMods({
+    dir: (mods["dir"] as string | undefined) ?? null,
+    include: (mods["include"] as string[] | undefined) ?? [],
+    exclude: (mods["exclude"] as string[] | undefined) ?? [],
+  });
+
+  const problems: string[] = [...selection.problems];
+  for (const [label, path] of [
+    ["assets", assets],
+    ["serverJar", jar],
+  ] as const) {
+    if (path !== null && !existsSync(path)) problems.push(`${label} does not exist: ${path}`);
+  }
+  if (assets === null) {
+    problems.push(
+      "No Assets.zip: detection found none and --assets was not given. " +
+        "The index cannot be built until this is set.",
+    );
+  }
+
+  const body = `${JSON.stringify(config, null, 2)}\n`;
+  const lines = [
+    args.dryRun === true ? `Would write ${target}:` : `Wrote ${target}:`,
+    "",
+    ...body.trimEnd().split("\n").map((l) => `  ${l}`),
+    "",
+    `Sources this selects:`,
+    `  Assets.zip  ${assets ?? "(none)"}`,
+    `  Server JAR  ${jar ?? "(none)"}`,
+    `  Patchline   ${patchline ?? "(none)"}`,
+    `  Schemas     ${schemaDir ?? "(none found -- assets will be untyped)"}`,
+    `  Index at    ${
+      args.cacheDir === undefined ? "(per-user cache directory)" : resolve(cwd, args.cacheDir)
+    }`,
+    `  Mods        ${selection.packs.length} pack(s)` +
+      (selection.packs.length === 0
+        ? ""
+        : ` -- ${selection.packs
+            .slice(0, 4)
+            .map((p) => basename(p.path))
+            .join(", ")}${selection.packs.length > 4 ? `, and ${selection.packs.length - 4} more` : ""}`),
+    "",
+  ];
+  for (const problem of problems) lines.push(`PROBLEM: ${problem}`);
+  if (problems.length > 0) lines.push("");
+  // Multi-pack indexing has landed, so the note that used to sit here -- "selected
+  // but not yet part of the index" -- became a false statement about the tool the
+  // moment `openPacks` started feeding these archives to `buildSearchIndex`. It
+  // survived the landing because nothing fails when prose goes stale. What a
+  // reader needs now is the consequence, not a status report.
+  if (selection.packs.length > 0) {
+    lines.push(
+      `Note: ${selection.packs.length} mod pack(s) will be indexed alongside the game.`,
+      "      Answers will include their assets, and where a pack overrides a",
+      "      vanilla asset the pack's version is the one you get. No pack code",
+      "      is executed -- the archives are read as zip files.",
+      "",
+    );
+  }
+
+  if (args.dryRun !== true) writeFileSync(target, body, "utf8");
+  process.stdout.write(lines.join("\n"));
+  // A file that names a path which is not there is written, but the exit code
+  // says something needs attention -- scripts should not treat it as clean.
+  return problems.length > 0 ? 1 : 0;
 }
 
 export interface GenerateSchemaArgs {
@@ -155,8 +429,63 @@ export async function cmdGenerateSchema(args: GenerateSchemaArgs): Promise<numbe
     return 1;
   }
 
-  const stamp = await archiveStamp(assetsZip);
-  const dbPath = frozenDbPath(frozenKey(assetsZip, stamp));
+  // The mod plugins whose code the server would load. Only .jar files: a .zip
+  // pack carries assets and no code, and passing them changes nothing --
+  // measured, 9 zips produced exactly the vanilla 105 schema files and loaded
+  // zero plugins. Naming only the archives that actually execute keeps the
+  // disclosure honest about its own scope.
+  const sourcesForSchema = resolveSources({
+    ...(args.assets === undefined ? {} : { assets: args.assets }),
+    ...(args.patchline === undefined ? {} : { patchline: args.patchline }),
+    ...(args.jar === undefined ? {} : { jar: args.jar }),
+  });
+  const modPlugins = sourcesForSchema.mods
+    .map((m) => m.path)
+    .filter((p) => p.toLowerCase().endsWith(".jar"));
+
+  if (modPlugins.length > 0) {
+    // A SECOND consent, separate from the telemetry one above, because it is a
+    // different act with a different blast radius. Telemetry is data leaving the
+    // machine; this is arbitrary third-party code running on it with the user's
+    // own privileges. `--yes` does not cover it -- only an explicit
+    // `consent.runModPlugins` or an interactive yes does.
+    const consentedToRun = await askConsent({
+      ...(sourcesForSchema.consent.runModPlugins ? { granted: true } : {}),
+      disclosure: [
+        "SCHEMAS FOR MOD-DEFINED TYPES REQUIRE RUNNING THE MODS.",
+        "",
+        `The server will LOAD and EXECUTE ${modPlugins.length} plugin JAR(s):`,
+        ...modPlugins.slice(0, 10).map((p) => `  ${basename(p)}`),
+        ...(modPlugins.length > 10 ? [`  ... and ${modPlugins.length - 10} more`] : []),
+        "",
+        "This is not the same as indexing them. Indexing reads archives; this",
+        "runs their Java with your account's privileges -- filesystem, network,",
+        "everything you can do. `--bare` does NOT prevent it: the server's own",
+        "help says plugins are still loaded.",
+        "",
+        "There is no way to have these schemas without it. The extra types exist",
+        "because the plugin code registers them at runtime; nothing is sitting in",
+        "the archives waiting to be read.",
+        "",
+        "The bundled JRE is Java 25, where the in-process SecurityManager has been",
+        "removed, so there is no sandbox inside the JVM. If you do not trust every",
+        "JAR above, run this in a container or a throwaway account instead.",
+      ].join("\n"),
+      question: `Execute ${modPlugins.length} third-party plugin(s) to generate their schemas?`,
+    });
+    if (!consentedToRun) {
+      process.stdout.write(
+        "Declined. Generating vanilla schemas only -- mod-defined types will be absent.\n",
+      );
+      modPlugins.length = 0;
+    }
+  }
+
+  const { path: dbPath } = await resolveDbPath({ assets: assetsZip });
+  if (dbPath === null) {
+    process.stderr.write("Assets.zip not found; nowhere to ingest the schemas.\n");
+    return 1;
+  }
   const db = openDatabase(dbPath);
   let generatorWarnings = 0;
 
@@ -167,6 +496,7 @@ export async function cmdGenerateSchema(args: GenerateSchemaArgs): Promise<numbe
         assetsZip,
         java,
         consent: true,
+        ...(modPlugins.length > 0 ? { modPlugins } : {}),
         ...(args.keep !== undefined ? { keepAt: args.keep } : {}),
         // The generator emits hundreds of routine warnings -- 437 of 444 lines on
         // the release corpus -- so echoing anything matching /WARN/ buries the
@@ -240,9 +570,19 @@ const DEFAULT_SCHEMA_DIR = "local/schema-release";
 
 export async function cmdIndex(args: IndexArgs): Promise<number> {
   const archivePath = await resolveArchive(args.assets, args.patchline);
-  const stamp = await archiveStamp(archivePath);
-  const key = frozenKey(archivePath, stamp);
-  const dbPath = frozenDbPath(key);
+  // Through the shared resolver: it is what puts the mod set into the key and
+  // honours a configured cache directory. Computing the key here by hand meant
+  // `index` wrote to one path while every reader looked at another the moment a
+  // config appeared.
+  const { path: dbPath, sources: selected } = await resolveDbPath({
+    ...(args.assets === undefined ? {} : { assets: args.assets }),
+    ...(args.patchline === undefined ? {} : { patchline: args.patchline }),
+    ...(args.schema === undefined ? {} : { schema: args.schema }),
+  });
+  if (dbPath === null) {
+    process.stderr.write("Assets.zip not found. Set HYTALE_ROOT, or pass --assets <path>.\n");
+    return 1;
+  }
 
   // --dry-run is documented as a global option and was read only by
   // generate-schema. `index --force --dry-run` therefore ran the real 40-second
@@ -277,16 +617,58 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
     `Indexing vanilla assets (one-time, cached globally)\n  ${archivePath}\n`,
   );
 
-  const archive = await AssetArchive.open(archivePath);
-  process.stdout.write(`  ${formatCount(archive.size)} entries\n`);
+  // Third-party packs the config selected. None without a config, so the plain
+  // `npx hytale-atlas` path is untouched.
+  if (selected.mods.length > 0) {
+    // A NOTICE, not a prompt. Indexing opens archives and reads JSON; no
+    // third-party code runs, so there is nothing here to consent to -- the
+    // consent this tool asks for guards code execution, and asking for one that
+    // guards nothing teaches people to click through the one that does.
+    //
+    // Still said out loud: these packs change every answer the index gives, and
+    // where one overrides a vanilla asset the pack wins.
+    process.stdout.write(
+      `
+  Including ${selected.mods.length} third-party pack(s) from ${CONFIG_FILENAME}:
+` +
+        selected.mods.slice(0, 6).map((m) => `    ${basename(m.path)}
+`).join("") +
+        (selected.mods.length > 6 ? `    ... and ${selected.mods.length - 6} more
+` : "") +
+        `  Read as archives -- no plugin code is executed.
+
+`,
+    );
+  }
 
   const db = openDatabase(dbPath);
+  const { sources, skipped } = await openPacks(
+    db,
+    archivePath,
+    selected.mods.map((m) => m.path),
+  );
+  const archive = sources[0]!.archive;
+  process.stdout.write(`  ${formatCount(archive.size)} entries\n`);
+  if (sources.length > 1) {
+    process.stdout.write(`  + ${sources.length - 1} third-party pack(s) with assets\n`);
+  }
+  if (skipped.length > 0) {
+    // Named, not silent: most jars in a mods directory are pure code, and a count
+    // dropping from 31 to 9 with no explanation reads as a failure.
+    process.stdout.write(
+      `  ${skipped.length} archive(s) carry no assets and were skipped ` +
+        `(${skipped.slice(0, 3).join(", ")}${skipped.length > 3 ? ", ..." : ""})\n`,
+    );
+  }
   try {
     // Schema first: it supplies the path -> type map, and an asset indexed without
     // a type cannot later be told apart from a worldgen prefab or an animation.
     let resolver: TypeResolver | undefined;
     let suffixes: string[] | undefined;
-    const schemaDir = args.schema ?? DEFAULT_SCHEMA_DIR;
+    // Flag, then config, then the relative default. The default is relative to
+    // the CWD, which is exactly why it belongs in the config: run from a pack
+    // directory it resolves to nothing, and the whole index comes out tier 1.
+    const schemaDir = selected.schema ?? DEFAULT_SCHEMA_DIR;
     if (existsSync(schemaDir)) {
       const set = readGeneratedSchemas(schemaDir);
       const ingested = ingestSchemas(db, set);
@@ -303,7 +685,7 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
       );
     }
 
-    const result = await buildSearchIndex(archive, db, {
+    const result = await buildSearchIndex(sources, db, {
       ...(resolver ? { types: resolver } : {}),
       ...(suffixes ? { assetSuffixes: suffixes } : {}),
       onProgress: (done, total) => {
@@ -311,6 +693,17 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
       },
     });
     process.stdout.write("\r".padEnd(48) + "\r");
+
+    // Overlay: exactly one row per identifier is the one the engine sees. Without
+    // it a mod's override and the vanilla original both count, and `get` picks
+    // whichever the join reaches first.
+    const overlay = markEffective(db);
+    if (overlay.overridden > 0) {
+      process.stdout.write(
+        `Overrides: ${formatCount(overlay.overridden)} vanilla asset(s) replaced by a pack
+`,
+      );
+    }
 
     // Pass 2 resolution: one indexed join per edge kind, now that the symbol
     // table is complete.
@@ -384,100 +777,19 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
   return 0;
 }
 
-function openFrozen(assets: string | undefined, patchline: string | undefined) {
-  const archivePath = assets ?? detectInstallation(patchline)?.assetsZip;
-  if (!archivePath) throw new Error("Assets.zip not found; run with --assets <path>.");
-  return archivePath;
-}
-
-async function frozenDb(assets: string | undefined, patchline: string | undefined) {
-  const archivePath = openFrozen(assets, patchline);
-  const dbPath = frozenDbPath(frozenKey(archivePath, await archiveStamp(archivePath)));
-  if (!existsSync(dbPath)) {
-    throw new Error(`No index yet. Run 'hytale-atlas index' first.\n  expected: ${dbPath}`);
-  }
-  return openDatabase(dbPath, { readOnly: true });
-}
-
 /**
- * One line describing the cached index, read from the cache itself.
- *
- * `status` used to print a constant -- "not built (indexing is not implemented
- * yet)" -- which stayed there long after indexing worked. Every other command
- * contradicted it, so the first thing a new user saw was the tool calling itself
- * broken. Never state capability from a literal when the artifact can be read.
+ * Delegates rather than repeating. This used to be a second copy of `openIndex`
+ * -- same resolve, same existence check, different error wording -- and it drifted
+ * in the way that matters: `openIndex` grew a readiness gate and this one did not,
+ * so every CLI read command would answer from a half-built index.
  */
-export async function indexSummary(
-  assets: string | undefined,
-  patchline: string | undefined,
-): Promise<string> {
-  let dbPath: string;
-  try {
-    const archivePath = openFrozen(assets, patchline);
-    dbPath = frozenDbPath(frozenKey(archivePath, await archiveStamp(archivePath)));
-  } catch {
-    return "no Assets.zip, nothing to index";
-  }
-  if (!existsSync(dbPath)) return "not built — run 'hytale-atlas index'";
-
-  const db = openDatabase(dbPath, { readOnly: true });
-  try {
-    const one = (sql: string): number =>
-      Number((db.prepare(sql).get() as Record<string, unknown> | undefined)?.["n"] ?? 0);
-    const assets = one("SELECT count(*) AS n FROM assets");
-    const typed = one("SELECT count(*) AS n FROM assets WHERE type IS NOT NULL");
-    // Excludes the empty-pointer TYPE rows, like every other count in the
-    // project. `status` said 18,396 while `undocumented` said 17,400 about the
-    // same thing, and the 996 difference is types, not fields.
-    const declared = one(
-      "SELECT count(*) AS n FROM schema_fields WHERE json_pointer <> ''",
-    );
-    const joined = one(
-      `SELECT count(*) AS n FROM field_stats fs
-        JOIN schema_fields sf ON sf.asset_type = fs.asset_type
-                             AND sf.json_pointer = fs.json_pointer`,
-    );
-    const observed = one("SELECT count(*) AS n FROM field_stats");
-    // Coverage is stated because --help promised it and the line did not carry
-    // it, and because both numbers are the honest caveat on every negative this
-    // tool gives: an unjoined field reads as unused when it may only be unmatched.
-    return (
-      `${formatCount(assets)} assets ` +
-      `(${formatCount(typed)} typed, ${Math.round((typed / Math.max(assets, 1)) * 100)}%), ` +
-      `${formatCount(declared)} schema fields, ` +
-      `${formatCount(one("SELECT count(*) AS n FROM edges"))} edges` +
-      // Named, not counted. "5 locales" led an agent to work out which ones by
-      // inference and conclude Ukrainian was absent -- it is not. The tool said
-      // nothing false; its silence produced a false belief, which is the same
-      // failure wearing a different hat.
-      // ...and attributed. Naming them was not enough: an unlabelled list of five
-      // codes on a counts line reads as the set of languages the GAME ships, and
-      // a blind trial asked to support "every language the game ships" could
-      // neither confirm nor refute it. These are the locales found in the
-      // archive that was indexed -- which is a fact about this archive.
-      `\n             locales in this Assets.zip: ${(
-        db.prepare("SELECT DISTINCT locale FROM lang_keys ORDER BY locale").all() as unknown as {
-          locale: string;
-        }[]
-      )
-        .map((r) => r.locale)
-        .join(", ")}\n` +
-      `             observed/declared join: ${formatCount(joined)} of ` +
-      `${formatCount(observed)} observed fields match a declared one ` +
-      `(${Math.round((joined / Math.max(observed, 1)) * 100)}%)\n` +
-      // Named, not just numbered. `epoch 1` appeared beside a path with nothing
-      // saying what it counts -- a reader deciding whether their index is stale
-      // had to guess between rebuild generation, cache format and schema version.
-      `             epoch ${one("SELECT CAST(ifnull(value,'0') AS INTEGER) AS n FROM meta WHERE key = 'epoch'")}` +
-      ` -- one per index build; rebuild with 'index --force'\n` +
-      `             ${dbPath}`
-    );
-  } catch (err) {
-    return `unreadable (${err instanceof Error ? err.message : String(err)})`;
-  } finally {
-    db.close();
-  }
+async function frozenDb(assets: string | undefined, patchline: string | undefined) {
+  return openIndex({
+    ...(assets === undefined ? {} : { assets }),
+    ...(patchline === undefined ? {} : { patchline }),
+  });
 }
+
 
 export async function cmdSearch(
   query: string,
@@ -504,9 +816,12 @@ export async function cmdSearch(
  */
 export async function cmdGet(
   logicalId: string,
-  args: { assets?: string; patchline?: string; raw?: boolean; type?: string },
+  args: { assets?: string; patchline?: string; raw?: boolean; type?: string; pack?: string },
 ): Promise<number> {
-  const archivePath = openFrozen(args.assets, args.patchline);
+  // One resolver, one wording. This used to call a near-copy of `resolveArchive`
+  // that threw a differently-phrased error for the same condition, so fixing the
+  // message in one place left the other stale.
+  const archivePath = await resolveArchive(args.assets, args.patchline);
   const db = await frozenDb(args.assets, args.patchline);
   const archive = await AssetArchive.open(archivePath);
 
@@ -516,32 +831,22 @@ export async function cmdGet(
     // leaving SQLite to break the tie by rowid. So `get Plant_Bush` announced
     // "Showing the Item one" and then printed the ItemDropList -- handing over the
     // wrong file while stating the right one.
-    const byId = db.prepare(
-      "SELECT path, type FROM assets WHERE logical_id = ?1" +
-        " AND (?2 IS NULL OR type = ?2) ORDER BY is_effective DESC, type LIMIT 1",
+    // Pack-aware: an asset can live in any indexed archive now, and a parent
+    // chain routinely crosses from a mod into vanilla.
+    const { load, close } = packAssetLoader(
+      db,
+      args.type,
+      ...(args.pack === undefined ? [] : [{ logicalId, pack: args.pack }]),
     );
-    // `forType` is the child's type when resolving a parent, and the caller's
-    // --type (or nothing) for the asset itself. Passing `args.type` for every
-    // lookup meant that without --type a parent was chosen by identifier alone:
-    // `get Eggsac` merged the BlockBoundingBoxes named Cocoon into a
-    // BlockSoundSet and printed `Boxes` in place of `SoundEvents`.
-    const load: AssetLoader = async (id, forType) => {
-      const row = byId.get(id, forType ?? args.type ?? null) as
-        | { path: string; type: string | null }
-        | undefined;
-      if (row === undefined) return null;
-      try {
-        return {
-          path: row.path,
-          type: row.type,
-          document: JSON.parse(await archive.readText(row.path)),
-        };
-      } catch {
-        return null;
-      }
-    };
-
-    const result = await getAssetOp(db, logicalId, load, args.type, args.raw === true);
+    const result = await getAssetOp(
+      db,
+      logicalId,
+      load,
+      args.type,
+      args.raw === true,
+      args.pack,
+    );
+    close();
     const miss = result.value === null;
     (miss ? process.stderr : process.stdout).write(result.text ?? "");
     // `--raw` promises parseable stdout, so its qualifications go to stderr --
@@ -870,3 +1175,59 @@ export async function cmdEval(args: {
   }
 }
 
+export interface McpInstallArgs {
+  readonly client?: string;
+  readonly all?: boolean;
+}
+
+/**
+ * Prints how to register this server with each AI client.
+ *
+ * Prints only. See mcp-install.ts for why nothing is written: the value a
+ * command adds over the README is the absolute paths, and that is all it adds.
+ */
+export function cmdMcpInstall(args: McpInstallArgs): number {
+  const all = targets();
+  const chosen =
+    args.client !== undefined
+      ? all.filter((t) => t.id === args.client)
+      : args.all === true
+        ? all
+        : all.filter(detected);
+
+  if (args.client !== undefined && chosen.length === 0) {
+    process.stderr.write(
+      `Unknown client '${args.client}'. Known: ${all.map((t) => t.id).join(", ")}\n`,
+    );
+    return 2;
+  }
+
+  const { command, args: launchArgs } = launchCommand();
+  const out: string[] = [`Server:  ${command} ${launchArgs.join(" ")}\n\n`];
+
+  if (chosen.length === 0) {
+    out.push(`No AI client detected here. --all lists all ${all.length} anyway.\n`);
+    process.stdout.write(out.join(""));
+    return 0;
+  }
+
+  if (args.client === undefined && args.all !== true) {
+    out.push(`Detected ${chosen.length} of ${all.length} known clients. --all for the rest.\n\n`);
+  }
+
+  for (const t of chosen) {
+    out.push(`${t.label}\n`);
+    if (t.cli !== undefined) {
+      out.push(`  ${t.cli}\n`);
+      out.push(`  or edit ${t.file}:\n`);
+    } else {
+      out.push(`  edit ${t.file}:\n`);
+    }
+    for (const l of snippet(t).split("\n")) out.push(l.length > 0 ? `    ${l}\n` : "");
+    out.push("\n");
+  }
+
+  out.push("Merge into what is already there -- these show the key, not the whole file.\n");
+  process.stdout.write(out.join(""));
+  return 0;
+}

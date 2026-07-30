@@ -1,4 +1,6 @@
 import type { Database } from "../db/open.ts";
+import { scopes } from "../sources/schema-doc.ts";
+import { escapeSegment } from "../util/json.ts";
 
 /**
  * Resolving an asset to its **effective** definition.
@@ -160,10 +162,6 @@ function buildRuleBook(db: Database): RuleBook {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function escapeSegment(segment: string): string {
-  return segment.replace(/~/g, "~0").replace(/\//g, "~1");
 }
 
 /**
@@ -338,8 +336,8 @@ function resolveScope(db: Database, type: string, chain: { document: Json }[]): 
     | undefined;
   if (root === undefined) return type;
 
-  const branches = root.ref_scope.split(" ").filter(Boolean);
-  const values = (root.discriminator_values ?? "").split(" ").filter(Boolean);
+  const branches = scopes(root.ref_scope);
+  const values = scopes(root.discriminator_values);
   if (branches.length < 2 || values.length !== branches.length) return type;
   const property = root.discriminator_property ?? "Type";
 

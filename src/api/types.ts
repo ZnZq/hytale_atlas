@@ -54,7 +54,12 @@ export type CaveatCode =
   /** Recipes require this bench id, but no asset provides a station carrying it. */
   | "bench-undeclared"
   /** The caller's pointer was rewritten before it arrived; this is what was read. */
-  | "pointer-repaired";
+  | "pointer-repaired"
+  /** Part of this answer comes from a third-party pack, not from the game. */
+  | "third-party"
+  | "shadowed"
+  | "shadowed-shown"
+  | "contested-packs";
 
 /**
  * Every operation returns its answer alongside what qualifies it.
@@ -241,6 +246,86 @@ export const caveat = {
   // join puts a field INTO the results -- it is presence that the ratio
   // undermines, not absence. `status` reports the ratio itself, where the
   // reader's risk is trusting the observed layer to be complete.
+  /**
+   * Names the packs an answer drew on, when any of them is not the game.
+   *
+   * Measured, not theorised: with 31 packs indexed, agents called `Multitools`,
+   * `Gravestones`, `Perfect Parries` and `WansWonderWeapon` assets "vanilla" --
+   * one of them concluding that a mod's plugin interaction was "compiled into
+   * the engine". They were right whenever the pack prefixed its identifiers and
+   * wrong whenever it did not, which makes correctness a property of someone
+   * else's naming convention rather than of this index.
+   *
+   * A modder who builds on an asset believing it ships with the game writes a
+   * pack that breaks for everyone who does not have that mod -- silently, at
+   * runtime, which is the failure this whole tool exists to prevent.
+   */
+  /**
+   * Several packs define one identifier and only one of them is loaded.
+   *
+   * Whole-asset replacement, not a merge (02-DOMAIN.md): the shadowed files are
+   * inert. Worth saying out loud because the winner looks exactly like any other
+   * answer -- a reader asking what vanilla adamantite armour does gets a mod's
+   * version under the vanilla name, with nothing on screen to suggest a second
+   * definition ever existed.
+   */
+  /**
+   * Two third-party packs claim one identifier, and neither is the base game.
+   *
+   * The engine has no per-asset priority at all -- `PackSource.overrides()`
+   * settles duplicate pack REGISTRATIONS, never assets (02-DOMAIN.md). Asset
+   * collisions go to whichever pack loaded last. When one side is the base game
+   * that is a safe bet, because it registers first; between two packs there is
+   * nothing to bet on, and calling either one the winner would dress this
+   * index's arbitrary row order as a fact about the game.
+   */
+  contestedPacks: (logicalId: string, packs: readonly string[], shown?: string): Caveat => ({
+    code: "contested-packs",
+    message:
+      `${packs.join(" and ")} both define '${logicalId}', and neither is the ` +
+      `base game. The engine keeps whichever pack loaded last and has no ` +
+      `priority rule to fall back on, so which one a running game uses cannot ` +
+      `be worked out from here. Treat the two as a conflict to resolve, not as ` +
+      `one winner and one loser.` +
+      // Only the pinned view HAS a shown file. The disambiguation view returns
+      // no document at all, and saying "the shown file" there described
+      // something that was not on screen -- the same slip this caveat's sibling
+      // carried, found by the same round of testing.
+      (shown === undefined
+        ? ""
+        : ` You are looking at ${shown}'s file; whether a running game uses it ` +
+          `is unknown.`),
+  }),
+
+  /** The caller asked for a definition the game does not load. */
+  shadowedShown: (logicalId: string, shown: string, winner: string): Caveat => ({
+    code: "shadowed-shown",
+    message:
+      `You are looking at ${shown}'s '${logicalId}', which the game does NOT ` +
+      `load -- ${winner} defines the same identifier and wins. This file is ` +
+      `inert: nothing in a running game reads it. Useful for seeing what ` +
+      `${winner} replaced, not for predicting behaviour.`,
+  }),
+  shadowed: (logicalId: string, winner: string, losers: readonly string[]): Caveat => ({
+    code: "shadowed",
+    message:
+      `'${logicalId}' is defined by ${losers.length + 1} packs: ${winner}, ` +
+      `${losers.join(", ")}. No document was returned, because choosing one ` +
+      `would be choosing for you -- a pack replaces the whole file rather than ` +
+      `merging into it, and the engine keeps whichever pack loaded last, which ` +
+      `this index cannot observe. ${winner} is the expected winner (packs load ` +
+      `after the base game). Ask again naming the pack you want.`,
+  }),
+  thirdParty: (packs: readonly string[]): Caveat => ({
+    code: "third-party",
+    message:
+      `This answer includes assets from ${packs.length} third-party pack(s): ` +
+      `${packs.join(", ")}. They are NOT part of the game -- anything built on ` +
+      `them requires that pack to be installed. Names carry no hint of this: ` +
+      `most packs do not prefix their identifiers, so a plausible-looking ` +
+      `name is not evidence of vanilla. Rows and values sourced from a pack ` +
+      `are marked with it in square brackets; unmarked ones are the game's.`,
+  }),
   /**
    * What the tool actually READ, when that is not what the caller typed.
    *
