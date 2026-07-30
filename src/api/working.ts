@@ -1,10 +1,11 @@
 import { existsSync } from "node:fs";
 
 import type { Database } from "../db/open.ts";
-import { assetIdFromPath } from "../indexer/corpus.ts";
+import { assetIdFromPath, collectReferences } from "../indexer/corpus.ts";
 import { collectCandidates } from "../indexer/references.ts";
 import { buildPointerAligner } from "../indexer/stats.ts";
 import { DirectorySource, treeStamp } from "../sources/directory.ts";
+import { isTranslationReference, localeFromPath, parseLang, referenceToKey } from "../sources/lang.ts";
 
 /**
  * The pack being authored, laid over the frozen corpus.
@@ -122,6 +123,11 @@ export async function buildWorkingLayer(
   // no declared field until it is rebased -- which silently swallowed the ItemId
   // inside a Recipe, the commonest shape there is.
   const aligner = buildPointerAligner(db);
+  // Parsed ONCE. Both the candidate pass and the search pass need the document,
+  // and reading each file twice doubled the cost of every refresh -- the one
+  // number that decides whether checking freshness before each answer is
+  // affordable at all.
+  const parsed = new Map<string, unknown>();
 
   let id = -1;
   let assets = 0;
@@ -142,6 +148,7 @@ export async function buildWorkingLayer(
       // which is itself worth seeing -- and contributes no values.
       continue;
     }
+    parsed.set(entry.path, doc);
     for (const c of collectCandidates(doc)) {
       // Union branches are chosen from a discriminator read out of `candidates`,
       // which a working asset has no row in -- so a union stays unresolved and
@@ -165,7 +172,7 @@ export async function buildWorkingLayer(
     "CREATE TEMP VIEW packs AS SELECT * FROM main.packs UNION ALL SELECT * FROM temp.working_packs",
   );
 
-  buildWorkingSearch(db);
+  await buildWorkingSearch(db, source, parsed);
   buildWorkingEdges(db);
   return { root, stamp, assets, source };
 }
@@ -182,7 +189,31 @@ export async function buildWorkingLayer(
  * files, which are not parsed here, so a draft is found by what it is CALLED in
  * code and not yet by what it says on screen.
  */
-function buildWorkingSearch(db: Database): void {
+async function buildWorkingSearch(
+  db: Database,
+  source: DirectorySource,
+  parsed: ReadonlyMap<string, unknown>,
+): Promise<void> {
+  // The pack's OWN translations. A draft is looked for by the name it will show
+  // on screen at least as often as by its identifier, and until these are read
+  // the only thing findable is what the file happens to be called.
+  const byLocale = new Map<string, Map<string, string>>();
+  for (const entry of source.entries) {
+    if (!entry.path.endsWith(".lang")) continue;
+    const locale = localeFromPath(entry.path);
+    if (locale === null) continue; // fallback.lang maps locales, it is not one
+    // Stored keys carry NO root prefix -- `lang.ts` states the invariant: the
+    // prefix is on the REFERENCE, and `referenceToKey` strips it. Prefixing by
+    // the file's stem here was wrong, and wrong in the worst way: this pack's
+    // file is `server.lang`, so the stem WAS the root, and every key became
+    // `server.items.X.name` against a lookup of `items.X.name`. Not one of the
+    // pack's eleven items was ever findable by its translated name.
+    const parsed = parseLang(await source.readText(entry.path));
+    const bucket = byLocale.get(locale) ?? new Map<string, string>();
+    for (const [k, v] of parsed) bucket.set(k, v);
+    byLocale.set(locale, bucket);
+  }
+
   db.exec("DROP TABLE IF EXISTS temp.working_fts");
   db.exec(
     // Same tokenizer and prefix settings as `assets_fts`. Without them the two
@@ -192,12 +223,41 @@ function buildWorkingSearch(db: Database): void {
       " (logical_id, type, locale UNINDEXED, display_name, description," +
       " tokenize = 'unicode61 remove_diacritics 2', prefix = '2 3')",
   );
-  db.exec(`
-    INSERT INTO temp.working_fts (logical_id, type, locale, display_name, description)
-    SELECT logical_id, ifnull(type, ''), '',
-           replace(replace(logical_id, '_', ' '), '.', ' '), ''
-      FROM temp.working_assets
-  `);
+  const insFts = db.prepare(
+    "INSERT INTO temp.working_fts (logical_id, type, locale, display_name, description)" +
+      " VALUES (?,?,?,?,?)",
+  );
+  const rows = db
+    .prepare("SELECT logical_id, ifnull(type,'') AS type, path FROM temp.working_assets")
+    .all() as unknown as { logical_id: string; type: string; path: string }[];
+
+  for (const row of rows) {
+    // The identifier row always exists, with separators opened up so a single
+    // token matches -- the frozen index does the same for unlocalized assets.
+    insFts.run(row.logical_id, row.type, "", row.logical_id.replace(/[_.]/g, " "), "");
+    if (byLocale.size === 0) continue;
+
+    // Already parsed by the caller; absent means it did not parse, and that was
+    // reported there.
+    const doc = parsed.get(row.path);
+    if (doc === undefined) continue;
+    const refs = collectReferences(doc, "", [], isTranslationReference);
+    if (refs.length === 0) continue;
+
+    for (const [locale, entries] of byLocale) {
+      let name = "";
+      let description = "";
+      for (const ref of refs) {
+        const value = entries.get(referenceToKey(ref.reference));
+        if (value === undefined) continue;
+        if (ref.role.toLowerCase().includes("desc")) description = value;
+        else name = value;
+      }
+      if (name !== "" || description !== "") {
+        insFts.run(row.logical_id, row.type, locale, name, description);
+      }
+    }
+  }
 }
 
 /**

@@ -80,6 +80,16 @@ export type CaveatCode =
 export interface Result<T> {
   readonly value: T;
   readonly caveats: readonly Caveat[];
+  /**
+   * The same answer WITHOUT the rows that `value` already carries.
+   *
+   * A tabular row is a second, lossier copy of structured data the caller was
+   * handed anyway -- and an MCP client pays for both. What is NOT in `value` is
+   * the prose: the qualifications, the explanations of what a column means, the
+   * next step to take. That is the part worth serving to a model, and this field
+   * is it. Absent where an answer has no table to drop.
+   */
+  readonly prose?: string;
   /** Rendered form. Optional while the commands are being moved across. */
   readonly text?: string;
 }
@@ -126,8 +136,9 @@ export function rendered<T>(
   value: T,
   text: string,
   caveats: readonly Caveat[] = [],
+  prose?: string,
 ): Result<T> {
-  return { value, caveats, text };
+  return { value, caveats, text, ...(prose === undefined ? {} : { prose }) };
 }
 
 /**

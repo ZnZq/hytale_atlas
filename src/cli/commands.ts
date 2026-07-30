@@ -785,10 +785,33 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
  * so every CLI read command would answer from a half-built index.
  */
 async function frozenDb(assets: string | undefined, patchline: string | undefined) {
-  return openIndex({
+  const options = {
     ...(assets === undefined ? {} : { assets }),
     ...(patchline === undefined ? {} : { patchline }),
-  });
+  };
+  try {
+    return await openIndex(options);
+  } catch (error) {
+    // The index is content-addressed over its SOURCES, so installing, removing or
+    // updating a mod produces a different cache key and the old database simply
+    // is not the answer to the new question. Until now that surfaced as "No index
+    // yet. Build it first." -- technically true and useless: nothing had gone
+    // wrong, the corpus had merely moved, and the reader was left to guess which
+    // of their mods did it. Rebuilding is the only correct response, so do it.
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/No index yet|INCOMPLETE|STALE/.test(message)) throw error;
+    process.stderr.write(
+      "Sources changed since the last index -- rebuilding before answering.\n",
+    );
+    // FORCE, always. We are here because the existing database cannot answer the
+    // question -- wrong source set, or a run that never finished. Without this
+    // `cmdIndex` sees a file on disk, prints "Use --force to rebuild", returns
+    // success, and the very next read fails the same way: a loop that reports no
+    // error and makes no progress.
+    const code = await cmdIndex({ ...options, force: true });
+    if (code !== 0) throw error;
+    return await openIndex(options);
+  }
 }
 
 
@@ -800,7 +823,7 @@ export async function cmdSearch(
   try {
     // The operation renders, this writes. A miss goes to stderr so piped output
     // stays machine-readable.
-    const result = searchAssetsOp(db, query, args.limit ?? 20, args.type);
+    const result = searchAssetsOp(db, query, args.limit, args.type);
     const miss = result.value.length === 0;
     (miss ? process.stderr : process.stdout).write(result.text ?? "");
     return miss ? 1 : 0;
@@ -834,7 +857,7 @@ export async function cmdGet(
     // wrong file while stating the right one.
     // Pack-aware: an asset can live in any indexed archive now, and a parent
     // chain routinely crosses from a mod into vanilla.
-    const { load, close } = packAssetLoader(
+    const { load, close, unreadable } = packAssetLoader(
       db,
       args.type,
       ...(args.pack === undefined ? [] : [{ logicalId, pack: args.pack }]),
@@ -846,6 +869,7 @@ export async function cmdGet(
       args.type,
       args.raw === true,
       args.pack,
+      unreadable,
     );
     close();
     const miss = result.value === null;
@@ -878,10 +902,10 @@ export async function cmdBench(
     // cannot disagree about whether a bench exists -- which they did, for every
     // id that recipes require and no asset declares.
     if (benchId === undefined) {
-      process.stdout.write(benchesOp(db, args.limit ?? 200).text ?? "");
+      process.stdout.write(benchesOp(db, args.limit).text ?? "");
       return 0;
     }
-    const result = benchOp(db, benchId, args.limit ?? 200);
+    const result = benchOp(db, benchId, args.limit);
     const miss = result.value.found === false;
     (miss ? process.stderr : process.stdout).write(result.text ?? "");
     return miss ? 1 : 0;
@@ -908,7 +932,7 @@ export async function cmdRefs(
   try {
     // All four branches -- asset, wrong type, value, file -- render in the
     // operation, so the served answer cannot take a different one.
-    const result = refsAnyOp(db, logicalId, args.type, args.limit ?? 40);
+    const result = refsAnyOp(db, logicalId, args.type, args.limit);
     const miss = result.value["found"] === false;
     (miss ? process.stderr : process.stdout).write(result.text ?? "");
     return miss ? 1 : 0;
@@ -965,7 +989,7 @@ export async function cmdLang(
   const db = await frozenDb(args.assets, args.patchline);
   try {
     // The operation renders; this writes. A miss goes to stderr.
-    const result = langOp(db, query, args.limit ?? 20);
+    const result = langOp(db, query, args.limit);
     const miss = result.value.length === 0;
     (miss ? process.stderr : process.stdout).write(result.text ?? "");
     return miss ? 1 : 0;
@@ -1010,7 +1034,7 @@ export async function cmdSearchSchema(
   try {
     // Renders nothing of its own: the operation carries its text and this writes
     // it. A miss goes to stderr so piped output stays machine-readable.
-    const result = searchSchemaOp(db, query, args.limit ?? 20);
+    const result = searchSchemaOp(db, query, args.limit);
     const miss = result.value.length === 0;
     (miss ? process.stderr : process.stdout).write(result.text ?? "");
     return miss ? 1 : 0;
@@ -1061,7 +1085,7 @@ export async function cmdUndocumented(args: {
         );
         return 1;
       }
-      const fields = findUndocumented(db, args.type, args.limit ?? 40);
+      const fields = findUndocumented(db, args.type, args.limit);
       if (fields.length === 0) {
         process.stdout.write(
           `'${args.type}' declares ${formatCount(declared)} fields and every one of ` +
@@ -1082,7 +1106,7 @@ export async function cmdUndocumented(args: {
     }
 
     // Everything below is the operation's own rendering.
-    process.stdout.write(undocumentedOp(db, args.type, args.limit ?? 40).text ?? "");
+    process.stdout.write(undocumentedOp(db, args.type, args.limit).text ?? "");
     return 0;
   } finally {
     db.close();

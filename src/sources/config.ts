@@ -305,10 +305,18 @@ export function loadConfig(cwd: string = process.cwd()): AtlasConfig {
   return file === null ? EMPTY : readConfig(file);
 }
 
-/** `*` is the only wildcard. Matched on the basename, case-insensitively. */
-function matches(pattern: string, name: string): boolean {
+/**
+ * `*` is the only wildcard, matched case-insensitively.
+ *
+ * Against the basename OR the full path. Basename-only was the documented rule
+ * and it failed the obvious case silently: an entry copied from what the tool
+ * itself prints -- an absolute path -- matched nothing, excluded nothing, and
+ * said nothing. A rule that ignores the form the tool displays is a trap.
+ */
+function matches(pattern: string, name: string, fullPath: string): boolean {
   const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
-  return new RegExp(`^${escaped}$`, "i").test(name);
+  const re = new RegExp(`^${escaped}$`, "i");
+  return re.test(name) || re.test(fullPath) || re.test(resolve(fullPath));
 }
 
 export interface ResolvedMod {
@@ -332,6 +340,10 @@ export function resolveMods(mods: ModSources): {
   const problems: string[] = [];
   const seen = new Set<string>();
   const packs: ResolvedMod[] = [];
+  // Which exclusions actually caught something. One that catches nothing is
+  // almost always a typo or the wrong path form, and silence about that is how a
+  // reader concludes a mod was dropped while it is still being indexed.
+  const used = new Set<string>();
 
   const add = (path: string, from: "dir" | "include"): void => {
     const key = resolve(path).toLowerCase();
@@ -350,8 +362,13 @@ export function resolveMods(mods: ModSources): {
     } else {
       for (const name of readdirSync(mods.dir).sort()) {
         if (!/\.(jar|zip)$/i.test(name)) continue;
-        if (mods.exclude.some((p) => matches(p, name))) continue;
-        add(join(mods.dir, name), "dir");
+        const full = join(mods.dir, name);
+        const hit = mods.exclude.find((p) => matches(p, name, full));
+        if (hit !== undefined) {
+          used.add(hit);
+          continue;
+        }
+        add(full, "dir");
       }
     }
   }
@@ -365,6 +382,10 @@ export function resolveMods(mods: ModSources): {
     // otherwise a broad pattern in one field silently cancels a named path in
     // the other, and the reader has no way to see why.
     add(path, "include");
+  }
+
+  for (const pattern of mods.exclude) {
+    if (!used.has(pattern)) problems.push(`mods.exclude matched nothing: ${pattern}`);
   }
 
   return { packs, problems };
