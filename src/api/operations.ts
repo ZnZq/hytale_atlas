@@ -16,7 +16,14 @@ import {
   searchSchemaDetailed,
 } from "../query/schema.ts";
 import { type SearchHit, searchAssets } from "../query/search.ts";
-import { AssetArchive, sourceStamp } from "../sources/archive.ts";
+import { AssetArchive, type AssetSource, sourceStamp } from "../sources/archive.ts";
+import { DirectorySource } from "../sources/directory.ts";
+import {
+  buildWorkingLayer,
+  refreshWorkingLayer,
+  type WorkingLayer,
+  workingValues,
+} from "./working.ts";
 import { detectInstallation, detectProject } from "../sources/detect.ts";
 import {
   type AtlasConfig,
@@ -55,6 +62,8 @@ import {
 export interface OpenOptions {
   readonly assets?: string;
   readonly patchline?: string;
+  /** Where to look for `hytale-atlas.json`. Defaults to the process's own. */
+  readonly cwd?: string;
 }
 
 /** Resolves and opens the frozen index, or explains precisely why it cannot. */
@@ -78,6 +87,9 @@ export async function openIndex(
   // assets with zero edges, and `search`, `get`, `refs` and `describe` all read
   // that happily and answer with confidence. Detecting a half-built index is
   // worth nothing if the commands that would be wrong about it never ask.
+  // The pack being authored, if the config names one. Attached HERE because this
+  // is the single gate every read path already goes through -- `frozenDb` and the
+  // MCP bootstrap both land here, so neither can miss it or attach it differently.
   const state = pipelineState(db);
   if (state !== "ready") {
     db.close();
@@ -89,7 +101,31 @@ export async function openIndex(
         `\nRun: hytale-atlas index --force\n  database: ${dbPath}`,
     );
   }
+  await attachWorking(db, options.cwd);
   return db;
+}
+
+/** The overlay currently attached to a connection, for refreshing it later. */
+const attached = new WeakMap<Database, { root: string; layer: WorkingLayer | null }>();
+
+async function attachWorking(db: Database, cwd?: string): Promise<void> {
+  const root = loadConfig(cwd).pack;
+  if (root === null) return;
+  attached.set(db, { root, layer: await buildWorkingLayer(db, root) });
+}
+
+/**
+ * Re-reads the working pack when it changed, and only then.
+ *
+ * A one-shot CLI run is fresh by construction; a server is not, so it calls this
+ * before answering. Comparing a tree stamp rather than watching files keeps both
+ * on one code path -- and a stamp cannot miss an event, which a watcher on a deep
+ * Windows tree can.
+ */
+export async function refreshWorking(db: Database): Promise<void> {
+  const entry = attached.get(db);
+  if (entry === undefined) return;
+  entry.layer = await refreshWorkingLayer(db, entry.layer, entry.root);
 }
 
 function count(db: Database, sql: string, ...params: unknown[]): number {
@@ -552,18 +588,18 @@ export function packAssetLoader(
   pin?: { readonly logicalId: string; readonly pack: string },
 ): { load: AssetLoader; close: () => void } {
   const byId = db.prepare(
-    `SELECT a.path, a.type, a.pack_id AS packId, p.path AS packPath
+    `SELECT a.path, a.type, a.pack_id AS packId, p.path AS packPath, p.kind AS packKind
        FROM assets a JOIN packs p ON p.id = a.pack_id
       WHERE a.logical_id = ?1 AND (?2 IS NULL OR a.type = ?2)
-      ORDER BY a.is_effective DESC, a.type LIMIT 1`,
+      ORDER BY a.is_effective DESC, p.priority ASC, a.type LIMIT 1`,
   );
   const byIdAndPack = db.prepare(
-    `SELECT a.path, a.type, a.pack_id AS packId, p.path AS packPath
+    `SELECT a.path, a.type, a.pack_id AS packId, p.path AS packPath, p.kind AS packKind
        FROM assets a JOIN packs p ON p.id = a.pack_id
       WHERE a.logical_id = ?1 AND (?2 IS NULL OR a.type = ?2) AND p.name = ?3
       ORDER BY a.type LIMIT 1`,
   );
-  const open = new Map<number, Promise<AssetArchive>>();
+  const open = new Map<number, Promise<AssetSource>>();
 
   const load: AssetLoader = async (logicalId, forType) => {
     const stmt = pin !== undefined && pin.logicalId === logicalId ? byIdAndPack : byId;
@@ -572,12 +608,23 @@ export function packAssetLoader(
         ? stmt.get(logicalId, forType ?? fallbackType ?? null, pin!.pack)
         : stmt.get(logicalId, forType ?? fallbackType ?? null)
     ) as
-      | { path: string; type: string | null; packId: number; packPath: string }
+      | {
+          path: string;
+          type: string | null;
+          packId: number;
+          packPath: string;
+          packKind: string;
+        }
       | undefined;
     if (row === undefined) return null;
     let pending = open.get(row.packId);
     if (pending === undefined) {
-      pending = AssetArchive.open(row.packPath);
+      // The pack being authored is a DIRECTORY, not an archive. The zip opener
+      // fails on its first byte, so the kind decides which reader runs.
+      pending =
+        row.packKind === "working"
+          ? Promise.resolve(DirectorySource.open(row.packPath))
+          : AssetArchive.open(row.packPath);
       open.set(row.packId, pending);
     }
     try {
@@ -819,12 +866,18 @@ export async function getAssetOp(
     pack = pinned === undefined ? null : { name: pinned.pack, kind: pinned.kind };
   }
   const foreign = new Set<string>();
-  if (pack !== null && pack.kind !== "vanilla") foreign.add(pack.name);
-  for (const ancestor of resolved.parentChain) {
-    const p = of(ancestor);
-    if (p !== null && p.kind !== "vanilla") foreign.add(p.name);
-  }
+  let touchesWorking = false;
+  const note = (p: AssetPack | null): void => {
+    if (p === null || p.kind === "vanilla") return;
+    // The pack being authored is not a dependency someone must install; it is a
+    // draft. Two different warnings, and mixing them makes both wrong.
+    if (p.kind === "working") touchesWorking = true;
+    else foreign.add(p.name);
+  };
+  note(pack);
+  for (const ancestor of resolved.parentChain) note(of(ancestor));
   if (foreign.size > 0) caveats.push(caveat.thirdParty([...foreign].sort()));
+  if (touchesWorking) caveats.push(caveat.workingPack());
 
   // Several packs define this identifier and the caller did not say which one it
   // wants. Answering anyway would mean picking for them, and the pick is not
@@ -1329,6 +1382,19 @@ function describeField(
         `           (${shown.length} of ${formatCount(o.cardinality)} distinct` +
         `${single ? "" : "; use --field for the rest"})\n`;
     }
+  }
+
+  // THIRD LAYER. Never folded into `seen:` above -- that line answers "what does
+  // the corpus do", and a draft in it answers a different question than the one
+  // asked. Worse, this pack is often written by the model that then reads it
+  // back, so merging would let an invention become its own evidence.
+  const mine = workingValues(db, f.assetType, f.pointer);
+  if (mine.length > 0) {
+    const shown = mine.slice(0, 8);
+    out +=
+      `    yours: ${shown.map((m) => m.value).join(", ")}` +
+      (mine.length > shown.length ? `  (${shown.length} of ${mine.length})` : "") +
+      `   [working -- unverified draft]\n`;
   }
 
   if (o) {

@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { DEFAULT_HTTP_PORT } from "../mcp/server.ts";
 import { detected, launchCommand, snippet, targets } from "./mcp-install.ts";
 import { basename, join, resolve } from "node:path";
 
@@ -1228,6 +1229,10 @@ export function cmdMcpInstall(args: McpInstallArgs): number {
   }
 
   out.push("Merge into what is already there -- these show the key, not the whole file.\n");
+  out.push(
+    "\nA client that wants a URL instead of a command: run 'hytale-atlas serve'\n" +
+      `and point it at http://127.0.0.1:${DEFAULT_HTTP_PORT}/mcp\n`,
+  );
   process.stdout.write(out.join(""));
   return 0;
 }

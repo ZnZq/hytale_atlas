@@ -5,6 +5,7 @@ import {
   assetsDeclaringField,
   countAssetsDeclaringField,
   packDefinitions,
+  refreshWorking,
   declarerSampleSize,
   assetsOfType,
   benchIdExists,
@@ -249,6 +250,11 @@ export async function callTool(
   args: Record<string, unknown>,
 ): Promise<Result<unknown>> {
   const { db } = ctx;
+  // Before answering, not on a timer. A server outlives the files it describes,
+  // so the pack being authored is re-read here whenever its tree stamp moved --
+  // which is why a one-shot CLI run and a long-lived server need no different
+  // code, and why a missed file-watch event cannot produce a stale answer.
+  await refreshWorking(db);
   // A malformed `limit` is REPORTED, not swallowed. `count` maps anything
   // invalid to undefined, which the operations then replace with their default,
   // so `limit: 0` returned a full page and `limit: "20"` returned the default --

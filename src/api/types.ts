@@ -57,6 +57,7 @@ export type CaveatCode =
   | "pointer-repaired"
   /** Part of this answer comes from a third-party pack, not from the game. */
   | "third-party"
+  | "working-pack"
   | "shadowed"
   | "shadowed-shown"
   | "contested-packs";
@@ -316,6 +317,24 @@ export const caveat = {
       `this index cannot observe. ${winner} is the expected winner (packs load ` +
       `after the base game). Ask again naming the pack you want.`,
   }),
+  /**
+   * The answer touched the pack currently being written.
+   *
+   * Deliberately not the third-party caveat, which says "requires that pack to be
+   * installed" -- true of someone else's mod, false of your own working copy, and
+   * exactly the kind of sentence that is right in one context and misleading in
+   * the next. What matters here instead is that this content is unverified: it is
+   * a draft, frequently written by the same model now reading it back.
+   */
+  workingPack: (): Caveat => ({
+    code: "working-pack",
+    message:
+      "This answer includes assets from the pack you are AUTHORING, marked " +
+      "[working]. They are drafts: nothing has validated them, and they are not " +
+      "evidence of what the game does. Treat them as what you wrote, not as " +
+      "what exists.",
+  }),
+
   thirdParty: (packs: readonly string[]): Caveat => ({
     code: "third-party",
     message:

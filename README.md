@@ -29,6 +29,31 @@ node dist/cli/main.js search pickaxe
 prints where the game was detected, which patchline is active, which capability
 tier is available, and — once built — what the index contains.
 
+### Running it as a command
+
+Inside this repository `npx hytale-atlas <command>` already works — `npx` reads
+the `bin` field of the package in the current directory. To use the name from
+anywhere:
+
+```bash
+npm link          # once, from this directory
+hytale-atlas status
+```
+
+`npm link` symlinks this directory into your global npm folder, so it is the
+working tree that runs, not a copy: `npm run build` takes effect immediately with
+no re-linking. Undo with `npm rm -g hytale-atlas`.
+
+Outside a linked environment `npx hytale-atlas` falls through to the public npm
+registry and fails — this package is not published. Worth knowing rather than
+guessing at: if that name is ever claimed by someone else, an unlinked `npx`
+would download and run *their* package. Prefer `npm link`, or call
+`node dist/cli/main.js` by path.
+
+Note that `hytale-atlas.json` is found by walking up from the working directory,
+so running the command from outside a configured project falls back to the
+game's own install.
+
 ---
 
 ## The mental model
@@ -128,7 +153,8 @@ Entirely optional. With no config file the tool reads the game's own install.
     "include": ["…/some-pack.zip"],
     "exclude": ["…/broken-pack.zip"]
   },
-  "consent": { "runModPlugins": false }
+  "consent": { "runModPlugins": false },
+  "port": 43790
 }
 ```
 
@@ -275,6 +301,32 @@ args = ["<ATLAS>", "--mcp"]
 ```
 
 Continue, Goose and Hermes use YAML; see their own docs for the exact key.
+
+### As an HTTP server
+
+Some clients take a URL rather than a command. For those:
+
+```bash
+hytale-atlas serve                # http://127.0.0.1:43790/mcp
+hytale-atlas serve --port 45001
+```
+
+The port comes from `--port`, then `"port"` in `hytale-atlas.json`, then the
+built-in **43790**. That default is derived from the package name rather than
+picked: round numbers like 8080 collide precisely because everyone reaches for
+them. The 40000–47999 band also sits below the range Windows hands out for
+outgoing connections (49152+), so a listener there will not fight the OS.
+
+**It binds loopback, and that is the entire security model.** A stdio server is
+reachable only by the process that spawned it; the moment this listens on a
+socket, anything that can reach the socket can ask it questions. There is no
+authentication because there is nothing to authenticate against — so the answer
+is not to be reachable. DNS-rebinding protection is on, which is what stops a web
+page from resolving a hostname it controls to `127.0.0.1` and talking to your
+index; a request arriving with an unexpected `Host` gets a 403.
+
+Each request gets its own protocol session — the database and the archive are
+shared, the plumbing is not.
 
 ### What it serves
 
