@@ -31,24 +31,29 @@ tier is available, and — once built — what the index contains.
 
 ### Running it as a command
 
+The `bin` field declares two command names for the same entry point: the full
+`hytale-atlas` and the short `hytlas`.
+
 Inside this repository `npx hytale-atlas <command>` already works — `npx` reads
-the `bin` field of the package in the current directory. To use the name from
-anywhere:
+the `bin` of the package in the current directory. Once the package is published
+to npm the same call works from anywhere:
 
 ```bash
-npm link          # once, from this directory
-hytale-atlas status
+npx hytale-atlas status
 ```
 
-`npm link` symlinks this directory into your global npm folder, so it is the
-working tree that runs, not a copy: `npm run build` takes effect immediately with
-no re-linking. Undo with `npm rm -g hytale-atlas`.
+`npx` resolves the argument as a *package* name, and the package is named
+`hytale-atlas`, so `npx hytlas` does not resolve — `hytlas` is a command alias,
+not a package. To get the short command from any directory, install once:
 
-Outside a linked environment `npx hytale-atlas` falls through to the public npm
-registry and fails — this package is not published. Worth knowing rather than
-guessing at: if that name is ever claimed by someone else, an unlinked `npx`
-would download and run *their* package. Prefer `npm link`, or call
-`node dist/cli/main.js` by path.
+```bash
+npm install -g hytale-atlas   # after it is published
+hytlas status                 # or: hytale-atlas status
+```
+
+During development, prefer `npm link` from this directory: it symlinks the
+working tree into your global npm folder, so `npm run build` takes effect
+immediately with no re-linking. Undo with `npm rm -g hytale-atlas`.
 
 Note that `hytale-atlas.json` is found by walking up from the working directory,
 so running the command from outside a configured project falls back to the
