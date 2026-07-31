@@ -39,6 +39,24 @@ const CONTAINER_SUBSTRINGS = ["object", "array"] as const;
 const CONTAINER_EXACT = ["anyOf", "oneOf"] as const;
 const CONTAINER_PREFIX = "$ref";
 
+/**
+ * `anyOf`/`oneOf` COUNTS as a container, and the exception that looks obvious is
+ * wrong.
+ *
+ * A union naming a reference target permits two shapes: an inline object, or a
+ * plain identifier string pointing at one. So the field is a container OR a
+ * scalar depending on what an asset wrote there -- `BlockType
+ * /Interactions/Use` shows twelve observed ids while its sibling
+ * `/Interactions/Pickup`, identical declared shape, shows none because assets
+ * write it inline.
+ *
+ * Excluding referenced unions from this test was tried and reverted: it changes
+ * which fields "CAN be observed", and with it the undocumented set and the
+ * declared-field counts -- three tests caught the drift immediately. The defect
+ * that prompted the attempt was the WORDING, not the classification: the legend
+ * used to say such a field CANNOT appear in the observed layer, which its own
+ * sibling disproves. The legend says it properly now.
+ */
 export function isContainer(declaredType: string | null): boolean {
   if (declaredType === null) return false;
   return (
@@ -324,10 +342,6 @@ export interface SchemaSearchResult {
   readonly relaxation: number;
   /** True when terms were ORed rather than ANDed to find anything at all. */
   readonly widened: boolean;
-}
-
-export function searchSchema(db: Database, query: string, limit = 20): readonly SchemaHit[] {
-  return searchSchemaDetailed(db, query, limit).hits;
 }
 
 export function searchSchemaDetailed(

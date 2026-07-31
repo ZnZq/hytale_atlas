@@ -51,6 +51,8 @@ export type CaveatCode =
   | "identifier-only"
   /** The pointer misses here because the schema tree continues in another type. */
   | "crosses-into"
+  /** An argument was accepted, understood, and does not apply to this answer. */
+  | "argument-ignored"
   /** Recipes require this bench id, but no asset provides a station carrying it. */
   | "bench-undeclared"
   /** The caller's pointer was rewritten before it arrived; this is what was read. */
@@ -179,6 +181,39 @@ export const caveat = {
       (widened ? "Showing fields matching any term" : "Showing loosened matches") +
       (level > 0 ? ` (word endings trimmed ${level}x)` : "") +
       " -- these may be unrelated.",
+  }),
+  /**
+   * SOME rows were loosened, and some matched as typed.
+   *
+   * `relaxed` above says "Nothing matched as written", which is a statement
+   * about the whole query -- true for `search_schema`, where loosening is one
+   * decision, and false for `search`, where the quota is filled row by row.
+   * `search pickaxe --type Item --limit 40` printed it above eleven exact
+   * matches, contradicting the legend two lines further down that explains `~N`
+   * marks the weaker ones. The same query at --limit 10 printed no note at all,
+   * because the exact matches alone filled it.
+   */
+  relaxedSome: (query: string, exact: number, loosened: number, level: number): Caveat => ({
+    code: "relaxed",
+    message:
+      `${exact} row(s) matched "${query}" as written; ${loosened} more were reached ` +
+      `only after loosening it (word endings trimmed ${level}x) and are marked ~N. ` +
+      `Those may be unrelated.`,
+  }),
+  /**
+   * An argument that was accepted, understood, and does not apply here.
+   *
+   * `--help` says `--type` works on `refs`, and on an asset id it does. When the
+   * argument is not an asset, `refs` falls back to a value-occurrence search --
+   * and a VALUE has no type, so the flag was silently dropped: `refs 0.25`,
+   * `refs 0.25 --type Item` and `refs 0.25 --type EntityEffect` returned
+   * byte-identical output. Silently ignoring a filter is the failure mode this
+   * project has now hit three times (`--type` on get, `limit` over MCP, and
+   * here); the fix each time is to say so rather than to guess.
+   */
+  argumentIgnored: (name: string, why: string): Caveat => ({
+    code: "argument-ignored",
+    message: `'${name}' was ignored: ${why}`,
   }),
   lexicalOnly: (): Caveat => ({
     code: "lexical-only",
@@ -309,6 +344,30 @@ export const caveat = {
           `is unknown.`),
   }),
 
+  /**
+   * The caller pinned the pack that WINS.
+   *
+   * Its own sentence, because the two pinned cases are opposites and both used
+   * to get the loser's wording: asking for the pack a running game actually
+   * loads was answered "which the game does NOT load -- Endgame&QoL defines the
+   * same identifier and wins", naming one pack on both sides of a contradiction.
+   * Reusing the unpinned collision caveat instead is no better -- that one says
+   * "No document was returned", above a document.
+   */
+  shadowedWinnerShown: (
+    logicalId: string,
+    shown: string,
+    losers: readonly string[],
+  ): Caveat => ({
+    code: "shadowed-shown",
+    message:
+      `You are looking at ${shown}'s '${logicalId}', and it IS the definition a ` +
+      `running game loads: ${losers.join(", ")} ` +
+      (losers.length === 1 ? "also defines this identifier and loses" : "also define this identifier and lose") +
+      ` to it. Anything built on this works only for players who have ` +
+      `${shown} installed.`,
+  }),
+
   /** The caller asked for a definition the game does not load. */
   shadowedShown: (logicalId: string, shown: string, winner: string): Caveat => ({
     code: "shadowed-shown",
@@ -383,8 +442,11 @@ export const caveat = {
     code: "crosses-into",
     message:
       `'${pointer}' is a reference, so the tree continues in '${into}' -- the rest of ` +
-      `your pointer is declared there, not here. Describe '${into}' with field ` +
-      `'${continueAt}'.`,
+      `your pointer is declared there, not here. ` +
+      // No field when the remainder cannot be placed there. Naming one anyway is
+      // how this sentence used to hand back `field '/'`, which declares nothing:
+      // the route out was a second dead end.
+      (continueAt === "" ? `Describe '${into}'.` : `Describe '${into}' with field '${continueAt}'.`),
   }),
   // Each side qualifies absence from the OTHER one, and the two were crossed:
   // `status` quoted 2 457 of 2 875 observed fields -- 85% -- under a sentence

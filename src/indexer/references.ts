@@ -1,6 +1,30 @@
 import type { Database } from "../db/open.ts";
-import { referenceKeySql } from "../sources/lang.ts";
 import { escapeSegment } from "../util/json.ts";
+
+/** One candidate, with the raw document position it was collected from. */
+export interface CandidateRow {
+  asset_id: number;
+  json_pointer: string;
+  raw_value: string;
+}
+
+/**
+ * Candidates of one resolved schema field.
+ *
+ * Lives here because this pass owns what a candidate IS. The bench pass and the
+ * value-link pass read the same table through the same predicate and each kept a
+ * byte-identical copy of this, so a column either of them came to need -- or any
+ * change to the `schema_scope` form -- would have been applied to one and not the
+ * other, and the two passes would have disagreed about the same rows.
+ */
+export function candidateRows(db: Database, scope: string, pointer: string): CandidateRow[] {
+  return db
+    .prepare(
+      `SELECT asset_id, json_pointer, raw_value FROM candidates
+        WHERE schema_scope = ? AND schema_pointer = ?`,
+    )
+    .all(scope, pointer) as unknown as CandidateRow[];
+}
 
 /**
  * Pass 2 — candidate extraction and reference resolution.
@@ -171,30 +195,18 @@ export function collectCandidates(node: unknown, pointer = "", out: Candidate[] 
  * from the pointer and the value instead. Tiers are therefore honest guesses,
  * which is exactly why low-confidence edges are kept and filtered at query time
  * rather than discarded at index time.
+ *
+ * THE RULE LIVES IN SQL, in `resolveCandidates` below, and only there. A second
+ * implementation of it stood here -- `classifyConfidence`, with its own
+ * STRONG_NAMES list -- called by nothing, its last branch a tautology returning
+ * `low` either way, and disagreeing with the SQL that actually runs: it graded
+ * `/Parent` as `high` by name while the query grades by edge KIND, and it knew
+ * nothing of the GLOB rule that stops `/Solid` and `/Fluid` being promoted. A
+ * maintainer extending the tiers would have read the prose-shaped copy, changed
+ * it, seen the tests pass because nothing calls it, and shipped no behaviour
+ * change at all. It is removed rather than revived: the SQL is authoritative and
+ * the `confidence` column the docs describe is written by it.
  */
-export type Confidence = "high" | "medium" | "low";
-
-/** Field names whose value is a reference by convention, measured on the corpus. */
-const STRONG_SUFFIXES = ["Id", "Ids", "Ref", "Refs", "TypeId", "SetId", "ListId"];
-const STRONG_NAMES = new Set([
-  "Parent", "ItemId", "BlockType", "BlockTypes", "BlockSets", "Set", "Model",
-  "ResourceTypeId", "PlayerAnimationsId", "ItemSoundSetId", "SoundEventId",
-]);
-
-export function classifyConfidence(pointer: string, value: string): Confidence {
-  const name = pointer.slice(pointer.lastIndexOf("/") + 1);
-
-  // `Parent` is inheritance, which the engine resolves itself; there is no guessing.
-  if (name === "Parent") return "high";
-  if (STRONG_NAMES.has(name)) return "medium";
-  if (STRONG_SUFFIXES.some((s) => name.endsWith(s) && name.length > s.length)) return "medium";
-
-  // A bare short word that happens to collide with an identifier. Kept, because
-  // the "did you mean" case needs it, but never presented as a fact.
-  if (value.length <= 6 || !value.includes("_")) return "low";
-  return "low";
-}
-
 export interface ResolveResult {
   readonly candidates: number;
   readonly references: number;
@@ -219,6 +231,18 @@ export interface ResolveResult {
  * Deliberately does not delete unmatched candidates. They are the dangling
  * references `validate_pack` reports, and the hook that lets a later-added asset
  * light up the edges pointing at it.
+ *
+ * **Edges terminate on the definition the engine loads**, hence `a.is_effective
+ * = 1` on every destination join. A pack override is whole-asset replacement and
+ * the losers are inert, but drawing an edge to every copy made one `/Parent`
+ * report two parents -- an inheritance graph that is not a tree, at `high` --
+ * and split an asset's inbound set across the winning row and the shadowed one.
+ * 137 (logical_id, type) groups are defined by more than one pack in a real mods
+ * folder, so this is the common case, not the exotic one. Runs after
+ * `markEffective`, which `cmdIndex` already sequences.
+ *
+ * `REFERENCES_FILE` is the exception: `files` carries no `is_effective`, so a
+ * file reference cannot yet be narrowed the same way.
  */
 export function resolveCandidates(db: Database): ResolveResult {
   db.exec("BEGIN");
@@ -251,6 +275,7 @@ export function resolveCandidates(db: Database): ResolveResult {
         FROM candidates c
         JOIN assets src ON src.id = c.asset_id
         JOIN assets a ON a.logical_id = c.raw_value AND a.type = src.type
+                     AND a.is_effective = 1
        WHERE c.value_kind = 'string' AND ${NOT_NOISE}
          AND c.json_pointer = '/Parent' AND a.id <> c.asset_id
     `);
@@ -261,12 +286,26 @@ export function resolveCandidates(db: Database): ResolveResult {
     // `role` (name/description/...) is the pointer's last segment. Deriving it in
     // SQLite means string surgery with no substring-search function; the query
     // layer splits the pointer instead, which is one line there and none here.
+    //
+    // MATCHED BY THE KEY'S OWN ROOT, not by a list of known ones. A reference is
+    // `<root>.<key>` and `lang_keys` stores both halves, so the general rule is
+    // one join condition. The old form stripped only `server.` and `common.` --
+    // and this corpus holds 36 distinct roots. References under the other 34
+    // (`items.`, `emotes.`, `npcs.`, `wordlists.`, and every pack's own) matched
+    // nothing and produced no edge, so `search-lang` answered "used by nothing
+    // indexed (UI text, or referenced dynamically)" about keys that are declared
+    // statically in an asset's TranslationProperties. A blind trial found it on a
+    // pack key and reproduced it on a second pack.
+    //
+    // Still an indexed seek: `l.key` is the leading column of idx_lang_key, and
+    // both sides of the AND are computed from the candidate row.
     db.exec(`
       INSERT INTO edges (src, dst, dst_kind, kind, json_pointer, confidence)
       SELECT c.asset_id, l.id, 'lang_key', 'LOCALIZED_BY', c.json_pointer, 'high'
         FROM candidates c
         JOIN lang_keys l
-          ON l.key = ${referenceKeySql("c.raw_value")}
+          ON l.key = substr(c.raw_value, instr(c.raw_value, '.') + 1)
+         AND l.root = substr(c.raw_value, 1, instr(c.raw_value, '.') - 1)
        WHERE c.value_kind = 'string' AND ${NOT_NOISE}
          AND c.raw_value LIKE '%.%.%' AND l.locale = 'en-US'
     `);
@@ -305,6 +344,7 @@ export function resolveCandidates(db: Database): ResolveResult {
         JOIN assets a
                ON a.logical_id = c.raw_value
               AND a.type = sf.reference_target
+              AND a.is_effective = 1
        WHERE c.value_kind = 'string' AND ${NOT_NOISE}
          AND c.json_pointer <> '/Parent' AND a.id <> c.asset_id
     `);
@@ -332,7 +372,7 @@ export function resolveCandidates(db: Database): ResolveResult {
              END
         FROM candidates c
         JOIN assets src ON src.id = c.asset_id
-        JOIN assets a ON a.logical_id = c.raw_value
+        JOIN assets a ON a.logical_id = c.raw_value AND a.is_effective = 1
        WHERE c.value_kind = 'string' AND ${NOT_NOISE}
          AND c.json_pointer <> '/Parent'
          AND a.id <> c.asset_id

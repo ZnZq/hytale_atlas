@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-import { existsSync } from "node:fs";
-
 import { DEFAULT_HTTP_PORT, serveHttp, serveMcp } from "../mcp/server.ts";
 import { looksMangled, normalizeFieldPointer } from "../query/schema.ts";
 import { loadConfig } from "../sources/config.ts";
@@ -100,7 +98,9 @@ Options
   --patchline <name>           Select a non-active patchline
   --force                      Rebuild even if a cached index exists
   --yes                        Accept the telemetry disclosure without prompting
-  --dry-run                    Print the command that would run, and exit
+  --dry-run                    generate-schema, init only: print what would run
+                               or be written, and exit. Other commands accept the
+                               flag and ignore it.
   --keep <path>                Keep generated schema files instead of discarding
   --schema <path>              Use an already-generated schema directory
   --field <pointer>            Single field for describe, e.g. --field /Quality.

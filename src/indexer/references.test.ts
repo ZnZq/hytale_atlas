@@ -201,21 +201,48 @@ test("two assets of the same known type still inherit", () => {
   db.close();
 });
 
-test("a localization reference carrying its server. root is not dangling either", () => {
+/**
+ * A reference is `<root>.<key>`, for EVERY root -- not just server. and common.
+ *
+ * The fixture here used to set root='items' on a key stored as 'items.apple.name'
+ * and then reference it as 'server.items.apple.name'. That combination cannot
+ * occur: `root` is the .lang file's stem, so a key inside server.lang has
+ * root='server', and one inside items.lang has root='items' with the stem NOT
+ * repeated in the key. It passed only because the rule it pinned ignored `root`
+ * entirely and stripped a hardcoded pair of prefixes -- which is exactly the
+ * defect a blind trial later found: this corpus holds 36 roots, and references
+ * under the other 34 produced no edge at all, so `search-lang` reported keys
+ * declared in an asset's TranslationProperties as "used by nothing indexed".
+ *
+ * Both shapes are pinned now, from the two roots that actually dominate the
+ * corpus: server (54,516 keys) and items (5,522).
+ */
+test("a localization reference resolves through its key's own root", () => {
   const db = openDatabase(":memory:");
   db.prepare("INSERT INTO packs (id, name, path, kind) VALUES (1,'Hytale','Assets.zip','vanilla')").run();
   db.prepare(
     "INSERT INTO assets (id, pack_id, logical_id, path) VALUES (1,1,'Item_Apple','Server/Item/Items/Item_Apple.json')",
   ).run();
   db.prepare(
-    "INSERT INTO lang_keys (pack_id, key, locale, value, root) VALUES (1,'items.apple.name','en-US','Apple','items')",
+    "INSERT INTO assets (id, pack_id, logical_id, path) VALUES (2,1,'Modded_Hat','Server/Item/Items/Modded_Hat.json')",
+  ).run();
+  // Vanilla: server.lang, so the stem is the root and the key keeps its own path.
+  db.prepare(
+    "INSERT INTO lang_keys (pack_id, key, locale, value, root) VALUES (1,'items.apple.name','en-US','Apple','server')",
+  ).run();
+  // A pack: items.lang, so the root IS 'items' and the key does not repeat it.
+  db.prepare(
+    "INSERT INTO lang_keys (pack_id, key, locale, value, root) VALUES (1,'Modded_Hat.name','en-US','Hat','items')",
   ).run();
   db.prepare(
     "INSERT INTO candidates (asset_id, json_pointer, schema_pointer, raw_value, value_kind) VALUES (1,'/Name','/Name','server.items.apple.name','string')",
   ).run();
+  db.prepare(
+    "INSERT INTO candidates (asset_id, json_pointer, schema_pointer, raw_value, value_kind) VALUES (2,'/Name','/Name','items.Modded_Hat.name','string')",
+  ).run();
 
   const result = resolveCandidates(db);
-  assert.equal(result.localizedBy, 1);
+  assert.equal(result.localizedBy, 2, "one of the two roots produced no edge");
   assert.equal(result.dangling, 0);
   db.close();
 });

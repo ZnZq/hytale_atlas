@@ -1,0 +1,22 @@
+/*
+ * Type-checks the tests, which the root config deliberately excludes.
+ *
+ * The exclusion is right for EMIT -- dist/ must not carry test files -- but it
+ * also took roughly 40% of the TypeScript in this repository outside the type
+ * checker, including every assertion about the source's contract. The strictness
+ * the source is held to (strict, noUncheckedIndexedAccess,
+ * exactOptionalPropertyTypes) did not apply to the files that pin what it
+ * promises, so a signature change could break them at the type level with
+ * nothing reporting it: `tsc --noEmit` passed because the files were excluded,
+ * and `node --experimental-strip-types` erases types rather than checking them.
+ *
+ * Same options, no emit, no exclusion.
+ */
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": []
+}

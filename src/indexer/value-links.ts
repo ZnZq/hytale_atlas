@@ -1,5 +1,6 @@
 import type { Database } from "../db/open.ts";
 import { scopes } from "../sources/schema-doc.ts";
+import { candidateRows } from "./references.ts";
 
 /**
  * Value links -- the one kind of domain knowledge the index has to carry.
@@ -95,12 +96,6 @@ export interface LinkResult {
   readonly unresolvedValues: readonly string[];
 }
 
-interface Row {
-  asset_id: number;
-  json_pointer: string;
-  raw_value: string;
-}
-
 /**
  * Expands a site into concrete (scope, pointer) pairs.
  *
@@ -116,15 +111,6 @@ function resolveSite(db: Database, site: Site): { scope: string; pointer: string
     scope,
     pointer: site.pointer,
   }));
-}
-
-function rowsAt(db: Database, scope: string, pointer: string): Row[] {
-  return db
-    .prepare(
-      `SELECT asset_id, json_pointer, raw_value FROM candidates
-        WHERE schema_scope = ? AND schema_pointer = ?`,
-    )
-    .all(scope, pointer) as unknown as Row[];
 }
 
 export function indexValueLinks(db: Database): LinkResult[] {
@@ -144,7 +130,7 @@ export function indexValueLinks(db: Database): LinkResult[] {
       let declarations = 0;
 
       for (const site of link.declaredAt.flatMap((s) => resolveSite(db, s))) {
-        for (const row of rowsAt(db, site.scope, site.pointer)) {
+        for (const row of candidateRows(db, site.scope, site.pointer)) {
           insert.run(link.name, row.raw_value, row.asset_id, row.json_pointer, "declares", 1);
           declared.add(row.raw_value);
           declarations++;
@@ -156,7 +142,7 @@ export function indexValueLinks(db: Database): LinkResult[] {
       const unresolved = new Set<string>();
 
       for (const site of link.referencedAt.flatMap((s) => resolveSite(db, s))) {
-        for (const row of rowsAt(db, site.scope, site.pointer)) {
+        for (const row of candidateRows(db, site.scope, site.pointer)) {
           const known = declared.has(row.raw_value);
           insert.run(
             link.name,

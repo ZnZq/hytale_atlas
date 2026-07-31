@@ -45,11 +45,6 @@ export interface Project {
   readonly manifestPath: string | null;
 }
 
-/** Directories that are build output or churn, never project content. */
-export const EXCLUDED_DIRS: ReadonlySet<string> = new Set([
-  "run", "data", "build", "dist", "out", ".gradle", "node_modules", ".git", "local",
-]);
-
 /**
  * Candidate install roots, most authoritative first.
  *

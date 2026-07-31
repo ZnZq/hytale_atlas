@@ -1,7 +1,10 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { createServer } from "node:http";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import {
+  StreamableHTTPServerTransport,
+  type StreamableHTTPServerTransportOptions,
+} from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -292,11 +295,25 @@ export async function serveHttp(
   const http = createServer((req, res) => {
     void (async () => {
       const perRequest = buildServer(context);
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: undefined,
+      // CHECKED against the SDK's own option type. The blanket `as unknown as`
+      // that used to wrap this object silenced the one check that matters: the
+      // SDK defaults DNS-rebinding protection to OFF, so a renamed or dropped
+      // option in a later 1.x would turn a documented security property off with
+      // no compile error and no runtime signal.
+      const security = {
         enableDnsRebindingProtection: true,
         allowedHosts: [`${host}:${port}`, `localhost:${port}`, `127.0.0.1:${port}`],
-      } as unknown as ConstructorParameters<typeof StreamableHTTPServerTransport>[0]);
+      } satisfies Partial<StreamableHTTPServerTransportOptions>;
+      // One cast remains, and only over `sessionIdGenerator`. Stateless mode is
+      // an EXPLICIT undefined by the SDK's own documentation, but the property is
+      // declared optional rather than `?: (() => string) | undefined`, which
+      // `exactOptionalPropertyTypes` forbids writing. That conflict is what the
+      // original cast was really for; widening it over the whole object is what
+      // cost us the check above.
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+        ...security,
+      } as unknown as StreamableHTTPServerTransportOptions);
       res.on("close", () => {
         void transport.close();
         void perRequest.close();

@@ -1,6 +1,4 @@
 import type { SourceStamp } from "../util/paths.ts";
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import type { Entry, ZipFile } from "yauzl";
 import yauzl from "yauzl";
@@ -41,6 +39,14 @@ export interface ArchiveEntry {
    * decompression required — though too weak to use as a content identity.
    */
   readonly crc32: number;
+  /**
+   * Where this entry's LOCAL header starts, so a later read can seek to it
+   * instead of re-reading the central directory. Absent for sources that are not
+   * zips -- a directory has no such thing.
+   */
+  readonly localHeaderOffset?: number;
+  /** Zip compression method: 0 stored, 8 deflate. Absent for non-zip sources. */
+  readonly compression?: number;
 }
 
 /**
@@ -109,6 +115,11 @@ export class AssetArchive implements AssetSource {
             uncompressedSize: entry.uncompressedSize,
             compressedSize: entry.compressedSize,
             crc32: entry.crc32,
+            // Carried out of the walk so the indexer can record it. Reading one
+            // entry later then costs a seek rather than a second enumeration of
+            // all 60,148 -- see sources/zip-entry.ts.
+            localHeaderOffset: entry.relativeOffsetOfLocalHeader,
+            compression: entry.compressionMethod,
           });
           byPath.set(entry.fileName, entry);
         }
@@ -175,23 +186,6 @@ export class AssetArchive implements AssetSource {
     this.#closed = true;
     this.#zip.close();
   }
-}
-
-/**
- * SHA-256 of the archive itself, used as the frozen-layer cache key.
- *
- * Keyed by content, never by version string: several patchlines commonly coexist
- * on one machine (`docs/init/OPEN-QUESTIONS.md` Q6), and a version string cannot
- * distinguish them reliably.
- *
- * This reads the whole file. Callers should cache the result against
- * (path, size, mtime) rather than recomputing it per run.
- */
-export async function hashArchive(path: string): Promise<string> {
-  const hash = createHash("sha256");
-  const stream = createReadStream(path);
-  for await (const chunk of stream) hash.update(chunk as Buffer);
-  return hash.digest("hex");
 }
 
 /** Cheap identity for deciding whether a cached hash is still valid. */

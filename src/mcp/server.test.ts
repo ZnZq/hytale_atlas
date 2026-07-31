@@ -328,8 +328,20 @@ test("the CLI and the MCP server emit the same bytes", opts, async () => {
     return;
   }
   const status = await ops.statusOp({});
-  let archive: { close(): void } | null = null;
-  const ctx = {
+  // Typed as ToolContext, not shaped like it. This literal declared `archive` as
+  // `{ close(): void }`, so `openArchive` returned something that was not an
+  // AssetArchive and the object did not satisfy the parameter it was passed to --
+  // invisible while test files sat outside the type checker, and precisely the
+  // drift that made checking them worth doing.
+  // Types derived from the dist modules these tests actually drive, so there is
+  // no second declaration here to drift from the real one.
+  // Off `open`'s return type rather than `InstanceType`: the constructor is
+  // private, which is the whole reason `open` exists. Initialised through an
+  // annotation for the same reason `server.ts` does it -- TypeScript narrows the
+  // closure's assignment away and then calls the cleanup unreachable on `never`.
+  type Archive = Awaited<ReturnType<typeof AssetArchive.open>>;
+  let archive: Archive | null = null as Archive | null;
+  const ctx: Parameters<typeof callTool>[0] = {
     db,
     options: {},
     openArchive: async () => {
@@ -364,6 +376,13 @@ test("the CLI and the MCP server emit the same bytes", opts, async () => {
       "undocumented",
       { type: "common:SelectInteraction" },
     ],
+    // The two branches `undocumented` used to render in the CLI alone. The only
+    // fixture above is a type on the pass-through path, so the diverging cases
+    // had no coverage at all and the defect shipped green: MCP answered "None
+    // across the whole schema" -- a confirmed negative about the game -- for a
+    // type that does not exist, and for one that exists but declares nothing.
+    [["undocumented", "FarmingBlock"], "undocumented", { type: "FarmingBlock" }],
+    [["undocumented", "NPCRole"], "undocumented", { type: "NPCRole" }],
     [["get", "Tool_Pickaxe_Iron", "--type", "Item"], "get", { id: "Tool_Pickaxe_Iron", type: "Item" }],
   ];
 
@@ -373,7 +392,27 @@ test("the CLI and the MCP server emit the same bytes", opts, async () => {
       // A miss is written to stderr so piped output stays machine-readable; the
       // STREAM is the CLI's decision, the bytes are the operation's.
       const printed = (proc.stdout || "") + (proc.status === 1 ? proc.stderr : "");
-      const served = (await callTool(ctx, tool, args)).text ?? "";
+      const result = await callTool(ctx, tool, args);
+      const served = result.text ?? "";
+
+      // THE OTHER DIRECTION. The subset check below can only catch MCP saying
+      // something the CLI did not; it is blind to the CLI saying something MCP
+      // did not, which is the shape `undocumented` failed in -- and a served
+      // answer that is merely SHORTER reads as agreement. A full reverse subset
+      // cannot hold, because MCP drops tabular rows on purpose. What must hold
+      // is that the two agree on whether there IS an answer: a front end that
+      // affirms what the other denies is the failure worth a test.
+      const value: unknown = result.value;
+      const servedMiss =
+        value === null ||
+        (Array.isArray(value) && value.length === 0) ||
+        (typeof value === "object" && (value as { found?: unknown }).found === false);
+      assert.equal(
+        servedMiss,
+        proc.status === 1,
+        `${argv.join(" ")}: the CLI ${proc.status === 1 ? "denied" : "answered"} this and ` +
+          `MCP ${servedMiss ? "denied" : "answered"} it`,
+      );
       // The contract changed shape, not strength. MCP now drops tabular rows --
       // `value` already carries every one of them as named fields, so serving
       // both makes a model read the same data twice, once in a worse form. What

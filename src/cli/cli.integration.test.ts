@@ -416,7 +416,14 @@ test("a container with no observations explains why that means nothing", opts, (
   // together looked like a contradiction.
   const { out } = run("describe", "common:SelectInteraction", "--field", "HitBlock");
   assert.match(out, /\(container\)/);
-  assert.match(out, /Absence here says nothing/);
+  assert.match(out, /Absence says nothing/);
+  // The sibling is the whole point, and for a long time only this comment said
+  // so: the output asserted "this is a container, and only scalar leaves are
+  // counted", which reads as a fact about the TYPE -- while every key of
+  // BlockType /Interactions shares this declared shape and /Use lists twelve
+  // observed ids. A blind trial reported it twice before the sentence named the
+  // mechanism (written inline, not as an id) instead of the category.
+  assert.match(out, /sibling of\s+the same declared shape may still show values/);
 });
 
 test("a union keyed on something other than Type resolves", opts, () => {
@@ -653,8 +660,14 @@ test("describe states that its counts predate inheritance", opts, () => {
   // shows the value on many more, because it resolves the parent chain. Both are
   // right, and nothing said they answered different questions.
   const { out } = run("describe", "common:FarmingData", "--field", "StartingStageSet");
-  assert.match(out, /counts files that declare the field themselves/);
   assert.match(out, /'get' resolves inheritance first/);
+  // The footnote used to say this number "counts files that declare the field
+  // themselves" -- which is the `declared by:` sample's number, not this one.
+  // They are 24 and 23 on common:BenchTierLevel /CraftingTimeReductionModifier,
+  // and the pair read as an off-by-one in a list that was complete. Each is
+  // named for what it measures now, so pin that rather than the old sentence.
+  assert.match(out, /'used in N assets' counts files with an observed VALUE/);
+  assert.match(out, /not expected to match/);
 });
 
 test("search-lang finds a key written the way an asset references it", opts, () => {
@@ -840,7 +853,9 @@ test("an unmarked property is still inherited, and it is visible where it matter
   assert.match(parent, /"Recipe"/, "fixture no longer declares a recipe");
   assert.match(child, /"Recipe"/, "an unmarked property stopped being inherited");
   assert.match(
-    JSON.parse(child).Recipe.Input.map((i) => i.ItemId).join(" "),
+    (JSON.parse(child) as { Recipe: { Input: { ItemId: string }[] } }).Recipe.Input.map(
+      (i) => i.ItemId,
+    ).join(" "),
     /Ingredient_Bar_Iron/,
     "the inherited recipe is not the parent's",
   );
@@ -1914,7 +1929,7 @@ test("the api layer and the CLI agree on describe's totals", async () => {
   }
   try {
     for (const type of ["Item", "BlockType", "EntityEffect"]) {
-      const fromOp = ops.describeOp(db, { assetType: type, limit: 5 }).value.total;
+      const fromOp: number = ops.describeOp(db, { assetType: type!, limit: 5 }).value.total;
       const printed = /showing \d+ of ([\d,]+) fields/.exec(
         run("describe", type, "--limit", "5").out,
       );
@@ -2396,11 +2411,13 @@ test("an undeclared observed field still reports the type it holds", async () =>
     const undeclared = fields.filter((f) => f.declared === null && f.observed !== null);
     if (undeclared.length === 0) return;
     for (const f of undeclared) {
+      const observed = f.observed;
+      assert.ok(observed !== null, `${f.pointer} lost its observations`);
       assert.ok(
-        f.observed.valueTypes !== null && f.observed.valueTypes.length > 0,
+        observed.valueTypes !== null && observed.valueTypes.length > 0,
         `${f.pointer} carries observations but no value types`,
       );
-      for (const t of f.observed.valueTypes) {
+      for (const t of observed.valueTypes) {
         assert.ok(["string", "number", "boolean"].includes(t), `odd value type ${t}`);
       }
     }
@@ -2432,7 +2449,8 @@ test("undocumented excludes $ref rows, and the indexer counts the same set", asy
       .prepare(
         `SELECT count(*) AS n FROM schema_fields sf WHERE ${schema.DECLARED_UNOBSERVED_SQL}`,
       )
-      .get();
+      .get() as { n: number } | undefined;
+    assert.ok(viaIndexerPredicate !== undefined, "the indexer predicate returned no row");
     assert.equal(Number(viaIndexerPredicate.n), all.length);
   } finally {
     db.close();
@@ -2486,8 +2504,8 @@ test("a file reference count says assets and occurrences separately", opts, () =
   const { out } = run("refs", "Frown.blockyanim", "--limit", "500");
   const m = /([\d,]+) asset\(s\) reference this file, ([\d,]+) time\(s\)/.exec(out);
   assert.ok(m !== null, "no split count in: " + out.slice(0, 200));
-  const assets = Number(m[1].replace(/,/g, ""));
-  const times = Number(m[2].replace(/,/g, ""));
+  const assets = Number(m[1]!.replace(/,/g, ""));
+  const times = Number(m[2]!.replace(/,/g, ""));
   assert.ok(times > assets, "this file is meant to have more pointers than assets");
 
   // The printed rows are the pointers, so they match the larger number.
