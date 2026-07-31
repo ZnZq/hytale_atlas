@@ -1,14 +1,23 @@
 {
   "name": "hytale-atlas",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Unofficial local indexer for Hytale asset packs, exposed to AI agents over MCP. Not affiliated with or endorsed by Hypixel Studios.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZnZq/hytale_atlas.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ZnZq/hytale_atlas/issues"
+  },
+  "homepage": "https://github.com/ZnZq/hytale_atlas#readme",
   "engines": {
     "node": ">=22.5.0"
   },
   "bin": {
-    "hytale-atlas": "./dist/cli/main.js"
+    "hytale-atlas": "./dist/cli/main.js",
+    "hytlas": "./dist/cli/main.js"
   },
   "main": "./dist/cli/main.js",
   "files": [
@@ -21,7 +30,8 @@
     "start": "node dist/cli/main.js",
     "test": "node --experimental-strip-types scripts/test.mjs",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
-    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "prepublishOnly": "npm run clean && npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
