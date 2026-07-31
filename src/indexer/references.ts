@@ -1,5 +1,4 @@
 import type { Database } from "../db/open.ts";
-import { referenceKeySql } from "../sources/lang.ts";
 import { escapeSegment } from "../util/json.ts";
 
 /** One candidate, with the raw document position it was collected from. */
@@ -287,12 +286,26 @@ export function resolveCandidates(db: Database): ResolveResult {
     // `role` (name/description/...) is the pointer's last segment. Deriving it in
     // SQLite means string surgery with no substring-search function; the query
     // layer splits the pointer instead, which is one line there and none here.
+    //
+    // MATCHED BY THE KEY'S OWN ROOT, not by a list of known ones. A reference is
+    // `<root>.<key>` and `lang_keys` stores both halves, so the general rule is
+    // one join condition. The old form stripped only `server.` and `common.` --
+    // and this corpus holds 36 distinct roots. References under the other 34
+    // (`items.`, `emotes.`, `npcs.`, `wordlists.`, and every pack's own) matched
+    // nothing and produced no edge, so `search-lang` answered "used by nothing
+    // indexed (UI text, or referenced dynamically)" about keys that are declared
+    // statically in an asset's TranslationProperties. A blind trial found it on a
+    // pack key and reproduced it on a second pack.
+    //
+    // Still an indexed seek: `l.key` is the leading column of idx_lang_key, and
+    // both sides of the AND are computed from the candidate row.
     db.exec(`
       INSERT INTO edges (src, dst, dst_kind, kind, json_pointer, confidence)
       SELECT c.asset_id, l.id, 'lang_key', 'LOCALIZED_BY', c.json_pointer, 'high'
         FROM candidates c
         JOIN lang_keys l
-          ON l.key = ${referenceKeySql("c.raw_value")}
+          ON l.key = substr(c.raw_value, instr(c.raw_value, '.') + 1)
+         AND l.root = substr(c.raw_value, 1, instr(c.raw_value, '.') - 1)
        WHERE c.value_kind = 'string' AND ${NOT_NOISE}
          AND c.raw_value LIKE '%.%.%' AND l.locale = 'en-US'
     `);

@@ -39,6 +39,14 @@ export interface ArchiveEntry {
    * decompression required — though too weak to use as a content identity.
    */
   readonly crc32: number;
+  /**
+   * Where this entry's LOCAL header starts, so a later read can seek to it
+   * instead of re-reading the central directory. Absent for sources that are not
+   * zips -- a directory has no such thing.
+   */
+  readonly localHeaderOffset?: number;
+  /** Zip compression method: 0 stored, 8 deflate. Absent for non-zip sources. */
+  readonly compression?: number;
 }
 
 /**
@@ -107,6 +115,11 @@ export class AssetArchive implements AssetSource {
             uncompressedSize: entry.uncompressedSize,
             compressedSize: entry.compressedSize,
             crc32: entry.crc32,
+            // Carried out of the walk so the indexer can record it. Reading one
+            // entry later then costs a seek rather than a second enumeration of
+            // all 60,148 -- see sources/zip-entry.ts.
+            localHeaderOffset: entry.relativeOffsetOfLocalHeader,
+            compression: entry.compressionMethod,
           });
           byPath.set(entry.fileName, entry);
         }

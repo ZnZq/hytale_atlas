@@ -272,9 +272,14 @@ export interface CraftableAtBench {
 export function craftableAt(db: Database, benchId: string, limit = 100): CraftableAtBench[] {
   return db
     .prepare(
+      // `a.is_effective = 1`: one row per identifier, the one the game loads.
+      // `assets` holds a row per PACK copy, so a shadowed id -- and 137 of them
+      // are shadowed in a real mods folder -- was listed twice, both copies
+      // carrying the winning pack's marker and the vanilla one never shown
+      // unmarked. A reader counting a bench's recipes counted some of them twice.
       `SELECT a.logical_id AS logicalId, rc.category_id AS category
          FROM bench_requirements r
-         JOIN assets a ON a.id = r.asset_id
+         JOIN assets a ON a.id = r.asset_id AND a.is_effective = 1
          LEFT JOIN bench_requirement_categories rc
                 ON rc.asset_id = r.asset_id AND rc.json_pointer = r.json_pointer
         WHERE r.bench_id = ?

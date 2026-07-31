@@ -416,7 +416,14 @@ test("a container with no observations explains why that means nothing", opts, (
   // together looked like a contradiction.
   const { out } = run("describe", "common:SelectInteraction", "--field", "HitBlock");
   assert.match(out, /\(container\)/);
-  assert.match(out, /Absence here says nothing/);
+  assert.match(out, /Absence says nothing/);
+  // The sibling is the whole point, and for a long time only this comment said
+  // so: the output asserted "this is a container, and only scalar leaves are
+  // counted", which reads as a fact about the TYPE -- while every key of
+  // BlockType /Interactions shares this declared shape and /Use lists twelve
+  // observed ids. A blind trial reported it twice before the sentence named the
+  // mechanism (written inline, not as an id) instead of the category.
+  assert.match(out, /sibling of\s+the same declared shape may still show values/);
 });
 
 test("a union keyed on something other than Type resolves", opts, () => {
@@ -653,8 +660,14 @@ test("describe states that its counts predate inheritance", opts, () => {
   // shows the value on many more, because it resolves the parent chain. Both are
   // right, and nothing said they answered different questions.
   const { out } = run("describe", "common:FarmingData", "--field", "StartingStageSet");
-  assert.match(out, /counts files that declare the field themselves/);
   assert.match(out, /'get' resolves inheritance first/);
+  // The footnote used to say this number "counts files that declare the field
+  // themselves" -- which is the `declared by:` sample's number, not this one.
+  // They are 24 and 23 on common:BenchTierLevel /CraftingTimeReductionModifier,
+  // and the pair read as an off-by-one in a list that was complete. Each is
+  // named for what it measures now, so pin that rather than the old sentence.
+  assert.match(out, /'used in N assets' counts files with an observed VALUE/);
+  assert.match(out, /not expected to match/);
 });
 
 test("search-lang finds a key written the way an asset references it", opts, () => {

@@ -21,7 +21,7 @@
  * makes a bump orphan old databases rather than silently reusing one whose shape
  * no longer matches.
  */
-export const SCHEMA_VERSION = 18;
+export const SCHEMA_VERSION = 19;
 
 /**
  * Version of the indexing PIPELINE, written to `meta.pipeline` only after every
@@ -48,7 +48,7 @@ export const SCHEMA_VERSION = 18;
  * refactor, not for rendering, not for a query — for anything that would make a
  * freshly built index differ from an existing one.
  */
-export const PIPELINE_VERSION = 2;
+export const PIPELINE_VERSION = 3;
 
 export const SCHEMA_SQL = `
 -- ---------------------------------------------------------------------------
@@ -433,6 +433,42 @@ CREATE TABLE IF NOT EXISTS bench_requirement_categories (
   json_pointer TEXT NOT NULL,
   category_id  TEXT NOT NULL,
   PRIMARY KEY (asset_id, json_pointer, category_id)
+) STRICT;
+
+-- ---------------------------------------------------------------------------
+-- Archive entry offsets
+--
+-- Where each asset's bytes start inside its pack archive, so reading ONE
+-- document does not mean reading the archive's whole central directory.
+--
+-- The get command is the only one that needs a document body -- everything else is
+-- answered from the tables above -- and it paid 12-23s per invocation to open
+-- Assets.zip, of which the read itself was 6ms. The cost was enumerating 60,148
+-- central-directory records at ~103us each to build a path map, in order to look
+-- up one path. That made get the slowest thing the tool does by an order of
+-- magnitude, and 15 tests that call it 82% of the suite's runtime.
+--
+-- The central directory is derived data about a frozen archive, which is exactly
+-- what this database is for. Recorded for ASSET entries only: they are what get
+-- reads. Anything else falls back to opening the archive.
+--
+-- Safe against a changed archive by construction: the cache key is a stamp of
+-- the archive, so different bytes mean a different database. The reader checks
+-- the local header signature regardless.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS archive_entries (
+  pack_id           INTEGER NOT NULL REFERENCES packs(id) ON DELETE CASCADE,
+  path              TEXT NOT NULL,
+  -- Offset of the LOCAL header, not of the data: the local header repeats the
+  -- name and extra fields with their own lengths, so only it can say where the
+  -- bytes begin.
+  local_header_ofs  INTEGER NOT NULL,
+  compressed_size   INTEGER NOT NULL,
+  uncompressed_size INTEGER NOT NULL,
+  -- 0 stored, 8 deflate.
+  compression       INTEGER NOT NULL,
+  PRIMARY KEY (pack_id, path)
 ) STRICT;
 
 -- ---------------------------------------------------------------------------

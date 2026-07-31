@@ -3,7 +3,7 @@ import { DEFAULT_HTTP_PORT } from "../mcp/server.ts";
 import { detected, launchCommand, snippet, targets } from "./mcp-install.ts";
 import { basename, join, resolve } from "node:path";
 
-import { type Database, openDatabase, setMeta } from "../db/open.ts";
+import { type Database, openDatabase, pipelineState, setMeta } from "../db/open.ts";
 import { PIPELINE_VERSION } from "../db/schema.ts";
 import { type PackSource, buildSearchIndex } from "../indexer/corpus.ts";
 import { indexBenches } from "../indexer/benches.ts";
@@ -589,9 +589,39 @@ export async function cmdIndex(args: IndexArgs): Promise<number> {
     return 0;
   }
 
+  // EXISTS is not CURRENT.
+  //
+  // This checked only that the file was there. `pipelineState` is the project's
+  // own answer to "is this database still the one this code would build", and
+  // the command whose entire job is building it never asked. So a
+  // PIPELINE_VERSION bump -- whose docstring says to bump it for "anything that
+  // would make a freshly built index differ from an existing one" -- changed
+  // nothing: `index` replied "already built", and every answer afterwards came
+  // from the old data. `scripts/test.mjs` runs this command, so the suite would
+  // have gone on asserting against a stale index in silence, and a frozen
+  // blind-trial snapshot would have reported defects that were already fixed.
   if (existsSync(dbPath) && !args.force) {
-    process.stdout.write(`Index already built: ${dbPath}\nUse --force to rebuild.\n`);
-    return 0;
+    let state: "ready" | "incomplete" | "stale" | "unreadable";
+    try {
+      const probe = openDatabase(dbPath, { readOnly: true });
+      try {
+        state = pipelineState(probe);
+      } finally {
+        probe.close();
+      }
+    } catch {
+      state = "unreadable";
+    }
+    if (state === "ready") {
+      process.stdout.write(`Index already built: ${dbPath}\nUse --force to rebuild.\n`);
+      return 0;
+    }
+    process.stdout.write(
+      `Index at ${dbPath}\n  is ${state === "incomplete" ? "half-written" : state} -- rebuilding.\n`,
+    );
+    for (const suffix of ["-wal", "-shm", ""]) {
+      rmSync(`${dbPath}${suffix}`, { force: true });
+    }
   }
   // The write-ahead log and shared-memory file are part of the database, not
   // scratch beside it: deleting only the main file leaves SQLite to reconcile a
@@ -840,9 +870,17 @@ export async function cmdGet(
   // One resolver, one wording. This used to call a near-copy of `resolveArchive`
   // that threw a differently-phrased error for the same condition, so fixing the
   // message in one place left the other stale.
-  const archivePath = await resolveArchive(args.assets, args.patchline);
+  // Resolved for its ERROR, not for a handle: this is where "no Assets.zip" gets
+  // its one good wording, before anything else is attempted.
+  //
+  // NOT opened. This command used to open the archive here and never read a byte
+  // from it -- the handle's only other appearance was `archive.close()` in the
+  // finally block -- while `packAssetLoader` did all the actual loading. Opening
+  // reads the whole central directory, 60,148 records on the release archive, so
+  // `get` paid ~10s to build a directory it then discarded. The cost hid inside
+  // the loader's own open until that became a seek.
+  await resolveArchive(args.assets, args.patchline);
   const db = await frozenDb(args.assets, args.patchline);
-  const archive = await AssetArchive.open(archivePath);
 
   try {
     // The ORDER BY must match the disambiguation note's exactly. It did not: the
@@ -875,7 +913,6 @@ export async function cmdGet(
     if (!miss && args.raw === true) process.stderr.write(caveatBlock(result.caveats));
     return miss ? 1 : 0;
   } finally {
-    archive.close();
     db.close();
   }
 }

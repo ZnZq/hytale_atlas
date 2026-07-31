@@ -17,8 +17,10 @@ import {
 } from "../query/schema.ts";
 import { type SearchHit, searchAssets } from "../query/search.ts";
 import { AssetArchive, type AssetSource, sourceStamp } from "../sources/archive.ts";
+import { ZipReader } from "../sources/zip-entry.ts";
 import { DirectorySource } from "../sources/directory.ts";
 import {
+  WORKING_PACK_NAME,
   buildWorkingLayer,
   refreshWorkingLayer,
   type WorkingLayer,
@@ -214,8 +216,18 @@ export function searchAssetsOp(
   // four effects, none of them named Burning, with nothing saying the query had
   // been widened three times. `search_schema` has emitted `relaxed` for this all
   // along -- one surface qualified its guesses and the other did not.
-  const loosened = Math.max(0, ...hits.map((h) => h.relaxation ?? 0));
-  if (loosened > 0) caveats.push(caveat.relaxed(query, loosened, false));
+  // Counted, not maxed. `search` fills its quota row by row, so a page can hold
+  // exact matches AND loosened ones -- and taking the maximum turned one loosened
+  // row into "Nothing matched as written" above eleven that did.
+  const level = Math.max(0, ...hits.map((h) => h.relaxation ?? 0));
+  const exactHits = hits.filter((h) => (h.relaxation ?? 0) === 0).length;
+  if (level > 0) {
+    caveats.push(
+      exactHits === 0
+        ? caveat.relaxed(query, level, false)
+        : caveat.relaxedSome(query, exactHits, hits.length - exactHits, level),
+    );
+  }
 
   // Which pack each hit came from. Without it a search result reads as a list of
   // things the game has, and four agents in one round built answers on mod
@@ -445,6 +457,20 @@ function packMark(pack: AssetPack | null | undefined): string {
  * Attribution key for a row. The identifier alone collides: 442 of them name
  * more than eight assets, so a map keyed on it hands one row's owner to another.
  */
+/**
+ * Sorts a value list numerically when every member is a number.
+ *
+ * Observed values are stored as text, so the index hands them back in string
+ * order. That is right for identifiers and wrong for measurements, and nothing
+ * downstream can tell the two apart from the type alone -- hence the test on the
+ * data. Left exactly as received the moment one member is not numeric, so a
+ * mixed list keeps the index's order instead of gaining a second arbitrary one.
+ */
+function numericOrder(values: readonly string[]): string[] {
+  const allNumeric = values.every((v) => v.trim() !== "" && Number.isFinite(Number(v)));
+  return allNumeric ? [...values].sort((a, b) => Number(a) - Number(b)) : [...values];
+}
+
 function hitKey(logicalId: string, type: string | null | undefined): string {
   return `${logicalId}\u001f${type ?? ""}`;
 }
@@ -673,7 +699,13 @@ export function packAssetLoader(
       WHERE a.logical_id = ?1 AND (?2 IS NULL OR a.type = ?2) AND p.name = ?3
       ORDER BY a.type LIMIT 1`,
   );
+  // Served by the (pack_id, path) primary key, so this is a seek, not a scan.
+  const entryOf = db.prepare(
+    `SELECT local_header_ofs, compressed_size, uncompressed_size, compression
+       FROM archive_entries WHERE pack_id = ? AND path = ?`,
+  );
   const open = new Map<number, Promise<AssetSource>>();
+  const readers = new Map<number, Promise<ZipReader>>();
   /** Identifiers whose file was found and could not be parsed. */
   const unreadable = new Set<string>();
 
@@ -693,6 +725,48 @@ export function packAssetLoader(
         }
       | undefined;
     if (row === undefined) return null;
+
+    // THE FAST PATH, and the reason `archive_entries` exists. Opening a pack
+    // archive means reading its whole central directory -- 60,148 records and
+    // 12-23s on the game's Assets.zip -- to locate one path, while the read
+    // itself is 6ms. The offsets were recorded at index time, so a document that
+    // has one is a seek. Everything else still opens the archive: a directory
+    // pack has no offsets by nature, and an entry the indexer never saw as an
+    // asset has none either.
+    if (row.packKind !== "working") {
+      const stored = entryOf.get(row.packId, row.path) as
+        | {
+            local_header_ofs: number;
+            compressed_size: number;
+            uncompressed_size: number;
+            compression: number;
+          }
+        | undefined;
+      if (stored !== undefined) {
+        try {
+          let reader = readers.get(row.packId);
+          if (reader === undefined) {
+            reader = ZipReader.open(row.packPath);
+            readers.set(row.packId, reader);
+          }
+          const bytes = await (await reader).read({
+            offset: stored.local_header_ofs,
+            compressedSize: stored.compressed_size,
+            uncompressedSize: stored.uncompressed_size,
+            compression: stored.compression,
+          });
+          return {
+            path: row.path,
+            type: row.type,
+            document: JSON.parse(bytes.toString("utf8")) as unknown,
+          };
+        } catch {
+          unreadable.add(logicalId);
+          return null;
+        }
+      }
+    }
+
     let pending = open.get(row.packId);
     if (pending === undefined) {
       // The pack being authored is a DIRECTORY, not an archive. The zip opener
@@ -727,6 +801,7 @@ export function packAssetLoader(
     unreadable,
     close: () => {
       for (const pending of open.values()) void pending.then((a) => a.close()).catch(() => {});
+      for (const pending of readers.values()) void pending.then((r) => r.close()).catch(() => {});
     },
   };
 }
@@ -979,9 +1054,18 @@ export async function getAssetOp(
       text = `'${logicalId}' is a bench id, not an asset. Use: hytale-atlas bench ${logicalId}\n`;
     } else if (logicalId.includes(":")) {
       const [maybeType, ...rest] = logicalId.split(":");
-      text =
-        `No asset '${logicalId}'. Identifiers carry no namespace here.\n` +
-        `Did you mean: hytale-atlas get ${rest.join(":")} --type ${maybeType}\n`;
+      text = typeExists(db, logicalId)
+        ? // A SHARED DEFINITION, which no asset instance carries -- so `get` can
+          // never resolve it under any spelling. The old advice stripped the
+          // namespace and offered it as a `--type`, and a blind trial followed
+          // that to a second dead end: `get ItemTool --type common` fails too,
+          // because `common` is not an asset type either. `describe` is the
+          // command that reads the schema, and the message never named it.
+          `'${logicalId}' is a shared definition, not an asset: it names a SHAPE that ` +
+          `other types embed, and nothing carries it as an asset.\n` +
+          `Use: hytale-atlas describe ${logicalId}\n`
+        : `No asset '${logicalId}'. Identifiers carry no namespace here.\n` +
+          `Did you mean: hytale-atlas get ${rest.join(":")} --type ${maybeType}\n`;
     } else {
       text = `No asset '${logicalId}'.\n` + nextCommands(db, logicalId, "search");
     }
@@ -1083,7 +1167,17 @@ export async function getAssetOp(
     );
     // The differences are on the FIRST variant's terms; say so, or a reader
     // takes them for differences from the game.
-    if (!allSame) lines.push(`Differences are shown against ${first!.pack}.\n`);
+    //
+    // And say what the marks MEAN. The table above prints `+Categories
+    // ~Tool` and the notation appeared nowhere -- not here, not in --help. A
+    // reader could infer it, and inferring a legend is exactly the guess this
+    // surface keeps trying not to make people make.
+    if (!allSame) {
+      lines.push(
+        `Differences are shown against ${first!.pack}.  ` +
+          `+key = present only here,  ~key = present in both with a different value.\n`,
+      );
+    }
     caveats.push(
       tied.length > 1
         ? caveat.contestedPacks(
@@ -1141,6 +1235,13 @@ export async function getAssetOp(
               ` the same priority -- whether the game keeps THIS one is unknown here`
           : `  also defined by: ${others.map((d) => d.pack).join(", ")}`,
       );
+      // WHICH SIDE of the shadow you asked for decides the sentence. `defs` is
+      // ordered winner-first, so pinning the winner and pinning a loser are
+      // opposite situations -- and both used to get the loser's wording. Asking
+      // for the pack that actually wins was answered "which the game does NOT
+      // load -- Endgame&QoL defines the same identifier and wins", naming the
+      // same pack on both sides of a contradiction in one sentence.
+      const pinnedWins = defs[0]!.pack === pinnedPack;
       caveats.push(
         tied.length > 1
           ? caveat.contestedPacks(
@@ -1148,7 +1249,13 @@ export async function getAssetOp(
               tied.map((d) => d.pack),
               pinnedPack,
             )
-          : caveat.shadowedShown(resolved.logicalId, pinnedPack, defs[0]!.pack),
+          : pinnedWins
+            ? caveat.shadowedWinnerShown(
+                resolved.logicalId,
+                pinnedPack,
+                others.map((d) => d.pack),
+              )
+            : caveat.shadowedShown(resolved.logicalId, pinnedPack, defs[0]!.pack),
       );
     }
   }
@@ -1463,6 +1570,7 @@ function describeField(
   // column: `describe BlockType --field HitboxType` printed '-> BlockBoundingBoxes'
   // and 214 distinct values without mentioning that one names nothing, 256 times.
   const broken = brokenRefsFor(db, assetType, f.pointer);
+  if (broken.shown.length > 0 || broken.distinct > broken.shown.length) markers.add("BROKEN");
   for (const one of broken.shown) {
     out +=
       `    BROKEN: '${one.value}' names no ${d?.referenceTarget ?? "asset"} ` +
@@ -1563,7 +1671,15 @@ function describeField(
   } else if (o?.values) {
     // Says how many of how many. The list was cut at 14 in silence, so a field
     // with 21 real bench ids showed 14 of them, ending mid-alphabet.
-    const shown = single ? o.values : o.values.slice(0, 14);
+    //
+    // NUMBERS IN NUMERIC ORDER. These are stored as strings and were printed in
+    // string order, so `CraftingRecipe /TimeSeconds` read
+    // "0, 0.5, 1, 1.5, 10, 14, 18, 2, 2.5, 20, 3, ..." -- which begins ascending
+    // and stays plausible, so a reader picking a smelt time from the range
+    // misjudges where their value falls. A truncated list is worse again: the
+    // first 14 of that order are not the 14 smallest.
+    const ordered = numericOrder(o.values);
+    const shown = single ? ordered : ordered.slice(0, 14);
     out += `    seen:  ${markValues(shown, foreign).join(", ")}
 `;
     if (shown.length < o.cardinality) {
@@ -1579,6 +1695,7 @@ function describeField(
   // back, so merging would let an invention become its own evidence.
   const mine = workingValues(db, f.assetType, f.pointer);
   if (mine.length > 0) {
+    markers.add("yours");
     const shown = mine.slice(0, 8);
     out +=
       `    yours: ${shown.map((m) => m.value).join(", ")}` +
@@ -1650,10 +1767,17 @@ function describeField(
         out += `      ${(values[i] ?? "?").padEnd(width)}  ${target}\n`;
       }
     }
-    // Absence here means nothing, and saying nothing invited the opposite reading.
+    // Absence here means nothing, and saying nothing invited the opposite
+    // reading. But "this IS a container" is too flat for a union: `BlockType
+    // /Interactions` is a map whose keys all declare `anyOf -> RootInteraction`,
+    // and /Use lists twelve observed ids while /Pickup lists none -- the same
+    // declared shape, written inline in one place and as an id in the other. So
+    // the sentence names the mechanism instead of asserting a category.
     out +=
-      "    no observed values: this is a container, and only scalar leaves are\n" +
-      "    counted. Absence here says nothing about whether the corpus uses it.\n";
+      "    no observed values here: only scalar leaves are counted, and this field's\n" +
+      "    value is written as a nested object rather than a plain id. A sibling of\n" +
+      "    the same declared shape may still show values. Absence says nothing about\n" +
+      "    whether the corpus uses it.\n";
   }
   return out;
 }
@@ -1694,9 +1818,17 @@ function describeLegend(db: Database, markers: Set<string>): string {
     UNDECLARED:
       "the corpus uses this field and the schema never declares it -- so there is\n" +
       "               no type, default or legal set to show",
+    // "CANNOT" was too strong, and its own siblings disproved it: a union like
+    // `anyOf -> RootInteraction` accepts an inline object OR a plain id, so
+    // BlockType /Interactions/Use lists twelve observed ids while /Interactions
+    // /Pickup, identical declared shape, lists none. Absence still says nothing
+    // about use -- which is the point -- but the reason is that the value may be
+    // written inline, not that it could never be observed.
     "(container)":
-      "holds other fields, never a value of its own, so it CANNOT appear in the\n" +
-      "               observed layer -- absence here says nothing about use",
+      "holds other fields rather than a value of its own, so it does not reach the\n" +
+      "               observed layer -- absence here says nothing about use. A union\n" +
+      "               with a '->' target also accepts a plain id instead, and a sibling\n" +
+      "               of the same shape may well show values",
     unused:
       "no vanilla asset sets it. A statement about this index, not the engine.\n" +
       "               Of the " +
@@ -1706,6 +1838,19 @@ function describeLegend(db: Database, markers: Set<string>): string {
       formatCount(joined) +
       " are; the rest are either genuinely unused or missed by the join",
     "?": "no declared type, because the schema does not describe this field",
+    // Printed on three separate --field calls and defined nowhere. It is also
+    // the one marker that is not about the game at all, which makes leaving it
+    // unexplained worse than the others: a reader who does not know it names
+    // THEIR OWN unsaved file can take a draft value for corpus evidence.
+    yours:
+      "values from the pack you are AUTHORING, kept separate from the observed\n" +
+      "               layer above -- they are a draft, not evidence of what the game does",
+    // Printed on up to nine rows of `describe Item --field Categories/*` and
+    // defined nowhere: the only explanation lived in a different command's
+    // footer, so a reader met the word for the first time as a verdict.
+    BROKEN:
+      "the corpus uses this value where the declared target type has no asset of\n" +
+      "               that name -- a reference that resolves to nothing",
     "->": "the asset TYPE this field declares it points at (hytale.hytaleAssetRef)",
     default: "the value the game uses when the field is absent",
     "points at":
@@ -1722,6 +1867,8 @@ function describeLegend(db: Database, markers: Set<string>): string {
     "points at",
     "default",
     "?",
+    "yours",
+    "BROKEN",
     "UNDECLARED",
     "(container)",
     "unused",
@@ -1765,7 +1912,11 @@ export function describeOp(db: Database, request: DescribeRequest): Result<Descr
   }
   if (fields.some((f) => f.observed !== null)) caveats.push(caveat.preInheritance());
   for (const f of fields) {
-    if (f.observed === null && isContainer(f.declared?.type ?? null) && field !== undefined) {
+    if (
+      f.observed === null &&
+      isContainer(f.declared?.type ?? null) &&
+      field !== undefined
+    ) {
       caveats.push(caveat.containerNoObservations());
     } else if (
       f.observed !== null &&
@@ -1899,7 +2050,14 @@ export function describeOp(db: Database, request: DescribeRequest): Result<Descr
   // The observed layer is the half of describe that reads as a fact about the
   // game, and it is the half packs silently join. A caveat here says so in the
   // structured channel, not only as a marker someone has to notice.
-  if (packsSeen.size > 0) caveats.push(caveat.thirdParty([...packsSeen].sort()));
+  // The pack being AUTHORED is not a dependency anyone installs. `get`, `search`
+  // and `bench` each say that separately; `describe` still bundled it into the
+  // third-party list and told a modder their own half-written draft "is NOT part
+  // of the game -- anything built on them requires that pack to be installed".
+  // Two different warnings, and mixing them makes both wrong.
+  const foreignSeen = [...packsSeen].filter((p) => p !== WORKING_PACK_NAME).sort();
+  if (foreignSeen.length > 0) caveats.push(caveat.thirdParty(foreignSeen));
+  if (packsSeen.has(WORKING_PACK_NAME)) caveats.push(caveat.workingPack());
 
   return rendered(
     value,
@@ -1913,7 +2071,15 @@ export function describeOp(db: Database, request: DescribeRequest): Result<Descr
       // occurrences here -- and an agent reasonably read that as this command
       // being wrong.
       (fields.some((f) => f.observed !== null)
-        ? "\n'used in N assets' counts files that declare the field themselves.\n" +
+        ? // NAMED for what it measures. This said it "counts files that declare
+          // the field themselves", which is the `declared by:` sample's number --
+          // a DIFFERENT one. On common:BenchTierLevel /CraftingTimeReductionModifier
+          // the two are 24 and 23, and the pair read as an off-by-one in a list
+          // that was in fact complete: 24 assets carry an observed VALUE, 23
+          // declare the field. Both true, about different sets.
+          "\n'used in N assets' counts files with an observed VALUE for the field.\n" +
+          "The 'declared by' sample counts files that declare it, which can differ:\n" +
+          "the two answer different questions and are not expected to match.\n" +
           "'get' resolves inheritance first, so it can show a value on assets that\n" +
           "are not counted here.\n" +
           // A shape can be embedded in a file of another type, so the count is not
@@ -2161,6 +2327,33 @@ export function typeExists(db: Database, assetType: string): boolean {
  */
 export function assetsOfType(db: Database, assetType: string): number {
   return count(db, "SELECT count(*) AS n FROM main.assets WHERE type = ?", assetType);
+}
+
+/**
+ * How many assets of a type are VISIBLE -- the corpus plus the pack being authored.
+ *
+ * The counterpart to `assetsOfType`, and the distinction is the point. That one
+ * is a STATISTIC: "how many assets carry this field" is a claim about the game,
+ * so it reads `main` and the draft must not inflate it. This one backs a
+ * RETRIEVAL header: `types <Type>` lists the draft's own assets, so the number
+ * above that list has to count them, or the header contradicts the rows beneath
+ * it.
+ *
+ * Qualifying the statistic without adding this is exactly what a blind trial
+ * caught one round later: `types` reported Item 4,395 while `types Item` said
+ * 4,384 -- the same question, two numbers, eleven apart, and no caveat saying
+ * why. Eleven was the working pack.
+ */
+export function assetsOfTypeVisible(db: Database, assetType: string): number {
+  // DISTINCT identifiers, because that is what the list beneath this number
+  // shows: `assetsOfTypeList` groups by logical_id, so a shadowed id is one row
+  // there and was two here. `types CraftingRecipe` headed a 473-row list with
+  // "474 asset(s)" and offered nothing to explain the missing one.
+  return count(
+    db,
+    "SELECT count(DISTINCT logical_id) AS n FROM assets WHERE type = ?",
+    assetType,
+  );
 }
 
 export function searchSchemaOp(db: Database, query: string, limit = 20) {
@@ -2427,7 +2620,8 @@ export function typesOp(
 
   if (request.type !== undefined) {
     const type = request.type;
-    const carried = assetsOfType(db, type);
+    // Visible, not corpus-only: the rows below include the draft, so this must.
+    const carried = assetsOfTypeVisible(db, type);
     if (carried === 0) {
       const declared = typeExists(db, type);
       const reason = declared
@@ -2506,7 +2700,13 @@ export function assetTypesOp(db: Database): Result<AssetTypeInfo[]> {
       `SELECT t.id AS type, t.schema_path AS declaredPath,
               (SELECT min(a.path) FROM assets a WHERE a.type = t.id) AS lo,
               (SELECT max(a.path) FROM assets a WHERE a.type = t.id) AS hi,
-              (SELECT count(*) FROM assets a WHERE a.type = t.id) AS assets,
+              -- DISTINCT, to match the number the per-type listing prints above its
+              -- own list. Counting rows here counted every pack's copy of a
+              -- shadowed identifier, so this table said 474 CraftingRecipe and
+              -- 185 ItemPlayerAnimations where drilling in showed 473 and 183 --
+              -- two different offsets, which reads as an unreliable table rather
+              -- than a definition mismatch.
+              (SELECT count(DISTINCT a.logical_id) FROM assets a WHERE a.type = t.id) AS assets,
               (SELECT count(*) FROM schema_fields sf
                 WHERE sf.asset_type = t.id AND sf.json_pointer <> '') AS declaredFields
          FROM asset_types t
@@ -3062,6 +3262,21 @@ export function refsAnyOp(
     const usage = valueRefsOp(db, logicalId, limit);
     if (usage.value.occurrences > 0) {
       const u = usage.value;
+      // Said, not swallowed. This branch answers about a VALUE, which has no
+      // type, so a `--type` the caller passed cannot narrow anything -- and
+      // returning the same 894 rows with no explanation reads as a filter that
+      // matched everything.
+      const valueCaveats =
+        type === undefined
+          ? usage.caveats
+          : [
+              ...usage.caveats,
+              caveat.argumentIgnored(
+                "--type",
+                `'${logicalId}' is not an asset, so this answer is about a VALUE and a ` +
+                  `value carries no type. Narrow with the field breakdown below instead.`,
+              ),
+            ];
       // stdout and exit 0: this is an ANSWER, not a miss. It went to stderr with
       // exit 1 -- a successful lookup reported as a failure, unusable in a
       // pipeline -- and once `search` began suggesting this exact command for a
@@ -3086,8 +3301,8 @@ export function refsAnyOp(
                 `  ${e.logicalId.padEnd(38)} ${(e.type ?? "untyped").padEnd(18)} ${e.pointer}\n`,
             )
             .join("") +
-          caveatBlock(usage.caveats),
-        usage.caveats,
+          caveatBlock(valueCaveats),
+        valueCaveats,
       );
     }
 
@@ -3744,18 +3959,46 @@ export function benchOp(db: Database, benchId: string, limit = 200) {
       .join("") +
     `\n${formatCount(total)} craftable here:\n`;
 
+  // MARKED, like every other listing. This was the one enumeration in the family
+  // with no provenance at all -- no bracket on a row, no third-party caveat on
+  // the answer -- so a bench list mixing vanilla recipes with a pack's read as
+  // entirely base-game. A blind trial hit it twice: `bench Weapon_Bench` listed
+  // Weapon_Crossbow_Cobalt unmarked, which `search` reports as
+  // `[More Crossbow Tiers]`, and `bench Salvagebench` did the same across 483
+  // rows. A modder builds on those ids believing every player has them.
+  const benchPack = hasThirdPartyPacks(db) ? packLookup(db) : (): null => null;
+  const touched = new Set<string>();
+  let working = false;
+  const noteOwner = (id: string): string => {
+    const p = benchPack(id);
+    if (p !== null && p.kind !== "vanilla") {
+      if (p.kind === "working") working = true;
+      else touched.add(p.name);
+    }
+    return packMark(p);
+  };
+
   let current: string | null | undefined;
+  let rows = "";
   for (const it of items) {
     if (it.category !== current) {
       current = it.category;
-      text += `\n  [${current ?? "no category"}]\n`;
+      rows += `\n  [${current ?? "no category"}]\n`;
     }
-    text += `    ${it.logicalId}\n`;
+    rows += `    ${it.logicalId}${noteOwner(it.logicalId)}\n`;
   }
+  if (declaredBy !== null) text = text.replace(`declared by: ${declaredBy}`, `declared by: ${declaredBy}${noteOwner(declaredBy)}`);
+  text += rows;
+
+  const withPacks: Caveat[] = [
+    ...caveats,
+    ...(touched.size > 0 ? [caveat.thirdParty([...touched].sort())] : []),
+    ...(working ? [caveat.workingPack()] : []),
+  ];
   return rendered(
     { categories, items, total, declaredBy, found: true as const },
-    `${text}\n${caveatBlock(caveats)}`,
-    caveats,
+    `${text}\n${caveatBlock(withPacks)}`,
+    withPacks,
   );
 }
 
@@ -3779,8 +4022,14 @@ export function benchDeclaredBy(db: Database, logicalId: string): string | null 
 export function benchDeclarers(db: Database, benchId: string): string | null {
   const row = db
     .prepare(
-      `SELECT group_concat(a.logical_id, ', ') AS ids FROM bench_declarations d
-         JOIN assets a ON a.id = d.asset_id WHERE d.bench_id = ?`,
+      // DISTINCT in a subquery, because SQLite's group_concat takes either a
+      // DISTINCT or a separator, not both -- and the separator is what keeps
+      // this readable. Two packs declaring one bench printed "Bench_Weapon,
+      // Bench_Weapon", which reads as a rendering bug rather than the override
+      // it is. The pack marker beside it says which copy is loaded.
+      `SELECT group_concat(id, ', ') AS ids FROM (
+         SELECT DISTINCT a.logical_id AS id FROM bench_declarations d
+           JOIN assets a ON a.id = d.asset_id WHERE d.bench_id = ?)`,
     )
     .get(benchId) as { ids: string | null } | undefined;
   return row?.ids ?? null;
@@ -4050,7 +4299,12 @@ export async function statusOp(
     if (sources.config.pack !== null) {
       lines.push(
         `Working pack: ${sources.config.pack}`,
-        "             drafts appear in get/search/types; corpus statistics exclude them",
+        // Named as a rule, not as a list. The list was wrong the moment it was
+        // written -- `describe --field` also surfaces drafts, on its `yours:`
+        // line -- and a reader using it to decide where draft content can appear
+        // would not have expected that one.
+        "             retrieval shows your drafts (get, search, types, refs, and the",
+        "             'yours:' line of describe); corpus statistics exclude them",
       );
     }
   }
@@ -4285,7 +4539,18 @@ export function benchIdExists(db: Database, id: string): boolean {
 
 /** How many recipes name this bench, before any display cap. */
 export function benchRecipeCount(db: Database, benchId: string): number {
-  return count(db, "SELECT count(*) AS n FROM bench_requirements WHERE bench_id = ?", benchId);
+  // Counts what the LIST beneath it shows: one row per identifier the game
+  // actually loads. `bench_requirements` holds a row per pack copy, so a bench
+  // whose craftables are shadowed announced "77 craftable here" above 68 rows --
+  // and the two benches checked alongside it agreed exactly, which made the gap
+  // read as a bug in this one bench rather than in the counting rule.
+  return count(
+    db,
+    `SELECT count(DISTINCT a.logical_id) AS n FROM bench_requirements r
+       JOIN assets a ON a.id = r.asset_id AND a.is_effective = 1
+      WHERE r.bench_id = ?`,
+    benchId,
+  );
 }
 
 /**

@@ -324,6 +324,14 @@ export async function buildSearchIndex(
       const insFts = db.prepare(
         "INSERT INTO assets_fts (logical_id, type, locale, display_name, description) VALUES (?,?,?,?,?)",
       );
+      // Where this entry's bytes live, so `get` can seek instead of re-reading a
+      // 60,148-record central directory to find one path. Only zip sources have
+      // an offset; a directory pack is read by path and needs none.
+      const insEntry = db.prepare(
+        "INSERT INTO archive_entries" +
+          " (pack_id, path, local_header_ofs, compressed_size, uncompressed_size, compression)" +
+          " VALUES (?,?,?,?,?,?) ON CONFLICT (pack_id, path) DO NOTHING",
+      );
 
       const assetEntries = archive.entries.filter(
         (e) =>
@@ -343,6 +351,16 @@ export async function buildSearchIndex(
         const assetType = types?.resolve(entry.path) ?? null;
         if (assetType !== null) typed++;
         insAsset.run(packId, id, assetType, entry.path);
+        if (entry.localHeaderOffset !== undefined && entry.compression !== undefined) {
+          insEntry.run(
+            packId,
+            entry.path,
+            entry.localHeaderOffset,
+            entry.compressedSize,
+            entry.uncompressedSize,
+            entry.compression,
+          );
+        }
         assets++;
         packAssets++;
 
