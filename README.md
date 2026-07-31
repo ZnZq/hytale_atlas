@@ -8,56 +8,40 @@ generate) into a local SQLite database, then answers questions about it: what an
 asset actually resolves to after inheritance, which fields a type declares, what
 references what, which values really occur, and what a mod pack has changed.
 
-Nothing is uploaded. Nothing about the game is stored in this repository.
+Nothing is uploaded. The index lives only in a per-user cache on your machine.
 
 ---
 
-## Quick start
+## Install
 
 Requires **Node.js ≥ 22.5.0** and an installed copy of Hytale.
 
-```bash
-npm install
-npm run build
+Run it on demand with `npx` — nothing to install:
 
-node dist/cli/main.js status     # what was found, and what the index holds
-node dist/cli/main.js index      # build it (~40s, cached per-user)
-node dist/cli/main.js search pickaxe
+```bash
+npx hytale-atlas status          # what was found, and what the index holds
+npx hytale-atlas index           # build the index (~40s, cached per-user)
+npx hytale-atlas search pickaxe
+```
+
+Or install once for a short command on your `PATH`:
+
+```bash
+npm install -g hytale-atlas
+hytlas status                    # short alias — hytale-atlas works too
 ```
 
 `status` works before anything is built, and is the right first command: it
 prints where the game was detected, which patchline is active, which capability
 tier is available, and — once built — what the index contains.
 
-### Running it as a command
+> The package ships two command names for the same tool: the full `hytale-atlas`
+> and the short `hytlas`. `npx` resolves a *package* name, so use
+> `npx hytale-atlas`; the `hytlas` alias becomes available after a global
+> install. Pin a version anywhere with `hytale-atlas@0.1.0`.
 
-The `bin` field declares two command names for the same entry point: the full
-`hytale-atlas` and the short `hytlas`.
-
-Inside this repository `npx hytale-atlas <command>` already works — `npx` reads
-the `bin` of the package in the current directory. Once the package is published
-to npm the same call works from anywhere:
-
-```bash
-npx hytale-atlas status
-```
-
-`npx` resolves the argument as a *package* name, and the package is named
-`hytale-atlas`, so `npx hytlas` does not resolve — `hytlas` is a command alias,
-not a package. To get the short command from any directory, install once:
-
-```bash
-npm install -g hytale-atlas   # after it is published
-hytlas status                 # or: hytale-atlas status
-```
-
-During development, prefer `npm link` from this directory: it symlinks the
-working tree into your global npm folder, so `npm run build` takes effect
-immediately with no re-linking. Undo with `npm rm -g hytale-atlas`.
-
-Note that `hytale-atlas.json` is found by walking up from the working directory,
-so running the command from outside a configured project falls back to the
-game's own install.
+The examples below write `hytale-atlas <command>`. If you did not install
+globally, prefix them with `npx `.
 
 ---
 
@@ -124,6 +108,8 @@ Reading one thing:
 Two commands are declared but **not implemented** — they exit 2 rather than
 pretend: `validate` and `clean`.
 
+Run `hytale-atlas --help` for the full, self-describing list.
+
 ### Options worth knowing
 
 | Option | Effect |
@@ -144,7 +130,8 @@ Shared types need their namespace: `describe common:ItemTool`, not `ItemTool`.
 Entirely optional. With no config file the tool reads the game's own install.
 
 `hytale-atlas.json` — found by walking up from the working directory, like
-`package.json`. When present it is the authority. Run `init` to generate one.
+`package.json`. When present it is the authority. Run `hytale-atlas init` to
+generate one.
 
 ```json
 {
@@ -168,8 +155,8 @@ Entirely optional. With no config file the tool reads the game's own install.
 - An explicit `include` entry is never vetoed by `exclude`.
 - Unknown keys and missing paths are reported, not ignored.
 
-`HYTALE_ATLAS_NO_CONFIG=1` disables config discovery entirely. The test suite
-sets it, so results never depend on which mods a developer happens to have.
+`HYTALE_ATLAS_NO_CONFIG=1` disables config discovery entirely, so results never
+depend on which mods happen to be installed.
 
 ---
 
@@ -196,66 +183,45 @@ version, because that is the one every player has.
 
 ## MCP (for AI assistants)
 
-The server itself is one command:
-
-```bash
-node /ABSOLUTE/PATH/TO/hytale-atlas/dist/cli/main.js --mcp
-```
-
-Use an **absolute** path to both `node` and `main.js`. A client starts the server
-from its own working directory with its own `PATH`, so a bare `node` or a relative
-path produces a config that works on the machine that wrote it and nowhere else.
-`node -e "console.log(process.execPath)"` prints the path to your `node`.
-
-Below, `<NODE>` is that path and `<ATLAS>` is this repository's
-`dist/cli/main.js`. To skip the substituting, this prints every line below with
-your own paths already in place:
-
-```bash
-node dist/cli/main.js mcp-install         # clients detected here
-node dist/cli/main.js mcp-install --all   # every client it knows
-```
-
-It only prints. Registering the server is your call, in your own config.
-
-### Clients with a command for it
-
-```bash
-# Claude Code -- project scope writes .mcp.json, shareable via git
-claude mcp add hytale-atlas --scope project -- <NODE> <ATLAS> --mcp
-# or --scope user for every project
-
-# Gemini CLI
-gemini mcp add hytale-atlas -s user <NODE> <ATLAS> --mcp
-
-# VS Code / GitHub Copilot (writes your user profile)
-code --add-mcp "{\"name\":\"hytale-atlas\",\"command\":\"<NODE>\",\"args\":[\"<ATLAS>\",\"--mcp\"]}"
-
-# Kiro
-kiro-cli mcp add --name hytale-atlas --command <NODE> --args <ATLAS> --args --mcp
-
-# Amazon Q Developer
-qchat mcp add --name hytale-atlas --command <NODE> --args <ATLAS>,--mcp
-```
-
-`opencode mcp add` and GitHub Copilot CLI's `/mcp add` exist but take no
-arguments — they prompt. Configure those by file, below.
-
-### Clients you configure by file
-
-There is no universal format. Four shapes are in use, and the differences are
-not cosmetic — the top-level key, the entry fields, and whether the command is a
-string or an array all differ.
-
-**`mcpServers`** — Claude Code (`.mcp.json`, `~/.claude.json`), Cursor
-(`~/.cursor/mcp.json`), Windsurf (`~/.codeium/windsurf/mcp_config.json`), Gemini
-CLI (`~/.gemini/settings.json`), Cline and Roo Code (their VS Code
-`globalStorage` settings), Claude Desktop:
+The atlas speaks MCP over stdio. Because it is published to npm, `npx` fetches and
+runs it for you — no absolute paths, no build step. Point your assistant at:
 
 ```json
 {
   "mcpServers": {
-    "hytale-atlas": { "command": "<NODE>", "args": ["<ATLAS>", "--mcp"] }
+    "hytale-atlas": { "command": "npx", "args": ["-y", "hytale-atlas", "--mcp"] }
+  }
+}
+```
+
+That is the whole configuration for most clients. Pin a version with
+`"hytale-atlas@0.1.0"` if you want reproducibility.
+
+### Clients with a command for it
+
+```bash
+# Claude Code — project scope writes .mcp.json, shareable via git
+claude mcp add hytale-atlas --scope project -- npx -y hytale-atlas --mcp
+# or --scope user for every project
+```
+
+Other CLIs (Gemini, Copilot, Kiro, Amazon Q) have their own `mcp add` syntax, but
+the command and arguments are the same three tokens: `npx -y hytale-atlas --mcp`.
+When in doubt, write the JSON below by hand — it is the source of truth.
+
+### Clients you configure by file
+
+There is no universal format. The top-level key differs between clients; the entry
+is the same `command`/`args` pair (opencode being the one exception).
+
+**`mcpServers`** — Claude Code (`.mcp.json`, `~/.claude.json`), Cursor
+(`~/.cursor/mcp.json`), Windsurf (`~/.codeium/windsurf/mcp_config.json`), Gemini
+CLI (`~/.gemini/settings.json`), Cline and Roo Code, Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "hytale-atlas": { "command": "npx", "args": ["-y", "hytale-atlas", "--mcp"] }
   }
 }
 ```
@@ -265,7 +231,7 @@ CLI (`~/.gemini/settings.json`), Cline and Roo Code (their VS Code
 ```json
 {
   "servers": {
-    "hytale-atlas": { "command": "<NODE>", "args": ["<ATLAS>", "--mcp"] }
+    "hytale-atlas": { "command": "npx", "args": ["-y", "hytale-atlas", "--mcp"] }
   }
 }
 ```
@@ -275,34 +241,32 @@ CLI (`~/.gemini/settings.json`), Cline and Roo Code (their VS Code
 ```json
 {
   "context_servers": {
-    "hytale-atlas": { "command": "<NODE>", "args": ["<ATLAS>", "--mcp"], "env": {} }
+    "hytale-atlas": { "command": "npx", "args": ["-y", "hytale-atlas", "--mcp"], "env": {} }
   }
 }
 ```
 
 **`mcp`** — opencode, `opencode.json`. Note the command is **one array**, not a
-command plus arguments; splitting it the way the shapes above do produces a
-config the schema accepts and the client cannot launch:
+command plus arguments:
 
 ```json
 {
   "mcp": {
     "hytale-atlas": {
       "type": "local",
-      "command": ["<NODE>", "<ATLAS>", "--mcp"],
+      "command": ["npx", "-y", "hytale-atlas", "--mcp"],
       "enabled": true
     }
   }
 }
 ```
 
-**TOML** — Codex, `~/.codex/config.toml` (or `.codex/config.toml` in a trusted
-project):
+**TOML** — Codex, `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.hytale-atlas]
-command = "<NODE>"
-args = ["<ATLAS>", "--mcp"]
+command = "npx"
+args = ["-y", "hytale-atlas", "--mcp"]
 ```
 
 Continue, Goose and Hermes use YAML; see their own docs for the exact key.
@@ -330,9 +294,6 @@ is not to be reachable. DNS-rebinding protection is on, which is what stops a we
 page from resolving a hostname it controls to `127.0.0.1` and talking to your
 index; a request arriving with an unexpected `Host` gets a 403.
 
-Each request gets its own protocol session — the database and the archive are
-shared, the plumbing is not.
-
 ### What it serves
 
 Serves the same answers as structured data over stdio, with caveats attached.
@@ -351,11 +312,11 @@ client is connected, reconnect.
 
 ## Schemas, telemetry and consent
 
-`get` and `search` need only `Assets.zip`. The DECLARED layer needs the schema
-the game's own server can generate:
+`get` and `search` need only `Assets.zip`. The DECLARED schema layer needs the
+schema the game's own server can generate:
 
 ```bash
-node dist/cli/main.js generate-schema
+hytale-atlas generate-schema
 ```
 
 This **starts the game server binary**, which **sends telemetry that cannot be
@@ -389,30 +350,15 @@ quiet one:
 
 ---
 
-## Development
-
-```bash
-npm run typecheck   # tsc --noEmit
-npm run build       # tsc
-npm test            # node --test, runs with config discovery disabled
-```
-
-The design rule the codebase is built around: **the contract is the operation,
-not the command.** `src/api/operations.ts` renders every answer, including its
-text; the CLI and the MCP server only compose it. A front end that computes
-anything itself has reintroduced the divergence that layer exists to prevent.
-
-Further reading lives in `docs/` — `INDEXING.md` for how the corpus is built,
-`TOOLS.md` for the tool surface, `SERVER-JAR.md` for what is known about the
-server binary, `BLIND-TRIALS.md` for how answers are evaluated, and
-`docs/init/` for the domain research and the open questions behind it.
-
----
-
 ## Legal
 
 Unofficial and unaffiliated. It reads a local, legitimately installed copy of the
-game and derives an index from it. **No Hytale-derived data is stored in this
-repository** — the `local/` directory is gitignored precisely so none leaks in.
-Hytale's EULA governs what you may do with what you extract; indexing your own
-install for your own authoring is the use this was built for.
+game and derives an index from it, kept in a per-user cache — no Hytale-derived
+data is uploaded anywhere. Hytale's EULA governs what you may do with what you
+extract; indexing your own install for your own authoring is the use this was
+built for.
+
+---
+
+Building from source, running the test suite, or cutting a release?
+See [DEV.md](DEV.md).
