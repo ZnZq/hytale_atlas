@@ -500,7 +500,14 @@ CREATE INDEX IF NOT EXISTS idx_candidates_edge ON candidates (resolved_edge_id);
 -- NOTE: idx_candidates_asset_ptr is created in pass 3, not here. Declaring it up
 -- front made every one of 479 000 candidate inserts maintain a second wide index
 -- and the build stopped finishing at all -- see computeFieldStats().
-CREATE INDEX IF NOT EXISTS idx_assets_logical   ON assets (logical_id);
+-- Composite (logical_id, type), NOT logical_id alone. markEffective marks the one
+-- effective row per (logical_id, type) with a correlated  b.type IS a.type . At
+-- tier 1 every type is NULL, so that predicate has no selectivity and the planner
+-- falls to idx_assets_type (type=?), which matches the WHOLE table on each of
+-- 32 704 rows -- ~1e9 comparisons that never finish, the "index just hangs" report.
+-- The composite turns the subquery into a seek (EXPLAIN: logical_id=? AND type=?);
+-- its leftmost prefix still serves the logical_id-only lookups the old index did.
+CREATE INDEX IF NOT EXISTS idx_assets_logical_type ON assets (logical_id, type);
 -- SPECULATIVE, and measurably so: nothing writes a non-zero last_changed_epoch
 -- and no query reads it, so this is a second b-tree over all 38 925 asset rows
 -- holding 38 925 identical keys, maintained on every insert of every build. It
